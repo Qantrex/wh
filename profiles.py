@@ -19,7 +19,7 @@ def text(ad):
 def generic_junk(ad):
     if re.search(WANTED, ad.get("title", "").lower()):
         return "wanted ad"
-    if ad.get("price") is None:
+    if not ad.get("price"):                                    # None, or €0 (giveaway / price on request)
         return "no price"
     m = re.search(BAD, text(ad))
     return "says '%s'" % m.group(0) if m else None
