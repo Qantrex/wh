@@ -3,8 +3,14 @@
 annotate(ads, name) sets `junk` on every ad (a reason, or None) and adds the profile's own fields.
 shortlist(ads, name, n) picks the ads worth a closer look. FIELDS[name] are the extra columns to show.
 The laptop tables come from the 2026-10-25 laptop hunt (seed/analyze.py, seed/rank.py).
+
+Two kinds: built-in profiles (Python, below) for items that need real parsing, and templates (TOML files in
+templates/ or a WH_TEMPLATES directory) for everything else: junk rules, columns, scores and new prices as data.
 """
+import glob
+import os
 import re
+import tomllib
 
 BAD = (r"\bdefekt(?:e|er|es|em|en)?\b|\bbastler(?:gerät|geraet|stück|stueck|ware|fahrzeug|objekt)?\b"
        r"|(?:als |für |fuer )?ersatzteil(?:spender|träger|traeger|lager|gerät|geraet)\b|(?:als |für |fuer )ersatzteile?\b"
@@ -200,10 +206,18 @@ def hz(t):
     return int(m.group(1)) if m else None
 
 
+APPLE_CHIP = r"m[1-5](?:\s*(?:pro|max|ultra))?"
+APPLE_CHIP_LIST = re.compile(r"\b%s(?:\s*(?:,|/|&|\boder\b|\bbzw\.?|\bund\b)\s*%s)+\b" % (APPLE_CHIP, APPLE_CHIP))
+APPLE_COMPARE = re.compile(r"\b(?:gleichwertig|vergleichbar|ähnlich|equal|comparable)\s+(?:wie|mit|zu|to|with)?\s*"
+                           r"(?:ein(?:em|en)?\s+|an?\s+)?%s\b" % APPLE_CHIP)
+
+
 def first_cpu(t, apple=False, table=CPU):
     """Like first(table, t), but Apple chip names (M1-M5) only count in an ad about a Mac: "M.2 SSD", an "M3" mouse, or
     "Tausch gegen MacBook M4" in a Windows ad isn't an Apple chip."""
     t_norm = re.sub(r"\b(1?\d)\.(\d{3}[a-z]?)", r"\1\2", t)   # German dot separator, e.g. "i7 12.700h"
+    if apple:                                                 # "gleichwertig wie ein M1, M2, M3, M4" names no chip
+        t_norm = APPLE_COMPARE.sub(" ", APPLE_CHIP_LIST.sub(" ", t_norm))
     for rx, score, name in table:
         if (apple or not name.startswith("Apple")) and re.search(rx, t_norm):
             return score, name
@@ -813,6 +827,139 @@ FIELDS = {
     "server": ["form", "cpu", "ram", "bays"],
     "hue": ["kind", "spec", "qty"],
 }
+
+
+BUILTIN = frozenset(PROFILES)
+
+
+# ---- templates: profiles as data -----------------------------------------------------------------------------
+
+TEMPLATE_DIRS = ([os.path.join(os.path.dirname(os.path.realpath(__file__)), "templates")]
+                 + [os.path.expanduser(d) for d in os.environ.get("WH_TEMPLATES", "").split(os.pathsep) if d])
+TEMPLATES = {}                                                # name -> parsed template
+TEMPLATE_ERRORS = {}                                          # path -> what's wrong (the template is skipped)
+SORT_KEYS = ("score", "below_new", "price", "published")
+DEFAULT_SORT = ["-score", "-below_new", "price"]
+
+
+def _rx(where, pattern):
+    try:
+        return re.compile(pattern, re.I)
+    except (re.error, TypeError) as e:
+        raise ValueError("%s: bad pattern %r (%s)" % (where, pattern, e))
+
+
+def parse_template(name, data):
+    """Check a template's TOML data and compile its patterns; raises ValueError saying what's wrong."""
+    unknown = set(data) - {"about", "category", "junk", "require", "field", "shortlist"}
+    if unknown:
+        raise ValueError("unknown keys: %s" % ", ".join(sorted(unknown)))
+    rules = []
+    for kind in ("junk", "require"):
+        for i, r in enumerate(data.get(kind, []), 1):
+            where = "[[%s]] #%d" % (kind, i)
+            if set(r) - {"reason", "title", "text", "unless"} or not r.get("reason") \
+                    or not (r.get("title") or r.get("text")) or (kind == "require" and r.get("unless")):
+                raise ValueError("%s: needs `reason` and `title` and/or `text`%s" % (
+                    where, ", optional `unless`" if kind == "junk" else " (no `unless`)"))
+            rules.append(dict(kind=kind, reason=r["reason"],
+                              **{k: _rx(where, r[k]) if r.get(k) else None for k in ("title", "text", "unless")}))
+    fields = []
+    for i, f in enumerate(data.get("field", []), 1):
+        where = "[[field]] %s" % f.get("name", "#%d" % i)
+        if not f.get("name") or not f.get("values") or f.get("in", "text") not in ("title", "text") \
+                or set(f) - {"name", "in", "values"}:
+            raise ValueError("%s: needs `name` and `values`, optional `in` (title or text)" % where)
+        values = []
+        for v in f["values"]:
+            if not isinstance(v, dict) or "match" not in v or set(v) - {"match", "value", "score", "new"}:
+                raise ValueError("%s: each value is { match = '…', value = '…', score = N, new = €N }" % where)
+            values.append(dict(match=_rx(where, v["match"]), value=v.get("value"),
+                               score=float(v.get("score", 0)), new=float(v["new"]) if v.get("new") else None))
+        fields.append(dict(name=f["name"], where=f.get("in", "text"), values=values))
+    sl = data.get("shortlist", {})
+    sort = sl.get("sort", DEFAULT_SORT)
+    if set(sl) - {"min_score", "sort"} or any(k.lstrip("-") not in SORT_KEYS for k in sort):
+        raise ValueError("[shortlist]: `min_score = N` and `sort` from %s (`-` = highest first)" % ", ".join(SORT_KEYS))
+    category = None
+    if data.get("category"):
+        m = re.search(r"-(\d+)$", data["category"].strip("/"))
+        if not m:
+            raise ValueError("category must end in willhaben's id, e.g. motorradbekleidung/handschuhe-6363")
+        category = (m.group(1), data["category"].strip("/"))
+    columns = [f["name"] for f in fields] + (["vs_new"] if any(v["new"] for f in fields for v in f["values"]) else [])
+    return dict(name=name, about=data.get("about", ""), category=category, rules=rules, fields=fields,
+                columns=columns, min_score=sl.get("min_score"), sort=sort)
+
+
+def template_annotate(tpl, ad):
+    """Fill the template's fields, `score`, `below_new`, `vs_new`; return a junk reason or None."""
+    title = strip_swap(ad.get("title", "").lower())
+    t = strip_swap(text(ad))
+    score, new = 0.0, None
+    for f in tpl["fields"]:
+        ad[f["name"]] = None
+        for v in f["values"]:
+            m = v["match"].search(title if f["where"] == "title" else t)
+            if m:
+                ad[f["name"]] = m.expand(v["value"]) if v["value"] else m.group(0)
+                score += v["score"]
+                new = new or v["new"]
+                break
+    price = ad.get("price")
+    ad["score"] = score
+    ad["below_new"] = round((new - price) / new, 3) if new and price else None
+    ad["vs_new"] = "new €%g (%+d %%)" % (new, round(-100 * ad["below_new"])) if ad["below_new"] is not None else None
+    for r in tpl["rules"]:
+        hit = all(rx.search(s) for rx, s in ((r["title"], title), (r["text"], t)) if rx)
+        if r["kind"] == "junk" and hit and not (r["unless"] and r["unless"].search(t)):
+            return r["reason"]
+        if r["kind"] == "require" and not hit:
+            return r["reason"]
+    return None
+
+
+def template_shortlist(tpl, ads, n):
+    ranked = [a for a in ads if not a.get("junk")
+              and (tpl["min_score"] is None or a.get("score", 0) >= tpl["min_score"])]
+    for k in reversed(tpl["sort"]):                           # stable sorts, last key first; missing values go last
+        f, desc = k.lstrip("-"), k.startswith("-")
+        ranked.sort(key=lambda a: ((a.get(f) is not None) if desc else (a.get(f) is None),
+                                   a.get(f) if a.get(f) is not None else 0), reverse=desc)
+    return interleave_buckets([ranked], [ranked], n)          # same ranking, minus reposts of one ad
+
+
+def load_templates(dirs=None):
+    """(Re)load every *.toml in the template dirs into PROFILES, FIELDS and CATEGORY. A later dir overrides an
+    earlier one; a broken template is skipped and listed in TEMPLATE_ERRORS."""
+    for name in TEMPLATES:
+        for table in (PROFILES, FIELDS, CATEGORY):
+            table.pop(name, None)
+    TEMPLATES.clear()
+    TEMPLATE_ERRORS.clear()
+    for d in TEMPLATE_DIRS if dirs is None else dirs:
+        for path in sorted(glob.glob(os.path.join(d, "*.toml"))):
+            name = os.path.basename(path)[:-5]
+            try:
+                if name in BUILTIN:
+                    raise ValueError("'%s' is a built-in profile; pick another file name" % name)
+                with open(path, "rb") as fh:
+                    tpl = parse_template(name, tomllib.load(fh))
+            except (ValueError, tomllib.TOMLDecodeError, OSError) as e:
+                TEMPLATE_ERRORS[path] = str(e)
+                continue
+            tpl["path"] = path
+            TEMPLATES[name] = tpl
+            PROFILES[name] = (lambda ad, tpl=tpl: template_annotate(tpl, ad),
+                              lambda ads, n, tpl=tpl: template_shortlist(tpl, ads, n))
+            FIELDS[name] = tpl["columns"]
+            if tpl["category"]:
+                CATEGORY[name] = tpl["category"]
+            else:
+                CATEGORY.pop(name, None)
+
+
+load_templates()
 
 
 def annotate(ads, name=None):
