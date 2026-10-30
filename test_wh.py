@@ -134,6 +134,19 @@ class ProfilesTests(unittest.TestCase):
         self.assertEqual(mac_space["ram"], 16)
         self.assertTrue(profiles.is_mac(mac_space))
 
+    def test_apple_chip_lists_are_comparisons_not_the_spec(self):
+        intel = {"id": 1, "title": "MacBook Pro *32GB RAM*1TB SSD*", "price": 549, "cats": "5824,5831",
+                 "body": "Macbook Pro 13 32GB Ram 1TB SSD. Gleichwertig wie ein M1, M2, M3, M4"}
+        cmp_ = {"id": 2, "title": "MacBook Pro 13 2020 i5", "price": 400, "cats": "5824,5831",
+                "body": "so schnell, vergleichbar mit einem M2"}
+        air = {"id": 3, "title": "MacBook Air 13 M4 16GB", "price": 850, "cats": "5824,5831", "body": "neuwertig"}
+        pro = {"id": 4, "title": "MacBook Pro 14 M1 Pro 16/512", "price": 650, "cats": "5824,5831", "body": ""}
+        profiles.annotate([intel, cmp_, air, pro], "laptop")
+        self.assertNotIn("Apple", intel["cpu"] or "")
+        self.assertNotIn("Apple", cmp_["cpu"] or "")
+        self.assertEqual(air["cpu"], "Apple M4")
+        self.assertEqual(pro["cpu"], "Apple M1 Pro/Max")
+
     def test_cpu_gpu_ram_and_desktop_part_edge_cases(self):
         ads = [
             {"id": 1, "title": "HP EliteBook 865 G10 | Ryzen 7 Pro 32GB 512GB SSD | GARANTIE",
@@ -407,6 +420,7 @@ class WhTests(TmpDbCase):
              mock.patch("sys.stdout", out):
             wh.cmd_hunt(ns)
 
+        self.assertIn("## Who it's for\n\nNot stated. Don't assume it's for me", captured["data"])
         self.assertIn("STATUS: reserved", captured["data"])
         self.assertIn("cut from €580", captured["data"])
         self.assertIn("Übergabe: Selbstabholung", captured["data"])
@@ -694,6 +708,149 @@ class FetchSweepTests(TmpDbCase):
         self.assertIn("treeAttributes=23", text)
         self.assertNotIn("Netbooks", text)                     # no ads
         self.assertNotIn("Preis", text)                        # price ranges: use --min/--max
+
+
+class TemplateTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.addCleanup(profiles.load_templates)              # back to the real templates
+        self.dir = tmp.name
+
+    def write(self, name, body):
+        with open(os.path.join(self.dir, name + ".toml"), "w") as fh:
+            fh.write(body)
+
+    def ad(self, title, price, body=""):
+        return {"id": title, "title": title, "price": price, "body": body, "loc": "Wien"}
+
+    def test_template_registers_filters_scores_and_ranks(self):
+        self.write("gloves", r"""
+about = "test"
+category = "motorradbekleidung/handschuhe-6363"
+[[junk]]
+reason = "short glove"
+title = '\bkurz\w*'
+unless = 'stulpe'
+[[require]]
+reason = "not leather"
+text = 'leder'
+[[field]]
+name = "model"
+values = [{ match = 'sp\s*-?\s*(\d)', value = 'SP-\1', score = 2, new = 100 }, { match = 'gp', score = 1 }]
+[shortlist]
+min_score = 1
+""")
+        profiles.load_templates([self.dir])
+        self.assertEqual(profiles.FIELDS["gloves"], ["model", "vs_new"])
+        self.assertEqual(profiles.CATEGORY["gloves"], ("6363", "motorradbekleidung/handschuhe-6363"))
+        ads = profiles.annotate([self.ad("Alpinestars SP-8 Leder", 50), self.ad("Kurze Handschuhe Leder SP8", 20),
+                                 self.ad("Kurze Handschuhe mit Stulpe Leder GP", 30), self.ad("Textil SP-8", 40),
+                                 self.ad("Leder Handschuhe", 10)], "gloves")
+        junk = {a["title"]: a["junk"] for a in ads}
+        self.assertEqual(junk, {"Alpinestars SP-8 Leder": None, "Kurze Handschuhe Leder SP8": "short glove",
+                                "Kurze Handschuhe mit Stulpe Leder GP": None,      # `unless` cancels the rule
+                                "Textil SP-8": "not leather", "Leder Handschuhe": None})
+        sp8 = ads[0]
+        self.assertEqual((sp8["model"], sp8["score"], sp8["below_new"], sp8["vs_new"]),
+                         ("SP-8", 2, 0.5, "new €100 (-50 %)"))
+        self.assertEqual(ads[2]["model"], "gp")                                  # no `value`: the matched text
+        short = profiles.shortlist([a for a in ads if not a["junk"]], "gloves", 10)
+        self.assertEqual([a["title"] for a in short],                           # min_score drops the plain one
+                         ["Alpinestars SP-8 Leder", "Kurze Handschuhe mit Stulpe Leder GP"])
+
+    def test_broken_templates_are_skipped_and_the_rest_still_load(self):
+        self.write("good", "[[field]]\nname = 'x'\nvalues = [{ match = 'a' }]\n")
+        self.write("bad", "[[junk]]\nreason = 'r'\ntitle = '(unclosed'\n")
+        self.write("laptop", "about = 'clash'\n")
+        self.write("typo", "[[feild]]\nname = 'x'\n")
+        self.write("badsort", "[shortlist]\nsort = ['-size']\n")
+        profiles.load_templates([self.dir])
+        self.assertIn("good", profiles.PROFILES)
+        errs = {os.path.basename(p): e for p, e in profiles.TEMPLATE_ERRORS.items()}
+        self.assertIn("bad pattern", errs["bad.toml"])
+        self.assertIn("built-in", errs["laptop.toml"])
+        self.assertIn("unknown keys", errs["typo.toml"])
+        self.assertIn("[shortlist]", errs["badsort.toml"])
+        self.assertIs(profiles.PROFILES["laptop"][0], profiles.laptop)      # the built-in stays
+
+    def test_reload_forgets_removed_templates(self):
+        self.write("gone", "about = 'x'\n")
+        profiles.load_templates([self.dir])
+        self.assertIn("gone", profiles.PROFILES)
+        os.remove(os.path.join(self.dir, "gone.toml"))
+        profiles.load_templates([self.dir])
+        self.assertNotIn("gone", profiles.PROFILES)
+        self.assertNotIn("gone", profiles.FIELDS)
+
+    def test_sort_keys_handle_strings_and_missing_values(self):
+        tpl = profiles.parse_template("t", {"shortlist": {"sort": ["-published", "price"]}})
+        ads = [dict(id=1, title="a", price=5, published=None, junk=None),
+               dict(id=2, title="b", price=9, published="2026-10-29", junk=None),
+               dict(id=3, title="c", price=1, published="2026-10-30", junk=None)]
+        self.assertEqual([a["id"] for a in profiles.template_shortlist(tpl, ads, 10)], [3, 2, 1])
+
+    def test_shipped_sport_gloves_template(self):
+        profiles.load_templates()
+        self.assertIn("sport-gloves", profiles.TEMPLATES, profiles.TEMPLATE_ERRORS)
+        ads = profiles.annotate([
+            self.ad("Alpinestars GP Pro R3 Handschuhe Gr. L", 90, "Känguruleder, sturzfrei"),
+            self.ad("Alpinestars SMX-2 Air Carbon kurz", 40),
+            self.ad("Damen Motorradhandschuhe Dainese", 50, "racing"),
+            self.ad("Held Phantom 9L", 57, "keine Löcher, Nähte und Protektoren intakt"),
+            self.ad("Alpinestars GP Pro R3 schwarz", 49, "Ein Finger und Handballen haben Reparaturstellen"),
+            self.ad("Vanucci Handschuhe", 30, "Leder mit Titan Knöchelschutz, sportlich"),
+            self.ad("Alpinestars KTM GP plus R2", 50, "neuwertig"),
+        ], "sport-gloves")
+        by = {a["title"]: a for a in ads}
+        r3 = by["Alpinestars GP Pro R3 Handschuhe Gr. L"]
+        self.assertEqual((r3["junk"], r3["model"], r3["palm"], r3["crash"]), (None, "GP Pro R3", "kangaroo", "crash-free"))
+        self.assertTrue(by["Alpinestars SMX-2 Air Carbon kurz"]["junk"])
+        self.assertTrue(by["Damen Motorradhandschuhe Dainese"]["junk"])
+        self.assertIsNone(by["Held Phantom 9L"]["junk"])                     # "keine Löcher" is not damage
+        self.assertEqual(by["Alpinestars GP Pro R3 schwarz"]["junk"], "damage or a crash mentioned")
+        self.assertIsNone(by["Vanucci Handschuhe"]["model"])                 # "Titan" alone isn't a Held Titan
+        self.assertEqual((by["Alpinestars KTM GP plus R2"]["model"], by["Alpinestars KTM GP plus R2"]["vs_new"]),
+                         ("GP Plus R2", None))                               # not the R v2 and its new price
+
+
+class NoteProfileTests(TmpDbCase):
+    def test_unknown_wh_profile_warns_and_sweeps_without_one(self):
+        with mock.patch.object(wh, "log") as log:
+            self.assertIsNone(wh.note_profile({"wh-profile": "glovez"}, "/x/Gloves.md"))
+            self.assertEqual(wh.note_profile({"wh-profile": "laptop"}, "/x/Laptop.md"), "laptop")
+        self.assertIn("unknown wh-profile 'glovez'", log.call_args[0][0])
+
+    def test_for_is_read_warned_about_and_put_in_the_prompt(self):
+        with mock.patch.object(wh, "log") as log:
+            self.assertIsNone(wh.note_for({}, "/x/Laptop.md"))
+            self.assertIn("Laptop has no `for:`", log.call_args[0][0])
+            log.reset_mock()
+            self.assertEqual(wh.note_for({"for": "girlfriend"}, "/x/Laptop.md"), "girlfriend")
+            self.assertEqual(wh.note_for({"for": ["me", "homelab"]}, "/x/Mixed.md"), "me, homelab")
+            log.assert_not_called()
+        block = wh.who_block("girlfriend")
+        self.assertTrue(block.startswith("## Who it's for\n\ngirlfriend. Judge only by"))
+        self.assertIn("unless it says it's for me", block)
+        self.assertIn("Don't assume it's for me", wh.who_block(None))
+
+    def test_sweep_warns_about_notes_without_for(self):
+        notes = os.path.join(self.tmp.name, "notes")
+        os.makedirs(notes)
+        for name, extra in (("Gloves", "for: me\n"), ("Laptop", "")):
+            with open(os.path.join(notes, name + ".md"), "w", encoding="utf-8") as f:
+                f.write("---\ntype: buy\nstatus: open\n%ssearch: x\n---\n# %s\n" % (extra, name))
+        empty = next_page({"searchResult": {"rowsFound": 0, "advertSummaryList": {"advertSummary": []}}})
+        ns = mock.Mock(notes=[], pages=1, limit=5, dry_run=True)
+        c = wh.db()
+        self.addCleanup(c.close)
+        with mock.patch.object(wh, "NOTES", notes), mock.patch.object(wh, "fetch", return_value=("u", empty)), \
+             mock.patch.object(wh, "db", return_value=c), \
+             mock.patch.object(wh, "log") as log, mock.patch("sys.stdout", io.StringIO()):
+            wh.cmd_sweep(ns)
+        warned = [c[0][0] for c in log.call_args_list if "no `for:`" in c[0][0]]
+        self.assertEqual(len(warned), 1)
+        self.assertIn("Laptop", warned[0])
 
 
 if __name__ == "__main__":

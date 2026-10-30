@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """wh: willhaben.at from the terminal. Fast public data with a local cache; Claude does the judging.
 
-Data commands (no AI):  search, facets, ad, photos, status, sweep
+Data commands (no AI):  search, facets, ad, photos, status, sweep, profiles
 AI commands:            deal, advise, hunt   (gather the data, then ask `claude -p` with the willhaben skill's rules;
                                               --no-ai prints the gathered data instead, for use inside a Claude session)
 
@@ -787,6 +787,35 @@ def cmd_status(a):
             write_note(f, set_prop(text, "checked", date.today().isoformat()))
 
 
+def note_for(props, path):
+    """Who a buy/wanted note is for (`for:` me, homelab, girlfriend, "Anna (friend)" …). Missing: say so, since nobody
+    should guess it."""
+    who = props.get("for")
+    who = ", ".join(map(str, who)) if isinstance(who, list) else str(who or "").strip()
+    if not who:
+        log("wh: %s has no `for:` (who it's for: me, homelab, girlfriend, \"<name> (friend)\" …); add it" % name_of(path))
+    return who or None
+
+
+def who_block(who):
+    """The prompt section that tells Claude who a purchase is for, so it never assumes it's for me."""
+    return "## Who it's for\n\n%s" % (
+        "%s. Judge only by this person's or purpose's needs as the note states them; don't bring in my own gear, sizes "
+        "or plans unless it says it's for me." % who if who else
+        "Not stated. Don't assume it's for me: judge from the stated requirements only and say where the verdict "
+        "depends on who it's for.")
+
+
+def note_profile(props, path):
+    """The note's `wh-profile` if wh knows it (built-in or template); otherwise say so and use none."""
+    name = props.get("wh-profile") or None
+    if name and name not in profiles.PROFILES:
+        log("wh: %s: unknown wh-profile '%s' (known: %s); sweeping without one"
+            % (name_of(path), name, ", ".join(sorted(profiles.PROFILES))))
+        return None
+    return name
+
+
 def sweep_plan(c, path, props):
     """A note's searches and what earlier sweeps saw, read before this run records anything."""
     searches = props.get("search") or []
@@ -805,7 +834,7 @@ def sweep_plan(c, path, props):
     prev_prices = ({r["id"]: r["price"] for r in c.execute(
         "select id, price from prices where seen <= ? order by seen, rowid", (max(ats),))} if ats else {})
     return dict(items=items, prev_prices=prev_prices, seen=set().union(*(x["seen"] for x in items)),
-                profile=props.get("wh-profile") or None, near=area(props.get("wh-area")))
+                profile=note_profile(props, path), near=area(props.get("wh-area")))
 
 
 def category_notes(plan, fetched):
@@ -908,6 +937,8 @@ def cmd_sweep(a):
     todo = [(f, t, p) for f, t, p in find_notes(a.notes, types={"buy", "wanted"}, statuses=OPEN) if p.get("search")]
     if not todo:
         sys.exit("wh: no open buy/wanted note with a `search:` property")
+    for f, _, p in todo:
+        note_for(p, f)
     plans = [sweep_plan(c, f, p) for f, _, p in todo]       # before this run records anything
     jobs = [(x["url"], x["key"]) for plan in plans for x in plan["items"]]
     log("%d notes, %d searches:" % (len(todo), len(jobs)))
@@ -931,7 +962,7 @@ def cmd_deal(a):
         sys.exit(fmt_details(d))
     words = a.compare or comp_words(d["title"])
     comps, found = comparables(c, d, words, a.pages, a.profile)
-    data = "## The ad\n\n%s\n\n## Comparable ads on willhaben now\n\nSearch \"%s\": %s; %s. Some may not be " \
+    data = who_block(a.for_) + "\n\n## The ad\n\n%s\n\n## Comparable ads on willhaben now\n\nSearch \"%s\": %s; %s. Some may not be " \
            "truly comparable: judge from the titles.\n\n%s" % (fmt_details(d, c), words, found, market(comps),
                                                               table(comps[:a.limit], a.profile, True))
     task = ("Should I buy this ad? Start with one verdict line: **good deal / fair / overpriced / walk away / likely "
@@ -967,7 +998,7 @@ def cmd_advise(a):
             "(title, photos, category). No paid extras.")
     jobs = []
     for (f, text, p, d, words), r in zip(live, found_all):
-        profile = p.get("wh-profile") or None
+        profile = note_profile(p, f)
         comps, found = comparables(c, d, words, a.pages, profile, fetched=r)
         data = ("## My note\n\n%s\n\n## My ad now\n\n%s\n\n## Comparable ads on willhaben now\n\nSearch \"%s\": %s; "
                 "%s.\n\n%s" % (strip_blocks(text), fmt_details(d, c), words, found, market(comps),
@@ -995,7 +1026,8 @@ def cmd_hunt(a):
     if not a.dry_run:                                       # saved now, so a failed Claude call doesn't lose the sweep
         text = set_prop(put_block(text, "sweep", block), "checked", date.today().isoformat())
         write_note(f, text)
-    profile = p.get("wh-profile") or None
+    profile = note_profile(p, f)
+    who = note_for(p, f)
     states = area(p.get("wh-area"))
     rows = []
     for x in short:
@@ -1024,9 +1056,10 @@ def cmd_hunt(a):
         return
     where = ("\n\n## Where\n\nMy pickup area is %s. Ads outside it are still options (I can travel there or ask for "
              "shipping): weigh the distance, but don't drop a good deal for it." % area_label(states)) if states else ""
-    data = "## What I want (my note)\n\n%s\n\n## Market\n\n%s (after removing junk)%s\n\n## Shortlist\n\n%s" % (
-        strip_blocks(text), mk, where, "\n".join(rows))
-    task = ("Pick the best options from the shortlist for what my note asks for. Answer with exactly two sections. "
+    data = "%s\n\n## The buy note\n\n%s\n\n## Market\n\n%s (after removing junk)%s\n\n## Shortlist\n\n%s" % (
+        who_block(who), strip_blocks(text), mk, where, "\n".join(rows))
+    task = ("Pick the best options from the shortlist for what the buy note asks for, for the person or purpose it's "
+            "for. Answer with exactly two sections. "
             "`## Picks`: the ads you'd actually recommend, best first, as a numbered list. For each: price and link, why "
             "it's good value against the market, what to check or ask the seller, and a suggested offer. `## Warnings`: "
             "ads that look like scams or too good to be true, one line each with the link and why.")
@@ -1069,6 +1102,24 @@ def cmd_facets(a):
                 print("          … %d more" % (len(vals) - a.limit))
 
 
+def cmd_profiles(a):
+    home = os.path.expanduser("~")
+    for name in sorted(profiles.PROFILES):
+        tpl = profiles.TEMPLATES.get(name)
+        cat = profiles.CATEGORY.get(name)
+        print("%-14s %-9s %-34s %s" % (name, "template" if tpl else "built-in",
+                                       cell(", ".join(profiles.FIELDS.get(name, [])), 34), cat[1] if cat else ""))
+        if tpl:
+            if tpl["about"]:
+                print("%25s%s" % ("", tpl["about"]))
+            print("%25s%s" % ("", tpl["path"].replace(home, "~", 1)))
+    if profiles.TEMPLATE_ERRORS:
+        print("\nSkipped (broken):")
+        for path, err in profiles.TEMPLATE_ERRORS.items():
+            print("  %s: %s" % (path.replace(home, "~", 1), err))
+    print("\nTemplates are read from: %s" % ", ".join(d.replace(home, "~", 1) for d in profiles.TEMPLATE_DIRS))
+
+
 def main():
     ap = argparse.ArgumentParser(prog="wh", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1095,6 +1146,10 @@ def main():
     s.add_argument("--max", type=float)
     s.add_argument("--limit", type=int, default=15, help="values per filter (default 15)")
     s.set_defaults(fn=cmd_facets)
+
+    s = sub.add_parser("profiles", help="the built-in profiles and the templates (templates/*.toml) a note's "
+                                        "`wh-profile` or --profile can name, and any template that's broken")
+    s.set_defaults(fn=cmd_profiles)
 
     s = sub.add_parser("ad", help="one ad in full (description, seller, price history)")
     s.add_argument("ad", help="ad ID or link")
@@ -1128,6 +1183,8 @@ def main():
             s.add_argument("--compare", help="keywords for the comparable ads (default: from the title)")
             s.add_argument("--question", help="an extra question for Claude")
             s.add_argument("--profile", choices=sorted(profiles.PROFILES))
+            s.add_argument("--for", dest="for_", metavar="WHO",
+                           help="who it's for (me, homelab, girlfriend, …); without it Claude is told not to assume")
         elif name == "advise":
             s.add_argument("notes", nargs="*")
         else:
@@ -1142,6 +1199,9 @@ def main():
         s.set_defaults(fn=fn)
 
     a = ap.parse_args()
+    if a.cmd != "profiles":
+        for path in profiles.TEMPLATE_ERRORS:
+            log("wh: skipped the broken template %s (see `wh profiles`)" % os.path.basename(path))
     try:
         a.fn(a)
     except WhError as e:
