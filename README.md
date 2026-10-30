@@ -1,27 +1,34 @@
 # wh
 
-willhaben.at from the terminal. It reads the public pages fast, one request at a time, and keeps every ad it sees in a local SQLite database. Claude does the judging on top of that.
+willhaben.at from the terminal. It reads the public pages, 4 requests at a time (at most 4 per second), and keeps every ad it sees in a local SQLite database. Claude does the judging on top of that.
 
 ```
 wh search dji fpv goggles v2            # list ads (junk filtered), --md for a note, --json for scripts
-wh search --url laptops-notebooks-5824 --max 800 --profile laptop
+wh search --url computer-tablets/notebooks-5831 --max 800 --profile laptop --area wien,noe
+wh facets rtx --url computer-tablets-5828   # willhaben's subcategories and filters for a search, with counts
 wh ad 1041160074                        # one ad in full, with seller info and price history
 wh photos 1041160074 ./photos           # photos as JPEG (WebP gets converted with magick)
 wh status                               # online? price? for every open Marketplace note with an `ad:`
 wh sweep                                # run the `search:` of every open buy/wanted note, write the results in
 
 wh deal <link>                          # AI: worth buying? verdict, comparables, offer, questions
-wh advise                               # AI: should my live ads get a lower price?
+wh advise                               # AI: should my live ads get a lower price? (one Claude call per ad, in parallel)
 wh hunt Laptop                          # AI: sweep a buy note, Claude writes the best picks into it
 ```
 
 The AI commands gather the data and ask `claude -p` (no tools, so it only reasons over what wh gives it) with the rules from the `willhaben` skill (`~/.claude/skills/willhaben/SKILL.md`). `--no-ai` prints the data and the task instead, which is what Claude itself uses inside a session.
 
+## Speed
+
+A full `wh sweep` of the five buy notes (28 searches, 41 pages) takes about 12 s; one request every 1.1 s took 46 s. The time is almost all network: parsing a 200-ad page takes ~14 ms, the profiles ~0.25 ms per ad. `sweep` puts the searches of every note into one queue, page 1 of each search first (it says how many pages there are), then the rest.
+
+If willhaben pushes back (HTTP 403/429/503 or a Cloudflare challenge page), every worker drops to one request per `WH_DELAY` for the rest of the run. A request that keeps failing marks its search incomplete in the note instead of stopping the run.
+
 ## Files
 
 - `wh`: the command (Python 3, standard library only). Linked as `~/.local/bin/wh`.
 - `profiles.py`: per-category knowledge that turns ads into comparable specs and filters junk (`laptop`, `pc`, `server`, `hue`). A buy note picks one with `wh-profile: laptop`.
-- `test_wh.py`: unit tests (`python3 -m unittest`).
+- `test_wh.py`: unit tests (`python3 -m unittest`), no network.
 - `seed/`: the scripts and CSVs from the first laptop hunt (2026-10-25), which the laptop profile came from.
 
 ## Notes it works with
@@ -29,9 +36,14 @@ The AI commands gather the data and ask `claude -p` (no tools, so it only reason
 Notes in `~/Notes/Marketplace` (`WH_NOTES` overrides), with YAML properties:
 
 - sell notes: `type: sell`, `status: live`, `ad: <willhaben-Code>`
-- buy/wanted notes: `type: buy` or `wanted`, `status: open`, `search:` (one willhaben search URL per line), optional `wh-profile`
+- buy/wanted notes: `type: buy` or `wanted`, `status: open`, `search:` (one willhaben search URL per line), optional `wh-profile` and `wh-area`
+- `wh-area: wien, noe` marks the ads in those states (a "Near" column, "N in Wien/NÖ" in the sweep line, and a hint for Claude in `hunt`). It never filters anything out: a good deal further away can still be picked up or shipped.
 
-`wh` only writes `checked`, `updated` and its own blocks between `<!-- wh:sweep -->` / `<!-- wh:picks -->` markers.
+`wh` only writes `checked`, `updated` and its own blocks between `<!-- wh:sweep -->` / `<!-- wh:picks -->` markers. `hunt` saves the sweep before asking Claude, so a failed Claude call doesn't lose it.
+
+A sweep's "new", "price cuts" and "gone" compare with earlier runs of the same search URL (changing a URL starts over). "Gone" compares with the last run that read every page. `--dry-run` records no run, so the next real sweep still compares with the last real one.
+
+When most ads of a search fall outside the profile's willhaben category (`profiles.CATEGORY`), the sweep says so and suggests the URL inside it. Category ids count, slugs don't: `laptops-notebooks-5824` is all of "Computer / Software", the notebooks are `computer-tablets/notebooks-5831`. `wh facets` shows the subcategories of any search.
 
 ## Settings
 
@@ -39,7 +51,9 @@ Notes in `~/Notes/Marketplace` (`WH_NOTES` overrides), with YAML properties:
 |---|---|
 | `WH_DB` | `~/.local/share/wh/wh.db` |
 | `WH_NOTES` | `~/Notes/Marketplace` |
-| `WH_DELAY` | `1.1` seconds between requests |
+| `WH_WORKERS` | `4` requests at once (`1` for one at a time) |
+| `WH_RATE` | `4` requests per second, all workers together |
+| `WH_DELAY` | `1.1` seconds between requests once willhaben pushes back |
 | `WH_MODEL` | Claude Code's default model |
 
 There's no timer: wh runs when I run it.

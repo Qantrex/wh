@@ -4,7 +4,6 @@ import importlib.util
 import io
 import json
 import os
-import sqlite3
 import tempfile
 import unittest
 from unittest import mock
@@ -22,7 +21,7 @@ def next_page(obj):
         {"props": {"pageProps": obj}})
 
 
-def make_summary(ad_id, heading, price, body="", seo="", cats="5824;5831", private="1", loc="Wien"):
+def make_summary(ad_id, heading, price, body="", seo="", cats="5824;5831", private="1", loc="Wien", state="Wien"):
     return {
         "id": str(ad_id),
         "description": heading,
@@ -30,7 +29,7 @@ def make_summary(ad_id, heading, price, body="", seo="", cats="5824;5831", priva
             {"name": "HEADING", "values": [heading]},
             {"name": "PRICE", "values": [str(price)] if price is not None else []},
             {"name": "LOCATION", "values": [loc]},
-            {"name": "STATE", "values": ["Wien"]},
+            {"name": "STATE", "values": [state]},
             {"name": "POSTCODE", "values": ["1230"]},
             {"name": "ISPRIVATE", "values": [private]},
             {"name": "PUBLISHED_String", "values": ["2026-10-20T10:00:00Z"]},
@@ -39,6 +38,19 @@ def make_summary(ad_id, heading, price, body="", seo="", cats="5824;5831", priva
             {"name": "categorytreeids", "values": cats.split(";") if cats else []},
         ]},
     }
+
+
+def search_page(found, ads):
+    return next_page({"searchResult": {"rowsFound": found, "advertSummaryList": {"advertSummary": ads}}})
+
+
+class FakeResp(io.BytesIO):
+    def __init__(self, body, headers=None):
+        super().__init__(body)
+        self.headers = headers or {}
+    def geturl(self): return "https://www.willhaben.at/ok"
+    def __enter__(self): return self
+    def __exit__(self, *a): pass
 
 
 def make_detail_html(ad_id, title, price, descr="", status="active", images=None, info=None, old_price=None):
@@ -175,20 +187,22 @@ class ProfilesTests(unittest.TestCase):
         self.assertEqual(top15_groups, {1, 2, 3, 4, 5})
 
 
-class WhTests(unittest.TestCase):
+class TmpDbCase(unittest.TestCase):
+    """A fresh database per test; requests in order, without waiting."""
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.db_path = os.path.join(self.tmp.name, "wh.db")
-        self.orig_db = wh.DB
-        self.orig_delay = wh.DELAY
-        wh.DB = self.db_path
-        wh.DELAY = 0.0
+        self.orig = (wh.DB, wh.DELAY, wh.RATE, wh.WORKERS)
+        wh.DB, wh.DELAY, wh.RATE, wh.WORKERS = self.db_path, 0.0, 0, 1   # in order, no waiting
+        wh._slow[0], wh._next[0] = False, 0.0
 
     def tearDown(self):
-        wh.DB = self.orig_db
-        wh.DELAY = self.orig_delay
+        wh.DB, wh.DELAY, wh.RATE, wh.WORKERS = self.orig
+        wh._slow[0], wh._next[0] = False, 0.0
         self.tmp.cleanup()
 
+
+class WhTests(TmpDbCase):
     def test_search_url_preserves_repeated_query_params(self):
         u = "https://www.willhaben.at/iad/kaufen-und-verkaufen/marktplatz/laptops-5824?areaId=900&areaId=3&page=4"
         out = wh.search_url(words="thinkpad", pmax=900, url=u)
@@ -494,6 +508,192 @@ class WhTests(unittest.TestCase):
             self.assertIsNotNone(ad["junk"], msg="Expected %d to be junk" % j)
         short = profiles.shortlist(ads, "hue", 2)
         self.assertEqual({x["id"] for x in short}, {20, 21})   # standalone Bridge V2 doesn't crowd out controls & bulbs
+
+    def test_hue_lamps_with_a_dimmer_power_supplies_and_gateway_bundles(self):
+        ads = [
+            {"id": 30, "title": "(NEU) Philips Hue White Ambiance Runner Spot 1 flg. weiß inkl. Dimmschalter in OVP",
+             "price": 74, "body": ""},
+            {"id": 31, "title": "Philips Hue White Ambiance Being Pendelleuchte weiß 2750lm inkl. Dimmschalter",
+             "price": 130, "body": ""},
+            {"id": 32, "title": "Philips Hue Niedervolt-Netzteile Outdoor 40 Watt", "price": 35,
+             "body": "7 Stück vorhanden, für Lily und Calla"},
+            {"id": 33, "title": "* Philips Hue Gateway mit 2 Lampen und Lichtband *", "price": 80, "body": ""},
+            {"id": 34, "title": "Philips Hue Base Station 2.1 + 3x Dimmer", "price": 50, "body": ""},
+            {"id": 35, "title": "Philips Hue Dimmschalter mit Glühbirnen", "price": 90, "body": "2x GU10"},
+            {"id": 36, "title": "Philips Hue Dimmer Switch V2 9290023986 mit Wandhalterung", "price": 15, "body": ""},
+            {"id": 37, "title": "Stehlampe Schwarz/Gold inkl. Philips Hue Color Big Studio", "price": 90, "body": ""},
+        ]
+        profiles.annotate(ads, "hue")
+        kind = {a["id"]: a["kind"] for a in ads}
+        self.assertEqual((kind[30], kind[31]), ("Lamp", "Lamp"))
+        self.assertIsNotNone(ads[2]["junk"])                   # a power supply isn't a light
+        self.assertEqual((kind[33], kind[34], kind[35]), ("Bundle", "Bundle", "Bundle"))
+        self.assertEqual(kind[36], "Dimmer V2")                # a wall plate is an add-on, still the dimmer
+        self.assertEqual(kind[37], "Lamp")
+
+
+class FetchSweepTests(TmpDbCase):
+    def sweep(self, c, props, pages_by_keyword, pages=1, record=True):
+        """sweep_note() against fake search pages: {keyword: html or exception}."""
+        def fake_fetch(url, binary=False):
+            r = next(v for k, v in pages_by_keyword.items() if "keyword=" + k in url)
+            if isinstance(r, Exception):
+                raise r
+            return url, r
+        with mock.patch.object(wh, "fetch", side_effect=fake_fetch), mock.patch.object(wh, "log"):
+            return wh.sweep_note(c, os.path.join(self.tmp.name, "Note.md"), props, pages, 10, record=record)
+
+    def test_dry_run_leaves_no_run_so_new_ads_stay_new(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        props = {"search": ["goggles"]}
+        a, b, n = (make_summary(i, "DJI Goggles V2 #%d" % i, 150 + i) for i in (1, 2, 3))
+        self.sweep(c, props, {"goggles": search_page(2, [a, b])})
+        block, *_ = self.sweep(c, props, {"goggles": search_page(3, [a, b, n])}, record=False)
+        self.assertIn("1 new", block)
+        self.assertEqual(c.execute("select count(*) from runs").fetchone()[0], 1)
+        block, *_ = self.sweep(c, props, {"goggles": search_page(3, [a, b, n])})
+        self.assertIn("1 new", block)                          # still new: the dry run didn't count as a sweep
+
+    def test_gone_compares_with_the_last_sweep_that_read_every_page(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        props = {"search": ["goggles"]}
+        a, b = make_summary(1, "DJI Goggles V2", 180), make_summary(2, "DJI Goggles 2 Fly More", 300)
+        self.sweep(c, props, {"goggles": search_page(2, [a, b])})
+        block, *_ = self.sweep(c, props, {"goggles": search_page(250, [a])})     # page limit: incomplete
+        self.assertIn("read 1 of 250 ads", block)
+        self.assertIn("0 gone", block)
+        block, *_ = self.sweep(c, props, {"goggles": search_page(1, [a])})
+        self.assertIn("1 gone", block)
+        self.assertIn("DJI Goggles 2 Fly More", block)
+
+    def test_a_failed_search_is_reported_and_the_sweep_carries_on(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        props = {"search": ["rtx", "gtx"]}
+        page = search_page(1, [make_summary(1, "Acer Nitro 5 RTX 3060", 500)])
+        block, short, *_ = self.sweep(c, props, {"rtx": page, "gtx": wh.FetchError("can't fetch: timed out")})
+        self.assertIn("gtx: couldn't read it all (can't fetch: timed out)", block)
+        self.assertIn("Acer Nitro 5 RTX 3060", block)
+        self.assertEqual(c.execute("select complete from runs order by run").fetchall()[1][0], 0)
+
+    def test_parallel_fetch_reads_every_page_of_every_search(self):
+        wh.WORKERS = 4
+        c = wh.db()
+        self.addCleanup(c.close)
+        calls = []
+
+        def fake_fetch(url, binary=False):
+            calls.append(url)
+            base = 1000 if "keyword=rtx" in url else 2000
+            page = int(url.rsplit("page=", 1)[1])
+            n = 50 if page == 3 else 200
+            ads = [make_summary(base * 10 + page * 200 + i, "Laptop %d" % i, 500) for i in range(n)]
+            return url, search_page(450, ads)
+
+        with mock.patch.object(wh, "fetch", side_effect=fake_fetch), mock.patch.object(wh, "log"):
+            res = wh.run_searches(c, [(wh.search_url("rtx"), "a"), (wh.search_url("gtx"), "b")], pages=5)
+        self.assertEqual([(len(r["ads"]), r["complete"], r["error"]) for r in res], [(450, True, None)] * 2)
+        self.assertEqual(len(calls), 6)
+
+    def test_pushback_slows_every_worker_down_and_retries(self):
+        ok = FakeResp(next_page({"searchResult": {"rowsFound": 0}}).encode())
+        busy = wh.urllib.error.HTTPError("https://www.willhaben.at/x", 429, "Too Many Requests", {}, io.BytesIO())
+        self.addCleanup(busy.close)
+        with mock.patch("urllib.request.urlopen", side_effect=[busy, ok]), mock.patch("time.sleep"), \
+             mock.patch.object(wh, "log"):
+            _, text = wh.fetch("https://www.willhaben.at/x")
+        self.assertIn("rowsFound", text)
+        self.assertTrue(wh._slow[0])
+
+    def test_a_cloudflare_challenge_is_never_returned_as_a_page(self):
+        challenge = b"<html><head><title>Just a moment...</title></head></html>"
+        with mock.patch("urllib.request.urlopen", side_effect=lambda *a, **k: FakeResp(challenge)), \
+             mock.patch("time.sleep"), mock.patch.object(wh, "log"):
+            with self.assertRaises(wh.FetchError):
+                wh.fetch("https://www.willhaben.at/x")
+        self.assertTrue(wh._slow[0])
+
+    def test_sweep_warns_when_a_search_is_in_the_wrong_category(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        url = "https://www.willhaben.at/iad/kaufen-und-verkaufen/marktplatz/laptops-notebooks-5824?keyword=rtx&PRICE_TO=850"
+        ads = ([make_summary(i, "Gaming PC RTX 3060 #%d" % i, 600, cats="5824;5828;5833") for i in range(20)]
+               + [make_summary(100 + i, "Lenovo Legion RTX 3060 #%d" % i, 650) for i in range(5)])
+        block, *_ = self.sweep(c, {"search": [url], "wh-profile": "laptop"}, {"rtx": search_page(25, ads)})
+        self.assertIn("80% of its ads are outside willhaben's notebooks-5831 category", block)
+        self.assertIn("/marktplatz/computer-tablets/notebooks-5831?keyword=rtx&PRICE_TO=850 instead", block)
+
+    def test_area_marks_near_ads_and_keeps_the_others(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        ads = [make_summary(1, "DJI Goggles V2", 180, state="Wien"),
+               make_summary(2, "DJI Goggles V2 Graz", 150, loc="Graz", state="Steiermark")]
+        block, short, *_ = self.sweep(c, {"search": ["goggles"], "wh-area": "wien, noe"},
+                                      {"goggles": search_page(2, ads)})
+        self.assertIn("1 in Wien/NÖ", block)
+        self.assertIn("| Near |", block)
+        self.assertEqual({x["id"]: x["near"] for x in short}, {1: True, 2: False})   # Graz stays on the list
+
+    def test_area_names(self):
+        self.assertEqual(wh.area("wien, noe"), {"Wien", "Niederösterreich"})
+        self.assertEqual(wh.area(["Wien", "NÖ"]), {"Wien", "Niederösterreich"})
+        self.assertEqual(wh.area(None), set())
+        with self.assertRaises(wh.WhError):
+            wh.area("graz")
+
+    def test_hunt_keeps_the_sweep_when_claude_fails(self):
+        note_path = os.path.join(self.tmp.name, "Goggles.md")
+        with open(note_path, "w", encoding="utf-8") as f:
+            f.write("---\ntype: buy\nstatus: open\nsearch: goggles\n---\n# Goggles\n")
+        page = search_page(1, [make_summary(1, "DJI Goggles V2", 180)])
+        c = wh.db()
+        self.addCleanup(c.close)
+        ns = mock.Mock(note=note_path, pages=1, limit=10, details=0, dry_run=False, no_ai=False)
+        with mock.patch.object(wh, "db", return_value=c), \
+             mock.patch.object(wh, "fetch", return_value=("u", page)), \
+             mock.patch.object(wh, "ask_claude", side_effect=wh.WhError("claude failed: rate limit")), \
+             mock.patch.object(wh, "log"):
+            with self.assertRaises(wh.WhError):
+                wh.cmd_hunt(ns)
+        saved, _ = wh.read_note(note_path)
+        self.assertIn("<!-- wh:sweep -->", saved)
+        self.assertIn("DJI Goggles V2", saved)
+
+    def test_ask_all_keeps_order_and_reports_failures(self):
+        def fake(a, task, data):
+            if data == "b":
+                raise wh.WhError("claude failed: boom")
+            return "answer " + data
+        with mock.patch.object(wh, "ask_claude", side_effect=fake):
+            self.assertEqual(wh.ask_all(mock.Mock(), [("t", "a"), ("t", "b"), ("t", "c")]),
+                             ["answer a", "wh: claude failed: boom", "answer c"])
+
+    def test_facets_prints_category_urls_and_filter_params(self):
+        nav = [{"label": "Kategorie", "navigatorList": [{"id": "category", "label": "Kategorie",
+                "groupedPossibleValues": [{"possibleValues": [
+                    {"label": "Notebooks", "hits": 207, "webLink": {"uri": "https://www.willhaben.at/iad/kaufen-und-"
+                     "verkaufen/marktplatz/computer-tablets/notebooks-5831?keyword=rtx"},
+                     "urlParamRepresentationForValue": [{"urlParameterName": "ATTRIBUTE_TREE", "value": "5831"}]},
+                    {"label": "Netbooks", "hits": 0, "webLink": {"uri": "x"}}]}]}]},
+               {"label": "Basisdaten", "navigatorList": [
+                   {"id": "price", "label": "Preis", "groupedPossibleValues": [{"possibleValues": [
+                       {"label": "ab € 0", "hits": 994, "urlParamRepresentationForValue": [
+                           {"urlParameterName": "PRICE_FROM", "navigatorUrlParameterType": "RANGE_FROM", "value": "0"}]}]}]},
+                   {"id": "Zustand", "label": "Zustand", "groupedPossibleValues": [{"possibleValues": [
+                       {"label": "Gebraucht", "hits": 713, "urlParamRepresentationForValue": [
+                           {"urlParameterName": "treeAttributes", "value": "23"}]}]}]}]}]
+        page = next_page({"searchResult": {"rowsFound": 994, "navigatorGroups": nav}})
+        out = io.StringIO()
+        with mock.patch.object(wh, "fetch", return_value=("u", page)), mock.patch("sys.stdout", out):
+            wh.cmd_facets(mock.Mock(words=["rtx"], url=None, min=None, max=None, limit=15))
+        text = out.getvalue()
+        self.assertIn("994 ads for", text)
+        self.assertIn("computer-tablets/notebooks-5831?keyword=rtx", text)
+        self.assertIn("treeAttributes=23", text)
+        self.assertNotIn("Netbooks", text)                     # no ads
+        self.assertNotIn("Preis", text)                        # price ranges: use --min/--max
 
 
 if __name__ == "__main__":
