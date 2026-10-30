@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """wh: willhaben.at from the terminal. Fast public data with a local cache; Claude does the judging.
 
-Data commands (no AI):  search, ad, photos, status, sweep
+Data commands (no AI):  search, facets, ad, photos, status, sweep
 AI commands:            deal, advise, hunt   (gather the data, then ask `claude -p` with the willhaben skill's rules;
                                               --no-ai prints the gathered data instead, for use inside a Claude session)
 
@@ -11,6 +11,7 @@ Every ad wh sees goes into ~/.local/share/wh/wh.db (price history, "new since la
 import argparse
 import gzip
 import html
+import http.client
 import json
 import os
 import re
@@ -19,10 +20,12 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
@@ -34,10 +37,22 @@ UA = "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0"
 DB = os.path.expanduser(os.environ.get("WH_DB", "~/.local/share/wh/wh.db"))
 NOTES = os.path.expanduser(os.environ.get("WH_NOTES", "~/Notes/Marketplace"))
 SKILL = os.path.expanduser(os.environ.get("WH_SKILL", "~/.claude/skills/willhaben/SKILL.md"))
-DELAY = float(os.environ.get("WH_DELAY", "1.1"))      # seconds between requests: one at a time, politely
+WORKERS = max(int(os.environ.get("WH_WORKERS", "4")), 1)  # requests in flight at once
+RATE = float(os.environ.get("WH_RATE", "4"))               # requests per second, all workers together
+DELAY = float(os.environ.get("WH_DELAY", "1.1"))           # seconds between requests once willhaben pushes back
 DETAIL_MAX_AGE_H = 12
 OPEN = {"open", "active", "waiting", "live", "reserved"}
-_last = [0.0]
+_lock = threading.Lock()
+_next = [0.0]                                              # monotonic time the next request may start
+_slow = [False]                                            # set when willhaben pushes back
+
+
+class WhError(Exception):
+    """Something to report as `wh: …`; commands that handle several notes report it per note and carry on."""
+
+
+class FetchError(WhError):
+    pass
 
 
 def log(*a):
@@ -54,14 +69,32 @@ def hours_since(ts):
 
 # ---- fetching -------------------------------------------------------------------------------------------------
 
+def wait_turn():
+    """Block until this thread may send a request: RATE per second overall, or one per DELAY s once slowed down."""
+    with _lock:
+        gap = DELAY if _slow[0] else (1 / RATE if RATE > 0 else 0)
+        t = max(time.monotonic(), _next[0])
+        _next[0] = t + gap
+    time.sleep(max(t - time.monotonic(), 0))
+
+
+def slow_down(why):
+    """willhaben pushed back: every worker drops to one request per DELAY s for the rest of the run."""
+    with _lock:
+        if not _slow[0]:
+            log("  willhaben pushed back (%s): one request every %.1f s from now on" % (why, DELAY))
+        _slow[0] = True
+        _next[0] = max(_next[0], time.monotonic() + 5)
+
+
 def fetch(url, binary=False):
-    """GET with a browser UA, one request at a time, 3 tries. Returns (final_url, body); body is '' on a 404."""
+    """GET with a browser UA within the shared rate limit, 3 tries. Returns (final_url, body); body is empty on a 404.
+    Raises FetchError when every try fails."""
     err = None
     for attempt in range(3):
-        wait = _last[0] + DELAY - time.time()
-        if wait > 0:
-            time.sleep(wait)
-        _last[0] = time.time()
+        if attempt:
+            time.sleep(4 * attempt)
+        wait_turn()
         try:
             req = urllib.request.Request(url, headers={
                 "User-Agent": UA, "Accept-Language": "de-AT,de;q=0.9", "Accept-Encoding": "gzip",
@@ -70,21 +103,48 @@ def fetch(url, binary=False):
                 body = r.read()
                 if body and r.headers.get("Content-Encoding", "").lower() == "gzip":
                     body = gzip.decompress(body)
-                return r.geturl(), body if binary else body.decode("utf-8", "replace")
+                if binary:
+                    return r.geturl(), body
+                text = body.decode("utf-8", "replace")
+                if not (r.headers.get("cf-mitigated") or "<title>Just a moment" in text[:3000]):
+                    return r.geturl(), text
+                err = "Cloudflare challenge"
+                slow_down(err)
         except urllib.error.HTTPError as e:
             if e.code in (404, 410):
                 return url, b"" if binary else ""
+            if e.code in (403, 429, 503):
+                slow_down("HTTP %d" % e.code)
             err = e
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+        except (http.client.HTTPException, OSError) as e:
             err = e
-        log("  retry %d: %s" % (attempt + 1, err))
-        time.sleep(4 * (attempt + 1))
-    sys.exit("wh: can't fetch %s: %s" % (url, err))
+        if attempt < 2:
+            log("  retry %d: %s" % (attempt + 1, err))
+    raise FetchError("can't fetch %s: %s" % (url, err))
+
+
+def pmap(fn, items):
+    """[fn(x) for x in items] on up to WORKERS threads, in order. A FetchError comes back in place of its result."""
+    def one(x):
+        try:
+            return fn(x)
+        except FetchError as e:
+            return e
+    if WORKERS == 1 or len(items) < 2:
+        return [one(x) for x in items]
+    ex = ThreadPoolExecutor(min(WORKERS, len(items)))
+    try:
+        return list(ex.map(one, items))
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
 
 
 def page_props(h):
-    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', h, re.S)
-    return json.loads(m.group(1))["props"]["pageProps"] if m else {}
+    i = h.find('<script id="__NEXT_DATA__"')
+    j = h.find("</script>", i) if i >= 0 else -1
+    if j < 0:
+        return {}
+    return json.loads(h[h.index(">", i) + 1:j])["props"]["pageProps"]
 
 
 def attrs(obj):
@@ -121,8 +181,8 @@ def ad_id(s):
     return int(m.group(1))
 
 
-def search_url(words=None, url=None, pmin=None, pmax=None):
-    """A search URL with rows=200 and no page. `url` may be a full willhaben search URL or a category slug."""
+def search_url(words=None, url=None, pmin=None, pmax=None, rows=200):
+    """A search URL with `rows` per page and no page. `url` may be a full willhaben search URL or a category slug."""
     if url and not url.startswith("http"):
         url = SEARCH + "/" + url.strip("/")
     u = urllib.parse.urlsplit(url or SEARCH)
@@ -135,8 +195,60 @@ def search_url(words=None, url=None, pmin=None, pmax=None):
         qs.append(("PRICE_FROM", str(int(pmin))))
     if pmax is not None:
         qs.append(("PRICE_TO", str(int(pmax))))
-    qs.append(("rows", "200"))
+    qs.append(("rows", str(rows)))
     return urllib.parse.urlunsplit((u.scheme, u.netloc, u.path, urllib.parse.urlencode(qs), ""))
+
+
+def in_category(url, path):
+    """The same search inside another category, e.g. path 'computer-tablets/notebooks-5831'."""
+    u = urllib.parse.urlsplit(url)
+    qs = [(k, v) for k, v in urllib.parse.parse_qsl(u.query) if k not in ("rows", "page")]
+    return urllib.parse.urlunsplit(("https", "www.willhaben.at", "/iad/kaufen-und-verkaufen/marktplatz/" + path,
+                                    urllib.parse.urlencode(qs), ""))
+
+
+def describe(url):
+    """A search URL in a few words for the terminal: category and query."""
+    u = urllib.parse.urlsplit(url)
+    qs = "&".join("%s=%s" % kv for kv in urllib.parse.parse_qsl(u.query) if kv[0] not in ("rows", "page"))
+    return (u.path.rsplit("/", 1)[-1] + ("?" + qs if qs else ""))[:90]
+
+
+# willhaben's STATE value: (short name, what a note's `wh-area` may say)
+STATES = {
+    "Wien": ("Wien", "wien"),
+    "Niederösterreich": ("NÖ", "noe", "nö", "niederösterreich", "niederoesterreich"),
+    "Burgenland": ("Bgld", "bgld", "burgenland"),
+    "Oberösterreich": ("OÖ", "ooe", "oö", "oberösterreich", "oberoesterreich"),
+    "Steiermark": ("Stmk", "stmk", "steiermark"),
+    "Kärnten": ("Ktn", "ktn", "kärnten", "kaernten"),
+    "Salzburg": ("Sbg", "sbg", "salzburg"),
+    "Tirol": ("Tirol", "tirol"),
+    "Vorarlberg": ("Vbg", "vbg", "vorarlberg"),
+}
+
+
+def area(spec):
+    """`wien, noe` (or a list) → {'Wien', 'Niederösterreich'}; empty without an area."""
+    words = [w for x in (spec if isinstance(spec, list) else [spec or ""]) for w in re.split(r"[,;/\s]+", x.lower()) if w]
+    out = set()
+    for w in words:
+        st = next((s for s, names in STATES.items() if w in names[1:]), None)
+        if not st:
+            raise WhError("unknown area %r; use %s" % (w, ", ".join(n[1] for n in STATES.values())))
+        out.add(st)
+    return out
+
+
+def area_label(states):
+    return "/".join(short for s, (short, *_) in STATES.items() if s in states)
+
+
+def mark_near(ads, states):
+    """Mark the ads in my pickup area. Only a mark: ads elsewhere stay, since I can travel there or ask for shipping."""
+    for a in ads:
+        a["near"] = (a.get("state") in states) if states else None
+    return ads
 
 
 # ---- database -------------------------------------------------------------------------------------------------
@@ -189,40 +301,61 @@ def store(c, ads, t):
             c.execute("insert into prices values (?,?,?)", (a["id"], a["price"], t))
 
 
-def run_search(c, url, pages=5, key=None):
-    """Fetch up to `pages` pages of 200 ads, store them and record the run. Returns (ads, rows_found, complete)."""
-    t, out, found, page, ok = now(), {}, 0, 0, False
-    for page in range(1, pages + 1):
-        _, h = fetch(url + "&page=%d" % page)
-        sr = page_props(h).get("searchResult")
-        if not sr:
-            ok = False
-            break
-        ok = True
-        found = sr.get("rowsFound") or 0
-        lst = (sr.get("advertSummaryList") or {}).get("advertSummary") or []
-        for a in lst:
-            s = summary(a)
-            out[s["id"]] = s
-        log("  page %d: %d ads (%d of %d)" % (page, len(lst), len(out), found))
-        if page * 200 >= found or not lst:
-            break
-    complete = ok and page * 200 >= found
-    store(c, out.values(), t)
-    cur = c.execute("insert into runs (key, url, at, found, complete) values (?,?,?,?,?)",
-                    (key or url, url, t, found, int(complete)))
-    c.executemany("insert into hits values (?,?)", [(cur.lastrowid, i) for i in out])
-    c.commit()
-    return list(out.values()), found, complete
+def read_page(url):
+    """One search page as (rows_found, ad summaries), or None when the page has no search result."""
+    _, h = fetch(url)
+    sr = page_props(h).get("searchResult")
+    if not sr:
+        return None
+    return sr.get("rowsFound") or 0, [summary(a) for a in (sr.get("advertSummaryList") or {}).get("advertSummary") or []]
 
 
-def details(c, i, refresh=False):
-    """Full ad page as a dict (cached DETAIL_MAX_AGE_H hours). status is 'offline' when the ad is gone."""
-    row = c.execute("select fetched, data from details where id=?", (i,)).fetchone()
-    prev = json.loads(row["data"]) if row else {}
-    if row and not refresh and hours_since(row["fetched"]) < DETAIL_MAX_AGE_H:
-        return prev
+def run_searches(c, jobs, pages=5, record=True):
+    """Fetch [(url, key), …] through the worker pool, page 1 of every search first (it says how many pages there are),
+    then the rest. Stores the ads and, unless record=False, one run per key. Returns one dict per job: ads, found,
+    complete (every page read) and error (why not, when a page failed)."""
     t = now()
+    urls = list(dict.fromkeys(u for u, _ in jobs))
+    first = pmap(lambda u: read_page(u + "&page=1"), urls)
+    more = [(u, p) for u, r in zip(urls, first) if isinstance(r, tuple) for p in range(2, min(pages, -(-r[0] // 200)) + 1)]
+    rest = dict(zip(more, pmap(lambda job: read_page("%s&page=%d" % job), more)))
+    res = {}
+    for u, r in zip(urls, first):
+        if not isinstance(r, tuple):
+            res[u] = dict(ads=[], found=0, complete=False, error=str(r) if r else "page 1 has no search result")
+            log("  %s: %s" % (describe(u), res[u]["error"]))
+            continue
+        found, ads, errors = r[0], {a["id"]: a for a in r[1]}, []
+        needed = -(-found // 200)
+        for p in range(2, min(pages, needed) + 1):
+            rp = rest[(u, p)]
+            if isinstance(rp, tuple) and rp[1]:
+                ads.update((a["id"], a) for a in rp[1])
+            else:
+                errors.append("page %d: %s" % (p, rp if isinstance(rp, FetchError) else "no ads"))
+        error = "; ".join(errors) or None
+        res[u] = dict(ads=list(ads.values()), found=found, complete=not error and needed <= pages, error=error)
+        log("  %s: %d of %d ads%s" % (describe(u), len(ads), found, " (%s)" % error if error else ""))
+    for u in urls:
+        store(c, res[u]["ads"], t)
+    if record:
+        for u, key in jobs:
+            r = res[u]
+            cur = c.execute("insert into runs (key, url, at, found, complete) values (?,?,?,?,?)",
+                            (key or u, u, t, r["found"], int(r["complete"])))
+            c.executemany("insert into hits values (?,?)", [(cur.lastrowid, a["id"]) for a in r["ads"]])
+    c.commit()
+    return [res[u] for u, _ in jobs]
+
+
+def run_search(c, url, pages=5, key=None, record=True):
+    """run_searches() for one search. Returns (ads, rows_found, complete)."""
+    r = run_searches(c, [(url, key)], pages, record)[0]
+    return r["ads"], r["found"], r["complete"]
+
+
+def fetch_detail(i, prev):
+    """The full ad page as a dict, without touching the database. A gone ad keeps what was known, as 'offline'."""
     final, h = fetch("%s/iad/object?adId=%d" % (BASE, i))
     ad = page_props(h).get("advertDetails") if h else None
     if not ad:
@@ -248,13 +381,43 @@ def details(c, i, refresh=False):
                  ends=(ad.get("endDate") or "")[:10], info=info, descr=clean(g("DESCRIPTION")),
                  images=[u for u in (x.get("referenceImageUrl") or x.get("mainImageUrl") for x in imgs) if u],
                  url=final if "/d/" in final else "%s/iad/object?adId=%d" % (BASE, i))
-        if d["price"] is not None:
-            last = c.execute("select price from prices where id=? order by seen desc, rowid desc limit 1", (i,)).fetchone()
-            if last is None or last["price"] != d["price"]:
-                c.execute("insert into prices values (?,?,?)", (i, d["price"], t))
-            c.execute("update ads set price=?, last_seen=? where id=?", (d["price"], t, i))
+    return d
+
+
+def save_detail(c, d, t):
+    i = d["id"]
+    if d["status"] != "offline" and d.get("price") is not None:
+        last = c.execute("select price from prices where id=? order by seen desc, rowid desc limit 1", (i,)).fetchone()
+        if last is None or last["price"] != d["price"]:
+            c.execute("insert into prices values (?,?,?)", (i, d["price"], t))
+        c.execute("update ads set price=?, last_seen=? where id=?", (d["price"], t, i))
     c.execute("insert or replace into details values (?,?,?)", (i, t, json.dumps(d, ensure_ascii=False)))
+
+
+def details_many(c, ids, refresh=False):
+    """details() for many ads: fresh ones from the cache, the rest fetched in parallel. {id: dict or FetchError}"""
+    out, todo = {}, []
+    for i in dict.fromkeys(ids):
+        row = c.execute("select fetched, data from details where id=?", (i,)).fetchone()
+        prev = json.loads(row["data"]) if row else {}
+        if row and not refresh and hours_since(row["fetched"]) < DETAIL_MAX_AGE_H:
+            out[i] = prev
+        else:
+            todo.append((i, prev))
+    t = now()
+    for (i, _), d in zip(todo, pmap(lambda job: fetch_detail(*job), todo)):
+        if not isinstance(d, FetchError):
+            save_detail(c, d, t)
+        out[i] = d
     c.commit()
+    return out
+
+
+def details(c, i, refresh=False):
+    """Full ad page as a dict (cached DETAIL_MAX_AGE_H hours). status is 'offline' when the ad is gone."""
+    d = details_many(c, [i], refresh)[i]
+    if isinstance(d, FetchError):
+        raise d
     return d
 
 
@@ -406,23 +569,26 @@ def specs(a, profile):
 def table(ads, profile=None, md=False, extra=None):
     """ads as a Markdown table (md) or as aligned plain text."""
     has_specs = bool(profile and profiles.FIELDS.get(profile))
-    head = (["Price"] + (["Was"] if extra else []) + ["Ad", "Where", "P/D"]
+    has_near = any(a.get("near") is not None for a in ads)  # only with an area (`wh-area`, --area)
+    near = lambda a: ["✓" if a.get("near") else ""] if has_near else []  # noqa: E731
+    head = (["Price"] + (["Was"] if extra else []) + ["Ad", "Where"] + (["Near"] if has_near else []) + ["P/D"]
             + (["Specs"] if has_specs else []) + ["Online since"] + ([] if md else ["ID"]))
     if md:
         lines = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
         for a in ads:
             cols = ([euro(a.get("price"))] + ([extra(a)] if extra else [])
-                    + ["[%s](%s)" % (link_text(a.get("title", ""), 70), a.get("url", "")),
-                       cell(a.get("loc", ""), 30), "P" if a.get("private") else "D"]
+                    + ["[%s](%s)" % (link_text(a.get("title", ""), 70), a.get("url", "")), cell(a.get("loc", ""), 30)]
+                    + near(a) + ["P" if a.get("private") else "D"]
                     + ([cell(specs(a, profile))] if has_specs else [])
                     + [cell(a.get("published", ""))])
             lines.append("| " + " | ".join(cols) + " |")
         return "\n".join(lines)
-    widths = [7] + ([7] if extra else []) + [52, 26, 3] + ([38] if has_specs else []) + [12, 10]
+    widths = ([7] + ([7] if extra else []) + [52, 26] + ([4] if has_near else []) + [3] + ([38] if has_specs else [])
+              + [12, 10])
     rows = [head]
     for a in ads:
-        rows.append([euro(a.get("price"))] + ([extra(a)] if extra else [])
-                    + [a.get("title", ""), a.get("loc", ""), "P" if a.get("private") else "D"]
+        rows.append([euro(a.get("price"))] + ([extra(a)] if extra else []) + [a.get("title", ""), a.get("loc", "")]
+                    + near(a) + ["P" if a.get("private") else "D"]
                     + ([specs(a, profile)] if has_specs else [])
                     + [a.get("published", ""), a.get("id")])
     fmt = lambda r: "  ".join(cell(x, w).ljust(w) for x, w in zip(r, widths)).rstrip()  # noqa: E731
@@ -495,13 +661,25 @@ def ask_claude(a, task, data, *rule_headings):
     try:
         r = subprocess.run(cmd, input=prompt, text=True, capture_output=True, timeout=a.timeout)
     except FileNotFoundError:
-        sys.exit("wh: `claude` not found; use --no-ai to print the data instead")
+        raise WhError("`claude` not found; use --no-ai to print the data instead")
     except subprocess.TimeoutExpired:
-        sys.exit("wh: Claude didn't answer within %d s (usually a rate limit while other sessions run). Try again, "
-                 "pick a faster model with --model, or use --no-ai." % a.timeout)
+        raise WhError("Claude didn't answer within %d s (usually a rate limit while other sessions run). Try again, "
+                      "pick a faster model with --model, or use --no-ai." % a.timeout)
     if r.returncode:
-        sys.exit("wh: claude failed: %s" % (r.stderr or r.stdout)[-800:])
+        raise WhError("claude failed: %s" % (r.stderr or r.stdout)[-800:])
     return r.stdout.strip()
+
+
+def ask_all(a, jobs):
+    """ask_claude(a, *job) for several jobs at once (Claude's side, so no load on willhaben). A failed one gives its
+    error text instead of an answer."""
+    def one(job):
+        try:
+            return ask_claude(a, *job)
+        except WhError as e:
+            return "wh: %s" % e
+    with ThreadPoolExecutor(min(len(jobs), 4) or 1) as ex:
+        return list(ex.map(one, jobs))
 
 
 STOP = {"verkaufe", "verkauf", "neu", "neuwertig", "top", "zustand", "zusatnd", "inkl", "inklusive", "mit", "ohne",
@@ -520,9 +698,13 @@ def comp_words(title):
     return " ".join(title_words(title)[:4])
 
 
-def comparables(c, d, words, pages, profile):
-    """Ads found by a keyword search, minus this ad and junk. Returns (ads, 'N found, M removed …' line)."""
-    ads, found, _ = run_search(c, search_url(words), pages, key="comps:" + words)
+def comparables(c, d, words, pages, profile, fetched=None):
+    """Ads found by a keyword search (or `fetched`, its run_searches() result), minus this ad and junk.
+    Returns (ads, 'N found, M removed …' line)."""
+    if fetched is None:
+        ads, found, _ = run_search(c, search_url(words), pages, key="comps:" + words)
+    else:
+        ads, found = fetched["ads"], fetched["found"]
     ads = profiles.annotate(attach_details(c, ads), profile)
     own = sum(1 for x in ads if x["id"] == d["id"])
     junk = sum(1 for x in ads if x["junk"] and x["id"] != d["id"])
@@ -540,7 +722,7 @@ def comparables(c, d, words, pages, profile):
 def cmd_search(a):
     c = db()
     ads, found, complete = run_search(c, search_url(" ".join(a.words) or None, a.url, a.min, a.max), a.pages)
-    ads = profiles.annotate(attach_details(c, ads), a.profile)
+    ads = mark_near(profiles.annotate(attach_details(c, ads), a.profile), area(a.area))
     ads = sorted((x for x in ads if a.all or not x["junk"]), key=lambda x: (x["price"] is None, x["price"] or 0))
     if a.json:
         print(json.dumps(ads[:a.limit], ensure_ascii=False, indent=1))
@@ -560,8 +742,9 @@ def cmd_photos(a):
     if not d.get("images"):
         sys.exit("wh: ad is offline, no cached photos" if d["status"] == "offline" else "wh: ad has no photos")
     os.makedirs(a.dir, exist_ok=True)
-    for n, u in enumerate(d["images"], 1):
-        _, raw = fetch(u, binary=True)
+    got = pmap(lambda u: fetch(u, binary=True), d["images"])
+    for n, (u, r) in enumerate(zip(d["images"], got), 1):
+        raw = None if isinstance(r, FetchError) else r[1]
         if not raw:
             log("  photo %d unavailable: %s" % (n, u))
             continue
@@ -585,10 +768,13 @@ def cmd_photos(a):
 
 def cmd_status(a):
     c = db()
-    for f, text, p in find_notes(a.notes, statuses=OPEN):
-        if not p.get("ad"):
+    todo = [(f, text, p) for f, text, p in find_notes(a.notes, statuses=OPEN) if p.get("ad")]
+    got = details_many(c, [ad_id(p["ad"]) for _, _, p in todo], refresh=True)
+    for f, text, p in todo:
+        d = got[ad_id(p["ad"])]
+        if isinstance(d, FetchError):
+            print("%-32s couldn't check: %s" % (name_of(f), d))
             continue
-        d = details(c, ad_id(p["ad"]), refresh=True)
         line = "%-32s %s" % (name_of(f), d["status"])
         if d["status"] == "offline":
             line += "  (usually just expired, not sold)"
@@ -601,45 +787,71 @@ def cmd_status(a):
             write_note(f, set_prop(text, "checked", date.today().isoformat()))
 
 
-def sweep_note(c, path, props, pages, limit, detail_count=0):
-    """Run a note's searches; returns (markdown block, shortlist, all good ads, market line)."""
+def sweep_plan(c, path, props):
+    """A note's searches and what earlier sweeps saw, read before this run records anything."""
     searches = props.get("search") or []
     searches = searches if isinstance(searches, list) else [searches]
-    profile = props.get("wh-profile") or None
-    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    plan = []
+    items = []
     for s in searches:
         is_url = s.startswith("http") or "/" in s or re.fullmatch(r"[a-z0-9-]+-\d{3,}", s)
         url = search_url(url=s) if is_url else search_url(s)
         key = "note:%s:%s" % (name_of(path), url)
-        prev = c.execute("select run, at, complete from runs where key=? order by run desc limit 1", (key,)).fetchone()
+        last = c.execute("select run, at from runs where key=? order by run desc limit 1", (key,)).fetchone()
+        full = c.execute("select run from runs where key=? and complete=1 order by run desc limit 1", (key,)).fetchone()
         seen = {r["id"] for r in c.execute("select distinct h.id from hits h join runs r on r.run=h.run"
                                            " where r.key=?", (key,))}
-        plan.append((s, url, key, prev, seen))
-    prev_ats = [prev["at"] for _, _, _, prev, _ in plan if prev]
+        items.append(dict(search=s, url=url, key=key, last=last, full=full, seen=seen))
+    ats = [x["last"]["at"] for x in items if x["last"]]
     prev_prices = ({r["id"]: r["price"] for r in c.execute(
-        "select id, price from prices where seen <= ? order by seen, rowid", (max(prev_ats),))} if prev_ats else {})
-    seen_before = set().union(*(seen for *_, seen in plan)) if plan else set()
+        "select id, price from prices where seen <= ? order by seen, rowid", (max(ats),))} if ats else {})
+    return dict(items=items, prev_prices=prev_prices, seen=set().union(*(x["seen"] for x in items)),
+                profile=props.get("wh-profile") or None, near=area(props.get("wh-area")))
+
+
+def category_notes(plan, fetched):
+    """Searches whose ads mostly sit outside the profile's willhaben category: pages fetched only to be dropped."""
+    cat = profiles.CATEGORY.get(plan["profile"])
+    out = []
+    for x, r in zip(plan["items"], fetched if cat else []):
+        with_cats = [a for a in r["ads"] if a.get("cats")]
+        off = sum(1 for a in with_cats if not re.search(r"\b%s\b" % cat[0], a["cats"]))
+        if len(with_cats) >= 20 and off > 0.3 * len(with_cats):
+            out.append("%s: %d%% of its ads are outside willhaben's %s category and get dropped; search %s instead"
+                       % (x["search"], 100 * off // len(with_cats), cat[1].rsplit("/", 1)[-1],
+                          in_category(x["url"], cat[1])))
+    return out
+
+
+def sweep_report(c, plan, fetched, limit, detail_count=0):
+    """The sweep block from this run's results (one run_searches() dict per search of the plan).
+    Returns (markdown block, shortlist, all good ads, market line)."""
+    profile = plan["profile"]
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     allads, new_ids, gone_ids, notes = {}, set(), set(), []
-    for s, url, key, prev, _ in plan:
-        ads, found, complete = run_search(c, url, pages, key)
-        if not complete:
-            notes.append("%s: read %d of %d ads (raise --pages for all)" % (s, len(ads), found))
-        for x in ads:
-            allads[x["id"]] = x
-        ids = {x["id"] for x in ads}
-        if prev:
-            new_ids |= (ids - seen_before)
-            if prev["complete"] and complete:
-                prev_ids = {r["id"] for r in c.execute("select id from hits where run=?", (prev["run"],))}
-                gone_ids |= (prev_ids - ids)
+    for x, r in zip(plan["items"], fetched):
+        if r["error"]:
+            notes.append("%s: couldn't read it all (%s)" % (x["search"], r["error"]))
+        elif not r["complete"]:
+            notes.append("%s: read %d of %d ads (raise --pages for all)" % (x["search"], len(r["ads"]), r["found"]))
+        for a in r["ads"]:
+            allads[a["id"]] = a
+        ids = {a["id"] for a in r["ads"]}
+        if x["last"]:
+            new_ids |= ids - plan["seen"]
+        if x["full"] and r["complete"]:                     # gone: against the last sweep that read every page
+            gone_ids |= {row["id"] for row in c.execute("select id from hits where run=?", (x["full"]["run"],))} - ids
+    notes += category_notes(plan, fetched)
     vals = profiles.annotate(attach_details(c, list(allads.values())), profile)
     good = [x for x in vals if not x["junk"]]
     short = profiles.shortlist(good, profile, limit)
     if detail_count > 0:
+        top = short[:detail_count]                          # full descriptions for the top of every shortlist bucket
+        got = details_many(c, [x["id"] for x in top])
         closed = {}
-        for x in short[:detail_count]:                      # full descriptions for the top of every shortlist bucket
-            d = details(c, x["id"])
+        for x in top:
+            d = got[x["id"]]
+            if isinstance(d, FetchError):
+                continue
             if d["status"] in ("offline", "sold", "deleted", "inactive"):
                 closed[x["id"]] = d["status"]
                 continue
@@ -656,17 +868,21 @@ def sweep_note(c, path, props, pages, limit, detail_count=0):
                 x["junk"] = closed[x["id"]]
         good = [x for x in vals if not x["junk"]]
         short = profiles.shortlist(good, profile, limit)
+    mark_near(vals, plan["near"])
+    prev_prices = plan["prev_prices"]
     new = sorted((x for x in good if x["id"] in new_ids), key=lambda x: x["price"])
-    cuts = sorted((x for x in good if x["id"] in seen_before and prev_prices.get(x["id"])
+    cuts = sorted((x for x in good if x["id"] in plan["seen"] and prev_prices.get(x["id"])
                    and x["price"] < prev_prices[x["id"]]), key=lambda x: x["price"])
     gone_rows = [dict(r) for i in sorted(gone_ids - set(allads))
                  for r in [c.execute("select * from ads where id=?", (i,)).fetchone()] if r]
     gone = [g for g in profiles.annotate(attach_details(c, gone_rows), profile) if not g["junk"]]
     mk = market(good)
-    out = ["## Sweep", "", "*wh sweep %s · %d search%s · %s · %d new · %d price cuts · %d gone*"
-           % (stamp, len(searches), "es" if len(searches) != 1 else "", mk, len(new), len(cuts), len(gone))]
+    near = (" · %d in %s" % (sum(1 for x in good if x["near"]), area_label(plan["near"]))) if plan["near"] else ""
+    n = len(plan["items"])
+    out = ["## Sweep", "", "*wh sweep %s · %d search%s · %s%s · %d new · %d price cuts · %d gone*"
+           % (stamp, n, "es" if n != 1 else "", mk, near, len(new), len(cuts), len(gone))]
     if notes:
-        out += [""] + ["> " + n for n in notes]
+        out += [""] + ["> " + x for x in notes]
     if new:
         out += ["", "### New since last sweep", "", table(new[:limit], profile, True)]
     if cuts:
@@ -679,19 +895,33 @@ def sweep_note(c, path, props, pages, limit, detail_count=0):
     return "\n".join(out), short, good, mk
 
 
+def sweep_note(c, path, props, pages, limit, detail_count=0, record=True):
+    """Run a note's searches; returns (markdown block, shortlist, all good ads, market line). record=False (dry runs)
+    leaves no run behind, so the next real sweep still compares with the last real one."""
+    plan = sweep_plan(c, path, props)
+    fetched = run_searches(c, [(x["url"], x["key"]) for x in plan["items"]], pages, record)
+    return sweep_report(c, plan, fetched, limit, detail_count)
+
+
 def cmd_sweep(a):
     c = db()
     todo = [(f, t, p) for f, t, p in find_notes(a.notes, types={"buy", "wanted"}, statuses=OPEN) if p.get("search")]
     if not todo:
         sys.exit("wh: no open buy/wanted note with a `search:` property")
-    for f, text, p in todo:
-        log("%s:" % name_of(f))
-        block, short, good, mk = sweep_note(c, f, p, a.pages, a.limit)
+    plans = [sweep_plan(c, f, p) for f, _, p in todo]       # before this run records anything
+    jobs = [(x["url"], x["key"]) for plan in plans for x in plan["items"]]
+    log("%d notes, %d searches:" % (len(todo), len(jobs)))
+    fetched = iter(run_searches(c, jobs, a.pages, record=not a.dry_run))   # one queue for every note
+    for (f, text, p), plan in zip(todo, plans):
+        block, short, good, mk = sweep_report(c, plan, [next(fetched) for _ in plan["items"]], a.limit)
         if a.dry_run:
             print(block)
-        else:
-            write_note(f, set_prop(put_block(text, "sweep", block), "checked", date.today().isoformat()))
-            print("%s: %s; %d on the shortlist" % (name_of(f), mk, len(short)))
+            continue
+        write_note(f, set_prop(put_block(text, "sweep", block), "checked", date.today().isoformat()))
+        print("%s: %s; %d on the shortlist" % (name_of(f), mk, len(short)))
+        for line in block.splitlines():
+            if line.startswith("> "):
+                print("  " + line[2:])
 
 
 def cmd_deal(a):
@@ -720,27 +950,37 @@ def cmd_advise(a):
     todo = [(f, t, p) for f, t, p in find_notes(a.notes, types={"sell"}, statuses=OPEN | {"draft"}) if p.get("ad")]
     if not todo:
         sys.exit("wh: no live sell note with an `ad:` property")
+    got = details_many(c, [ad_id(p["ad"]) for _, _, p in todo], refresh=True)
+    live = []
     for f, text, p in todo:
-        log("%s:" % name_of(f))
-        d = details(c, ad_id(p["ad"]), refresh=True)
-        if d["status"] == "offline":
+        d = got[ad_id(p["ad"])]
+        if isinstance(d, FetchError):
+            print("## %s\n\nwh: %s\n" % (name_of(f), d))
+        elif d["status"] == "offline":
             print("## %s\n\nThe ad is offline (usually just expired): renew or relist it.\n" % name_of(f))
-            continue
+        else:
+            live.append((f, text, p, d, p.get("wh-compare") or comp_words(d["title"])))
+    found_all = run_searches(c, [(search_url(w), "comps:" + w) for *_, w in live], a.pages)  # all at once
+    task = ("This is one of my own ads. Should I change the price? Give one concrete answer first (\"keep €X\" or "
+            "\"lower to €X\"), then why: days online, views and watchers over time from my note's Checks table, "
+            "offers so far, and the truly comparable ads. If few people look at it, say what to change instead "
+            "(title, photos, category). No paid extras.")
+    jobs = []
+    for (f, text, p, d, words), r in zip(live, found_all):
         profile = p.get("wh-profile") or None
-        words = p.get("wh-compare") or comp_words(d["title"])
-        comps, found = comparables(c, d, words, a.pages, profile)
+        comps, found = comparables(c, d, words, a.pages, profile, fetched=r)
         data = ("## My note\n\n%s\n\n## My ad now\n\n%s\n\n## Comparable ads on willhaben now\n\nSearch \"%s\": %s; "
                 "%s.\n\n%s" % (strip_blocks(text), fmt_details(d, c), words, found, market(comps),
                                table(comps[:a.limit], profile, True)))
-        task = ("This is one of my own ads. Should I change the price? Give one concrete answer first (\"keep €X\" or "
-                "\"lower to €X\"), then why: days online, views and watchers over time from my note's Checks table, "
-                "offers so far, and the truly comparable ads. If few people look at it, say what to change instead "
-                "(title, photos, category). No paid extras.")
-        if a.no_ai and len(todo) > 1:
-            print("# %s\n" % name_of(f))
-        ans = ask_claude(a, task, data, "Ground rules", "Selling", "Pricing advice for my ads")
-        if ans:
-            print("## %s\n\n%s\n" % (name_of(f), ans))
+        jobs.append((task, data, "Ground rules", "Selling", "Pricing advice for my ads"))
+    if a.no_ai:
+        for (f, *_), job in zip(live, jobs):
+            if len(live) > 1:
+                print("# %s\n" % name_of(f))
+            ask_claude(a, *job)
+        return
+    for (f, *_), ans in zip(live, ask_all(a, jobs)):            # one Claude call per ad, all at the same time
+        print("## %s\n\n%s\n" % (name_of(f), ans))
 
 
 def cmd_hunt(a):
@@ -751,13 +991,19 @@ def cmd_hunt(a):
     f, text, p = todo[0]
     if not p.get("search"):
         sys.exit("wh: %s has no `search:` property" % name_of(f))
-    block, short, good, mk = sweep_note(c, f, p, a.pages, a.limit, detail_count=a.details)
+    block, short, good, mk = sweep_note(c, f, p, a.pages, a.limit, detail_count=a.details, record=not a.dry_run)
+    if not a.dry_run:                                       # saved now, so a failed Claude call doesn't lose the sweep
+        text = set_prop(put_block(text, "sweep", block), "checked", date.today().isoformat())
+        write_note(f, text)
     profile = p.get("wh-profile") or None
+    states = area(p.get("wh-area"))
     rows = []
     for x in short:
         if x.get("junk"):
             continue
         meta = ["private" if x["private"] else "dealer"]
+        if states:
+            meta.append("near me" if x.get("near") else "outside my area (travel or shipping)")
         if x.get("ad_status") and x["ad_status"] != "active":
             meta.append("STATUS: " + x["ad_status"])
         if x.get("old_price"):
@@ -774,31 +1020,53 @@ def cmd_hunt(a):
             euro(x["price"]), x["title"], x["loc"], " · ".join(meta),
             x["url"], cell(x.get("descr") or x.get("body"), 2000)))
     if not rows:
-        if not a.dry_run:
-            write_note(f, set_prop(put_block(text, "sweep", block), "checked", date.today().isoformat()))
         print("Nothing matches.")
         return
-    data = "## What I want (my note)\n\n%s\n\n## Market\n\n%s (after removing junk)\n\n## Shortlist\n\n%s" % (
-        strip_blocks(text), mk, "\n".join(rows))
+    where = ("\n\n## Where\n\nMy pickup area is %s. Ads outside it are still options (I can travel there or ask for "
+             "shipping): weigh the distance, but don't drop a good deal for it." % area_label(states)) if states else ""
+    data = "## What I want (my note)\n\n%s\n\n## Market\n\n%s (after removing junk)%s\n\n## Shortlist\n\n%s" % (
+        strip_blocks(text), mk, where, "\n".join(rows))
     task = ("Pick the best options from the shortlist for what my note asks for. Answer with exactly two sections. "
             "`## Picks`: the ads you'd actually recommend, best first, as a numbered list. For each: price and link, why "
             "it's good value against the market, what to check or ask the seller, and a suggested offer. `## Warnings`: "
             "ads that look like scams or too good to be true, one line each with the link and why.")
     ans = ask_claude(a, task, data, "Ground rules", "Judging a deal (buying)")
     if ans is None:
-        if not a.dry_run:
-            write_note(f, set_prop(put_block(text, "sweep", block), "checked", date.today().isoformat()))
         return
     parts = re.split(r"^#{2,3}\s+Warnings\b[^\n]*\n?", ans, maxsplit=1, flags=re.M | re.I)
     picks, warnings = parts[0], parts[1] if len(parts) > 1 else ""
     picks = re.sub(r"\A.*?^#{2,3}\s+Picks\b[^\n]*\n?", "", picks, count=1, flags=re.M | re.S | re.I).strip()
     out = "## Picks\n\n*wh hunt %s (Claude)*\n\n%s" % (datetime.now().strftime("%Y-%m-%d %H:%M"), picks)
     if not a.dry_run:
-        text = put_block(put_block(text, "sweep", block), "picks", out)
-        write_note(f, set_prop(text, "checked", date.today().isoformat()))
+        write_note(f, put_block(text, "picks", out))
     print(out)
     if warnings.strip():
         print("\n## Warnings (not written to the note)\n\n" + warnings.strip())
+
+
+def cmd_facets(a):
+    """willhaben's own breakdown of a search (its filter sidebar): subcategories with ready-to-paste URLs, and the
+    other filters (condition, region, brand, …) as URL parameters, each with its number of ads."""
+    url = search_url(" ".join(a.words) or None, a.url, a.min, a.max)
+    _, h = fetch(url + "&page=1")
+    sr = page_props(h).get("searchResult")
+    if not sr:
+        raise WhError("no search result for %s" % url)
+    print("%d ads for %s" % (sr.get("rowsFound") or 0, url.replace("&rows=200", "").replace("?rows=200", "")))
+    for g in sr.get("navigatorGroups") or []:
+        for n in g.get("navigatorList") or []:
+            vals = [v for gv in n.get("groupedPossibleValues") or [] for v in gv.get("possibleValues") or []
+                    if v.get("hits")]
+            par = [(v.get("urlParamRepresentationForValue") or [{}])[0] for v in vals]
+            if not vals or all(str(x.get("navigatorUrlParameterType", "")).startswith("RANGE") for x in par):
+                continue
+            print("\n%s" % n.get("label"))
+            for v, x in list(zip(vals, par))[:a.limit]:
+                link = (v.get("webLink") or {}).get("uri") if n.get("id") == "category" else None
+                print("  %6s  %-34s %s" % (v["hits"], cell(v.get("label"), 34),
+                                           link or "%s=%s" % (x.get("urlParameterName"), x.get("value"))))
+            if len(vals) > a.limit:
+                print("          … %d more" % (len(vals) - a.limit))
 
 
 def main():
@@ -807,16 +1075,26 @@ def main():
 
     s = sub.add_parser("search", help="search willhaben (keyword and/or category URL), store and list the ads")
     s.add_argument("words", nargs="*")
-    s.add_argument("--url", help="willhaben search URL or category slug, e.g. laptops-notebooks-5824")
+    s.add_argument("--url", help="willhaben search URL or category slug, e.g. computer-tablets/notebooks-5831")
     s.add_argument("--min", type=float)
     s.add_argument("--max", type=float)
     s.add_argument("--pages", type=int, default=3, help="pages of 200 ads (default 3)")
     s.add_argument("--limit", type=int, default=40)
     s.add_argument("--profile", choices=sorted(profiles.PROFILES))
+    s.add_argument("--area", help="mark the ads in these states, e.g. wien,noe (nothing gets filtered out)")
     s.add_argument("--all", action="store_true", help="keep junk (defects, wanted ads, parts)")
     s.add_argument("--md", action="store_true", help="Markdown table")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_search)
+
+    s = sub.add_parser("facets", help="willhaben's breakdown of a search: subcategories (with URLs), condition, "
+                                      "region, brand … with counts; for writing a note's `search:` lines")
+    s.add_argument("words", nargs="*")
+    s.add_argument("--url", help="willhaben search URL or category slug")
+    s.add_argument("--min", type=float)
+    s.add_argument("--max", type=float)
+    s.add_argument("--limit", type=int, default=15, help="values per filter (default 15)")
+    s.set_defaults(fn=cmd_facets)
 
     s = sub.add_parser("ad", help="one ad in full (description, seller, price history)")
     s.add_argument("ad", help="ad ID or link")
@@ -866,6 +1144,8 @@ def main():
     a = ap.parse_args()
     try:
         a.fn(a)
+    except WhError as e:
+        sys.exit("wh: %s" % e)
     except KeyboardInterrupt:
         sys.exit(130)
 
