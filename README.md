@@ -20,7 +20,8 @@ The AI commands gather the data and ask `claude -p` (no tools, so it only reason
 ## Files
 
 - `wh`: the command (Python 3, standard library only). Linked as `~/.local/bin/wh`.
-- `profiles.py`: per-category knowledge that turns ads into comparable specs and filters junk. `laptop` has CPU/GPU tiers, RAM and refresh rate. A buy note picks one with `wh-profile: laptop`.
+- `profiles.py`: per-category knowledge that turns ads into comparable specs and filters junk (`laptop`, `pc`, `server`, `hue`). A buy note picks one with `wh-profile: laptop`.
+- `test_wh.py`: unit tests (`python3 -m unittest`).
 - `seed/`: the scripts and CSVs from the first laptop hunt (2026-10-25), which the laptop profile came from.
 
 ## Notes it works with
