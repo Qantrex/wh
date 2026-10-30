@@ -9,6 +9,7 @@ Every ad wh sees goes into ~/.local/share/wh/wh.db (price history, "new since la
 ~/Notes/Marketplace. Only public pages are read; anything behind the login stays with Claude in Chrome.
 """
 import argparse
+import gzip
 import html
 import json
 import os
@@ -17,6 +18,7 @@ import sqlite3
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -61,9 +63,13 @@ def fetch(url, binary=False):
             time.sleep(wait)
         _last[0] = time.time()
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Language": "de-AT,de;q=0.9"})
+            req = urllib.request.Request(url, headers={
+                "User-Agent": UA, "Accept-Language": "de-AT,de;q=0.9", "Accept-Encoding": "gzip",
+            })
             with urllib.request.urlopen(req, timeout=30) as r:
                 body = r.read()
+                if body and r.headers.get("Content-Encoding", "").lower() == "gzip":
+                    body = gzip.decompress(body)
                 return r.geturl(), body if binary else body.decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
             if e.code in (404, 410):
@@ -120,15 +126,16 @@ def search_url(words=None, url=None, pmin=None, pmax=None):
     if url and not url.startswith("http"):
         url = SEARCH + "/" + url.strip("/")
     u = urllib.parse.urlsplit(url or SEARCH)
-    qs = dict(urllib.parse.parse_qsl(u.query))
+    drop = {"page", "rows"} | ({"keyword"} if words else set()) | ({"PRICE_FROM"} if pmin is not None else set()) | (
+        {"PRICE_TO"} if pmax is not None else set())
+    qs = [(k, v) for k, v in urllib.parse.parse_qsl(u.query) if k not in drop]
     if words:
-        qs["keyword"] = words
+        qs.append(("keyword", words))
     if pmin is not None:
-        qs["PRICE_FROM"] = str(int(pmin))
+        qs.append(("PRICE_FROM", str(int(pmin))))
     if pmax is not None:
-        qs["PRICE_TO"] = str(int(pmax))
-    qs.pop("page", None)
-    qs["rows"] = "200"
+        qs.append(("PRICE_TO", str(int(pmax))))
+    qs.append(("rows", "200"))
     return urllib.parse.urlunsplit((u.scheme, u.netloc, u.path, urllib.parse.urlencode(qs), ""))
 
 
@@ -144,13 +151,15 @@ create table if not exists hits (run integer, id integer);
 create table if not exists details (id integer primary key, fetched text, data text);
 create index if not exists hits_run on hits (run);
 create index if not exists prices_id on prices (id);
+create index if not exists runs_key on runs (key);
 """
 
 
 def db():
     os.makedirs(os.path.dirname(DB), exist_ok=True)
-    c = sqlite3.connect(DB)
+    c = sqlite3.connect(DB, timeout=10)
     c.row_factory = sqlite3.Row
+    c.execute("pragma journal_mode=wal")
     c.executescript(SCHEMA)
     return c
 
@@ -182,21 +191,23 @@ def store(c, ads, t):
 
 def run_search(c, url, pages=5, key=None):
     """Fetch up to `pages` pages of 200 ads, store them and record the run. Returns (ads, rows_found, complete)."""
-    t, out, found, page = now(), {}, 0, 0
+    t, out, found, page, ok = now(), {}, 0, 0, False
     for page in range(1, pages + 1):
         _, h = fetch(url + "&page=%d" % page)
         sr = page_props(h).get("searchResult")
         if not sr:
+            ok = False
             break
+        ok = True
         found = sr.get("rowsFound") or 0
-        lst = sr["advertSummaryList"]["advertSummary"]
+        lst = (sr.get("advertSummaryList") or {}).get("advertSummary") or []
         for a in lst:
             s = summary(a)
             out[s["id"]] = s
         log("  page %d: %d ads (%d of %d)" % (page, len(lst), len(out), found))
-        if page * 200 >= found or len(lst) < 200:
+        if page * 200 >= found or not lst:
             break
-    complete = page * 200 >= found
+    complete = ok and page * 200 >= found
     store(c, out.values(), t)
     cur = c.execute("insert into runs (key, url, at, found, complete) values (?,?,?,?,?)",
                     (key or url, url, t, found, int(complete)))
@@ -208,12 +219,14 @@ def run_search(c, url, pages=5, key=None):
 def details(c, i, refresh=False):
     """Full ad page as a dict (cached DETAIL_MAX_AGE_H hours). status is 'offline' when the ad is gone."""
     row = c.execute("select fetched, data from details where id=?", (i,)).fetchone()
+    prev = json.loads(row["data"]) if row else {}
     if row and not refresh and hours_since(row["fetched"]) < DETAIL_MAX_AGE_H:
-        return json.loads(row["data"])
+        return prev
+    t = now()
     final, h = fetch("%s/iad/object?adId=%d" % (BASE, i))
     ad = page_props(h).get("advertDetails") if h else None
     if not ad:
-        d = dict(id=i, status="offline", url="%s/iad/object?adId=%d" % (BASE, i))
+        d = dict(prev, id=i, status="offline", url=prev.get("url") or "%s/iad/object?adId=%d" % (BASE, i))
     else:
         at = attrs(ad)
         g = lambda n: (at.get(n) or [""])[0]  # noqa: E731
@@ -233,11 +246,34 @@ def details(c, i, refresh=False):
                  seller_since=(seller.get("registerDate") or "")[:7], seller_ads=seller.get("activeAdCount"),
                  first_published=(ad.get("firstPublishedDate") or "")[:10], changed=(ad.get("changedDate") or "")[:10],
                  ends=(ad.get("endDate") or "")[:10], info=info, descr=clean(g("DESCRIPTION")),
-                 images=[x.get("referenceImageUrl") or x.get("mainImageUrl") for x in imgs],
+                 images=[u for u in (x.get("referenceImageUrl") or x.get("mainImageUrl") for x in imgs) if u],
                  url=final if "/d/" in final else "%s/iad/object?adId=%d" % (BASE, i))
-    c.execute("insert or replace into details values (?,?,?)", (i, now(), json.dumps(d, ensure_ascii=False)))
+        if d["price"] is not None:
+            last = c.execute("select price from prices where id=? order by seen desc, rowid desc limit 1", (i,)).fetchone()
+            if last is None or last["price"] != d["price"]:
+                c.execute("insert into prices values (?,?,?)", (i, d["price"], t))
+            c.execute("update ads set price=?, last_seen=? where id=?", (d["price"], t, i))
+    c.execute("insert or replace into details values (?,?,?)", (i, t, json.dumps(d, ensure_ascii=False)))
     c.commit()
     return d
+
+
+def attach_details(c, ads):
+    """Enrich ad summaries in-place with cached full descriptions/attributes from SQLite."""
+    if not ads:
+        return ads
+    ids = [a["id"] for a in ads]
+    cached = {}
+    for i in range(0, len(ids), 500):
+        chunk = ids[i:i + 500]
+        q = "select id, data from details where id in (%s)" % ",".join("?" * len(chunk))
+        cached.update({r["id"]: json.loads(r["data"]) for r in c.execute(q, chunk)})
+    for a in ads:
+        d = cached.get(a["id"])
+        if d and d.get("descr"):
+            a.setdefault("descr", d["descr"])
+            a.setdefault("info", d.get("info") or [])
+    return ads
 
 
 def price_history(c, i):
@@ -246,20 +282,33 @@ def price_history(c, i):
 
 # ---- notes ----------------------------------------------------------------------------------------------------
 
-FM = re.compile(r"\A---\n(.*?)\n---\n", re.S)
+FM = re.compile(r"\A---\r?\n(.*?)\r?\n---\r?\n", re.S)
+
+
+def clean_val(v):
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+        return v[1:-1]
+    if not v.startswith(("http://", "https://")):
+        v = re.sub(r"\s+#.*$", "", v).strip()
+    return [] if v == "[]" else v
 
 
 def read_note(path):
-    text = open(path, encoding="utf-8").read()
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
     props, key, m = {}, None, FM.match(text)
     for line in (m.group(1).splitlines() if m else []):
+        if line.strip().startswith("#"):
+            continue
         if re.match(r"^\s+-\s", line) and key:
-            v = line.split("-", 1)[1].strip().strip("'\"")
-            props[key] = (props[key] if isinstance(props.get(key), list) else ([props[key]] if props.get(key) else [])) + [v]
+            v = clean_val(line.split("-", 1)[1])
+            cur = props.get(key)
+            props[key] = (cur if isinstance(cur, list) else ([cur] if cur else [])) + [v]
         elif ":" in line and not line.startswith((" ", "\t")):
             key, _, v = line.partition(":")
             key = key.strip()
-            props[key] = v.strip().strip("'\"")
+            props[key] = clean_val(v)
     return text, props
 
 
@@ -268,10 +317,11 @@ def set_prop(text, key, value):
     if not m:
         return "---\n%s: %s\n---\n" % (key, value) + text
     fm = m.group(1)
+    repl = "%s: %s" % (key, value)
     if re.search(r"^%s:.*$" % re.escape(key), fm, re.M):
-        fm = re.sub(r"^%s:.*$" % re.escape(key), "%s: %s" % (key, value), fm, count=1, flags=re.M)
+        fm = re.sub(r"^%s:.*$" % re.escape(key), lambda _: repl, fm, count=1, flags=re.M)
     else:
-        fm += "\n%s: %s" % (key, value)
+        fm += "\n" + repl
     return "---\n" + fm + "\n---\n" + text[m.end():]
 
 
@@ -279,7 +329,7 @@ def put_block(text, name, content):
     """Replace (or append) the generated block <!-- wh:name --> … <!-- /wh:name --> in a note."""
     start, end = "<!-- wh:%s -->" % name, "<!-- /wh:%s -->" % name
     block = "%s\n%s\n%s" % (start, content.strip(), end)
-    if start in text and end in text:
+    if start in text and end in text and text.index(start) < text.index(end):
         return text[:text.index(start)] + block + text[text.index(end) + len(end):]
     return text.rstrip() + "\n\n" + block + "\n"
 
@@ -314,7 +364,19 @@ def find_notes(args, types=None, statuses=None):
 
 def write_note(path, text):
     text = set_prop(text, "updated", date.today().isoformat())
-    open(path, "w", encoding="utf-8").write(text)
+    d = os.path.dirname(os.path.abspath(path))
+    mode = os.stat(path).st_mode if os.path.exists(path) else None
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".wh-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        if mode is not None:
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
 
 
 def name_of(path):
@@ -332,6 +394,10 @@ def cell(s, n=None):
     return s if n is None or len(s) <= n else s[:n - 1] + "…"
 
 
+def link_text(s, n=70):
+    return cell(s, n).replace("[", "(").replace("]", ")")
+
+
 def specs(a, profile):
     return " · ".join("%s%s" % (a[f], " GB" if f == "ram" else " Hz" if f == "hz" else "")
                       for f in profiles.FIELDS.get(profile, []) if a.get(f))
@@ -339,23 +405,28 @@ def specs(a, profile):
 
 def table(ads, profile=None, md=False, extra=None):
     """ads as a Markdown table (md) or as aligned plain text."""
-    rows = []
-    for a in ads:
-        r = [euro(a.get("price")), a.get("title", ""), a.get("loc", ""), "P" if a.get("private") else "D",
-             specs(a, profile), a.get("published", ""), a.get("url") if md else a.get("id")]
-        if extra:
-            r.insert(1, extra(a))
-        rows.append(r)
-    head = ["Price"] + (["Was"] if extra else []) + ["Ad", "Where", "P/D", "Specs", "Online since", "Link" if md else "ID"]
+    has_specs = bool(profile and profiles.FIELDS.get(profile))
+    head = (["Price"] + (["Was"] if extra else []) + ["Ad", "Where", "P/D"]
+            + (["Specs"] if has_specs else []) + ["Online since"] + ([] if md else ["ID"]))
     if md:
-        lines = ["| " + " | ".join(head[:-1]) + " |", "|" + "---|" * (len(head) - 1)]
-        for r in rows:
-            link = "[%s](%s)" % (cell(r[-6], 70), r[-1])
-            lines.append("| " + " | ".join([cell(x) for x in r[:-6]] + [link] + [cell(x, 30) for x in r[-5:-1]]) + " |")
+        lines = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+        for a in ads:
+            cols = ([euro(a.get("price"))] + ([extra(a)] if extra else [])
+                    + ["[%s](%s)" % (link_text(a.get("title", ""), 70), a.get("url", "")),
+                       cell(a.get("loc", ""), 30), "P" if a.get("private") else "D"]
+                    + ([cell(specs(a, profile))] if has_specs else [])
+                    + [cell(a.get("published", ""))])
+            lines.append("| " + " | ".join(cols) + " |")
         return "\n".join(lines)
-    widths = [7] + ([7] if extra else []) + [52, 26, 3, 30, 12, 10]
+    widths = [7] + ([7] if extra else []) + [52, 26, 3] + ([38] if has_specs else []) + [12, 10]
+    rows = [head]
+    for a in ads:
+        rows.append([euro(a.get("price"))] + ([extra(a)] if extra else [])
+                    + [a.get("title", ""), a.get("loc", ""), "P" if a.get("private") else "D"]
+                    + ([specs(a, profile)] if has_specs else [])
+                    + [a.get("published", ""), a.get("id")])
     fmt = lambda r: "  ".join(cell(x, w).ljust(w) for x, w in zip(r, widths)).rstrip()  # noqa: E731
-    return "\n".join([fmt(head)] + [fmt(r) for r in rows])
+    return "\n".join(fmt(r) for r in rows)
 
 
 def market(ads):
@@ -369,7 +440,8 @@ def market(ads):
 
 def fmt_details(d, c=None):
     if d["status"] == "offline":
-        return "Ad %d is offline (usually just expired, not sold). %s" % (d["id"], d["url"])
+        head = ("**%s** (%s) — " % (d["title"], euro(d.get("price")))) if d.get("title") else ""
+        return "%sAd %d is offline (usually just expired, not sold). %s" % (head, d["id"], d["url"])
     seller = "%s seller %s (member since %s, %s active ads)" % (
         "private" if d["private"] else "dealer", d.get("seller") or "?", d.get("seller_since") or "?", d.get("seller_ads"))
     days = (date.today() - date.fromisoformat(d["first_published"])).days if d.get("first_published") else None
@@ -397,8 +469,10 @@ SYSTEM = ("You judge willhaben.at ads for Konstantin, who lives in 1230 Wien (Li
 
 def skill_rules(*headings):
     try:
-        text = open(SKILL, encoding="utf-8").read()
+        with open(SKILL, encoding="utf-8") as f:
+            text = f.read()
     except OSError:
+        log("  note: %s not found, running without skill rules" % SKILL)
         return ""
     out = []
     for h in headings:
@@ -430,12 +504,15 @@ def ask_claude(a, task, data, *rule_headings):
     return r.stdout.strip()
 
 
-STOP = {"verkaufe", "verkauf", "neu", "neuwertig", "top", "zustand", "inkl", "mit", "und", "für", "fuer", "der", "die",
-        "das", "original", "gebraucht", "set", "wie", "sehr", "gut", "guter", "gutem", "super", "angebot", "nur", "ovp"}
+STOP = {"verkaufe", "verkauf", "neu", "neuwertig", "top", "zustand", "zusatnd", "inkl", "inklusive", "mit", "ohne",
+        "und", "für", "fuer", "der", "die", "das", "ein", "eine", "einen", "original", "originalverpackt", "gebraucht",
+        "set", "wie", "sehr", "gut", "guter", "gutem", "super", "angebot", "nur", "ovp", "preis", "fix", "fixpreis",
+        "vb", "vhb", "verhandlungsbasis", "reserviert", "suche", "kaufe", "tausche", "tausch", "rabattaktion",
+        "privatverkauf", "garantie", "rechnung", "versand", "abholung", "stück", "stueck"}
 
 
 def title_words(title):
-    return [w for w in re.findall(r"[a-z0-9äöüß]+", title.lower()) if w not in STOP and len(w) > 1]
+    return [w for w in re.findall(r"[a-z0-9äöüß]+", title.lower()) if w not in STOP and (len(w) > 1 or w.isdigit())]
 
 
 def comp_words(title):
@@ -446,7 +523,7 @@ def comp_words(title):
 def comparables(c, d, words, pages, profile):
     """Ads found by a keyword search, minus this ad and junk. Returns (ads, 'N found, M removed …' line)."""
     ads, found, _ = run_search(c, search_url(words), pages, key="comps:" + words)
-    ads = profiles.annotate(ads, profile)
+    ads = profiles.annotate(attach_details(c, ads), profile)
     own = sum(1 for x in ads if x["id"] == d["id"])
     junk = sum(1 for x in ads if x["junk"] and x["id"] != d["id"])
     mine = set(title_words(d["title"]))
@@ -463,7 +540,7 @@ def comparables(c, d, words, pages, profile):
 def cmd_search(a):
     c = db()
     ads, found, complete = run_search(c, search_url(" ".join(a.words) or None, a.url, a.min, a.max), a.pages)
-    ads = profiles.annotate(ads, a.profile)
+    ads = profiles.annotate(attach_details(c, ads), a.profile)
     ads = sorted((x for x in ads if a.all or not x["junk"]), key=lambda x: (x["price"] is None, x["price"] or 0))
     if a.json:
         print(json.dumps(ads[:a.limit], ensure_ascii=False, indent=1))
@@ -480,19 +557,29 @@ def cmd_ad(a):
 def cmd_photos(a):
     c = db()
     d = details(c, ad_id(a.ad), refresh=True)
-    if d["status"] == "offline":
-        sys.exit("wh: ad is offline, no photos")
+    if not d.get("images"):
+        sys.exit("wh: ad is offline, no cached photos" if d["status"] == "offline" else "wh: ad has no photos")
     os.makedirs(a.dir, exist_ok=True)
     for n, u in enumerate(d["images"], 1):
         _, raw = fetch(u, binary=True)
+        if not raw:
+            log("  photo %d unavailable: %s" % (n, u))
+            continue
         webp = raw[:4] == b"RIFF" and raw[8:12] == b"WEBP"
-        path = os.path.join(a.dir, "%d-%02d.%s" % (d["id"], n, "webp" if webp else "jpg"))
-        open(path, "wb").write(raw)
+        png = raw[:8] == b"\x89PNG\r\n\x1a\n"
+        path = os.path.join(a.dir, "%d-%02d.%s" % (d["id"], n, "webp" if webp else "png" if png else "jpg"))
+        with open(path, "wb") as f:
+            f.write(raw)
         if webp:
             jpg = path[:-4] + "jpg"
-            if subprocess.run(["magick", path, jpg]).returncode == 0:
-                os.remove(path)
-                path = jpg
+            for tool in ("magick", "convert"):
+                try:
+                    if subprocess.run([tool, path, jpg], capture_output=True).returncode == 0:
+                        os.remove(path)
+                        path = jpg
+                        break
+                except FileNotFoundError:
+                    continue
         print(path)
 
 
@@ -514,21 +601,27 @@ def cmd_status(a):
             write_note(f, set_prop(text, "checked", date.today().isoformat()))
 
 
-def sweep_note(c, path, props, pages, limit):
+def sweep_note(c, path, props, pages, limit, detail_count=0):
     """Run a note's searches; returns (markdown block, shortlist, all good ads, market line)."""
     searches = props.get("search") or []
     searches = searches if isinstance(searches, list) else [searches]
     profile = props.get("wh-profile") or None
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    allads, new, cuts, gone, notes = {}, [], [], [], []
+    plan = []
     for s in searches:
         is_url = s.startswith("http") or "/" in s or re.fullmatch(r"[a-z0-9-]+-\d{3,}", s)
         url = search_url(url=s) if is_url else search_url(s)
         key = "note:%s:%s" % (name_of(path), url)
-        prev = c.execute("select run, complete from runs where key=? order by run desc limit 1", (key,)).fetchone()
-        seen_before = {r["id"] for r in c.execute("select distinct h.id from hits h join runs r on r.run=h.run"
-                                                  " where r.key=?", (key,))}
-        last_prices = {r["id"]: r["price"] for r in c.execute("select id, price from prices order by seen")}
+        prev = c.execute("select run, at, complete from runs where key=? order by run desc limit 1", (key,)).fetchone()
+        seen = {r["id"] for r in c.execute("select distinct h.id from hits h join runs r on r.run=h.run"
+                                           " where r.key=?", (key,))}
+        plan.append((s, url, key, prev, seen))
+    prev_ats = [prev["at"] for _, _, _, prev, _ in plan if prev]
+    prev_prices = ({r["id"]: r["price"] for r in c.execute(
+        "select id, price from prices where seen <= ? order by seen, rowid", (max(prev_ats),))} if prev_ats else {})
+    seen_before = set().union(*(seen for *_, seen in plan)) if plan else set()
+    allads, new_ids, gone_ids, notes = {}, set(), set(), []
+    for s, url, key, prev, _ in plan:
         ads, found, complete = run_search(c, url, pages, key)
         if not complete:
             notes.append("%s: read %d of %d ads (raise --pages for all)" % (s, len(ads), found))
@@ -536,30 +629,52 @@ def sweep_note(c, path, props, pages, limit):
             allads[x["id"]] = x
         ids = {x["id"] for x in ads}
         if prev:
-            new += [x for x in ads if x["id"] not in seen_before]
-            cuts += [x for x in ads if x["id"] in seen_before and x["id"] in last_prices
-                     and x["price"] is not None and last_prices[x["id"]] is not None and x["price"] < last_prices[x["id"]]]
+            new_ids |= (ids - seen_before)
             if prev["complete"] and complete:
                 prev_ids = {r["id"] for r in c.execute("select id from hits where run=?", (prev["run"],))}
-                gone += [dict(c.execute("select * from ads where id=?", (i,)).fetchone()) for i in prev_ids - ids]
-    good = [x for x in profiles.annotate(list(allads.values()), profile) if not x["junk"]]
+                gone_ids |= (prev_ids - ids)
+    vals = profiles.annotate(attach_details(c, list(allads.values())), profile)
+    good = [x for x in vals if not x["junk"]]
     short = profiles.shortlist(good, profile, limit)
-    goodids = {x["id"] for x in good}
-    new = [x for x in new if x["id"] in goodids]
-    cuts = [x for x in cuts if x["id"] in goodids]
+    if detail_count > 0:
+        closed = {}
+        for x in short[:detail_count]:                      # full descriptions for the top of every shortlist bucket
+            d = details(c, x["id"])
+            if d["status"] in ("offline", "sold", "deleted", "inactive"):
+                closed[x["id"]] = d["status"]
+                continue
+            x["descr"] = d["descr"]
+            x["info"] = d.get("info") or []
+            x["ad_status"] = d.get("status")
+            x["old_price"] = d.get("old_price")
+            x["seller"] = "%s, member since %s, %s active ads" % (
+                d.get("seller"), d.get("seller_since"), d.get("seller_ads"))
+            x["first_published"] = d.get("first_published")
+        profiles.annotate(vals, profile)
+        for x in vals:
+            if x["id"] in closed:
+                x["junk"] = closed[x["id"]]
+        good = [x for x in vals if not x["junk"]]
+        short = profiles.shortlist(good, profile, limit)
+    new = sorted((x for x in good if x["id"] in new_ids), key=lambda x: x["price"])
+    cuts = sorted((x for x in good if x["id"] in seen_before and prev_prices.get(x["id"])
+                   and x["price"] < prev_prices[x["id"]]), key=lambda x: x["price"])
+    gone_rows = [dict(r) for i in sorted(gone_ids - set(allads))
+                 for r in [c.execute("select * from ads where id=?", (i,)).fetchone()] if r]
+    gone = [g for g in profiles.annotate(attach_details(c, gone_rows), profile) if not g["junk"]]
     mk = market(good)
     out = ["## Sweep", "", "*wh sweep %s · %d search%s · %s · %d new · %d price cuts · %d gone*"
            % (stamp, len(searches), "es" if len(searches) != 1 else "", mk, len(new), len(cuts), len(gone))]
     if notes:
         out += [""] + ["> " + n for n in notes]
     if new:
-        out += ["", "### New since last sweep", "", table(sorted(new, key=lambda x: x["price"])[:limit], profile, True)]
+        out += ["", "### New since last sweep", "", table(new[:limit], profile, True)]
     if cuts:
         out += ["", "### Price cuts", "", table(cuts[:limit], profile, True,
-                                                 extra=lambda x: euro(last_prices.get(x["id"])))]
+                                                 extra=lambda x: euro(prev_prices.get(x["id"])))]
     if gone:
         out += ["", "### Gone since last sweep", "", "Usually just expired, not sold."]
-        out += ["- [%s](%s), %s" % (cell(g["title"], 70), g["url"], euro(g["price"])) for g in gone[:limit]]
+        out += ["- [%s](%s), %s" % (link_text(g["title"], 70), g["url"], euro(g["price"])) for g in gone[:limit]]
     out += ["", "### Shortlist", "", table(short, profile, True) if short else "Nothing matches."]
     return "\n".join(out), short, good, mk
 
@@ -611,15 +726,18 @@ def cmd_advise(a):
         if d["status"] == "offline":
             print("## %s\n\nThe ad is offline (usually just expired): renew or relist it.\n" % name_of(f))
             continue
+        profile = p.get("wh-profile") or None
         words = p.get("wh-compare") or comp_words(d["title"])
-        comps, found = comparables(c, d, words, a.pages, None)
+        comps, found = comparables(c, d, words, a.pages, profile)
         data = ("## My note\n\n%s\n\n## My ad now\n\n%s\n\n## Comparable ads on willhaben now\n\nSearch \"%s\": %s; "
                 "%s.\n\n%s" % (strip_blocks(text), fmt_details(d, c), words, found, market(comps),
-                                       table(comps[:a.limit], None, True)))
+                               table(comps[:a.limit], profile, True)))
         task = ("This is one of my own ads. Should I change the price? Give one concrete answer first (\"keep €X\" or "
                 "\"lower to €X\"), then why: days online, views and watchers over time from my note's Checks table, "
                 "offers so far, and the truly comparable ads. If few people look at it, say what to change instead "
                 "(title, photos, category). No paid extras.")
+        if a.no_ai and len(todo) > 1:
+            print("# %s\n" % name_of(f))
         ans = ask_claude(a, task, data, "Ground rules", "Selling", "Pricing advice for my ads")
         if ans:
             print("## %s\n\n%s\n" % (name_of(f), ans))
@@ -633,24 +751,33 @@ def cmd_hunt(a):
     f, text, p = todo[0]
     if not p.get("search"):
         sys.exit("wh: %s has no `search:` property" % name_of(f))
-    block, short, good, mk = sweep_note(c, f, p, a.pages, a.limit)
+    block, short, good, mk = sweep_note(c, f, p, a.pages, a.limit, detail_count=a.details)
     profile = p.get("wh-profile") or None
-    for x in short[:a.details]:                            # full descriptions for the top of the shortlist
-        d = details(c, x["id"])
-        if d["status"] == "offline":
-            x["junk"] = "offline"
-            continue
-        x["descr"] = d["descr"][:700]
-        x["seller"] = "%s, member since %s, %s active ads" % (d.get("seller"), d.get("seller_since"), d.get("seller_ads"))
-        x["first_published"] = d.get("first_published")
     rows = []
     for x in short:
         if x.get("junk"):
             continue
-        rows.append("- **%s** %s · %s · %s · %s · online since %s%s\n  %s\n  %s" % (
-            euro(x["price"]), x["title"], x["loc"], "private" if x["private"] else "dealer", specs(x, profile),
-            x.get("first_published") or x.get("published"), " · seller " + x["seller"] if x.get("seller") else "",
-            x["url"], cell(x.get("descr") or x.get("body"), 700)))
+        meta = ["private" if x["private"] else "dealer"]
+        if x.get("ad_status") and x["ad_status"] != "active":
+            meta.append("STATUS: " + x["ad_status"])
+        if x.get("old_price"):
+            meta.append("cut from " + euro(x["old_price"]))
+        sp = specs(x, profile)
+        if sp:
+            meta.append(sp)
+        meta.append("online since %s" % (x.get("first_published") or x.get("published")))
+        if x.get("seller"):
+            meta.append("seller " + x["seller"])
+        if x.get("info"):
+            meta.append("; ".join(x["info"]))
+        rows.append("- **%s** %s · %s · %s\n  %s\n  %s" % (
+            euro(x["price"]), x["title"], x["loc"], " · ".join(meta),
+            x["url"], cell(x.get("descr") or x.get("body"), 2000)))
+    if not rows:
+        if not a.dry_run:
+            write_note(f, set_prop(put_block(text, "sweep", block), "checked", date.today().isoformat()))
+        print("Nothing matches.")
+        return
     data = "## What I want (my note)\n\n%s\n\n## Market\n\n%s (after removing junk)\n\n## Shortlist\n\n%s" % (
         strip_blocks(text), mk, "\n".join(rows))
     task = ("Pick the best options from the shortlist for what my note asks for. Answer with exactly two sections. "
@@ -659,9 +786,12 @@ def cmd_hunt(a):
             "ads that look like scams or too good to be true, one line each with the link and why.")
     ans = ask_claude(a, task, data, "Ground rules", "Judging a deal (buying)")
     if ans is None:
+        if not a.dry_run:
+            write_note(f, set_prop(put_block(text, "sweep", block), "checked", date.today().isoformat()))
         return
-    picks, _, warnings = ans.partition("## Warnings")
-    picks = picks.replace("## Picks", "").strip()
+    parts = re.split(r"^#{2,3}\s+Warnings\b[^\n]*\n?", ans, maxsplit=1, flags=re.M | re.I)
+    picks, warnings = parts[0], parts[1] if len(parts) > 1 else ""
+    picks = re.sub(r"\A.*?^#{2,3}\s+Picks\b[^\n]*\n?", "", picks, count=1, flags=re.M | re.S | re.I).strip()
     out = "## Picks\n\n*wh hunt %s (Claude)*\n\n%s" % (datetime.now().strftime("%Y-%m-%d %H:%M"), picks)
     if not a.dry_run:
         text = put_block(put_block(text, "sweep", block), "picks", out)
