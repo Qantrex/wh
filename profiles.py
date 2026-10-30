@@ -141,7 +141,7 @@ PART_HEAD = (r"^(neue?r?s? )?(kühlung|kühler|lüfter|akku|tastatur|display|bil
              r"|motherboard|gehäuse|scharnier|grafikkarte|mxm)\b")
 PART_FOR = (r"\b(für|fuer|passend für) (clevo|lenovo|asus|acer|hp|dell|msi|mac\s?book|legion|thinkpad)\b")
 DESKTOP = r"\b(tower|gaming[- ]?pc|desktop|komplett[- ]?pc|pc[- ]?system|midi|aio|mac ?mini|imac|mac studio)\b"
-LAPTOP_CAT = "5831"                                           # willhaben's Laptops subcategory (inside laptops-notebooks-5824)
+LAPTOP_CAT = "5831"                                           # Notebooks (5824 is all of Computer / Software)
 LAPTOP = (r"laptop|notebook|mac\s?book|thinkpad|thinkbook|ideapad|ultrabook|legion|loq|nitro|predator|swift|aspire"
           r"|tuf|rog|zephyrus|zenbook|vivobook|victus|omen|elitebook|probook|zbook|omnibook|spectre|envy|pavilion"
           r"|yoga|xps|inspiron|latitude|precision|alienware|katana|cyborg|razer|blade|erazer|xmg|schenker|clevo|tulpar"
@@ -664,6 +664,10 @@ def hue_qty(title, t):
     return 1
 
 
+HUE_BRIDGE = r"\b(?:bridge|gateway|base\s?station|basisstation)\b"
+HUE_EXTRAS = re.compile(r"\s(?:inkl\.?|inklusive|incl\.?|mit|samt|plus|\+)\s")  # what follows is an add-on
+
+
 def _match_hue_kind(s):
     if re.search(r"dimm(?:er|schalter)[^\n]{0,25}(?:v2|rwl022|2\.\s?gen|neues\s+modell)|rwl022|\bv2\s+dimm", s):
         return "Dimmer V2"
@@ -679,24 +683,30 @@ def _match_hue_kind(s):
         return "Strip"
     if re.search(r"\bhue\s+(?:go|iris|signe|bloom|flourish|wellness|explore|ensis|infuse|centris|aurelle|surimu"
                  r"|datura|enrave|still|being|adore|perifo|appear|resonate|lily|calla|fuzo|turaco|impress)\b"
-                 r"|tischleuchte|tisch\s+lampe|stimmungsleuchte|stehleuchte|deckenleuchte|pendelleuchte|wandleuchte|außenleuchte|sockelleuchte", s):
+                 r"|\b(?:runner|buckram|fugato|argenta|pillar)\b|tischleuchte|tisch\s?lampe|stimmungsleuchte"
+                 r"|stehleuchte|stehlampe|deckenleuchte|deckenlampe|pendelleuchte|hängelampe|wandleuchte|wandlampe"
+                 r"|außenleuchte|sockelleuchte|\b\d\s?-?\s?fl(?:g\b|ammig)", s):  # "Runner Spot 3 flg." is a fixture
         return "Lamp"
     if re.search(r"smart\s?plug|steckdose|zwischenstecker", s):
         return "Plug"
     if re.search(r"\b(?:e27|e14|gu10)\b|leuchtmittel|glühbirne\w*|\bbirne(?:n)?\b|\blampe(?:n)?\b|filament|\bspot(?:s)?\b|kerze", s):
         return "Bulb"
-    if re.search(r"\bbridge\b|\bhub\b", s):
+    if re.search(HUE_BRIDGE + r"|\bhub\b", s):
         return "Bridge"
     return None
 
 
 def hue_kind_spec(title, t, q):
     is_bundle = bool(re.search(r"starter[- ]?(?:set|kit)|startpaket|konvolut|\bpaket\b|\bhue\s+set\b", title)
-                     or (re.search(r"\bbridge\b", title) and re.search(r"lampe|birne|dimm|sensor|e27|gu10", title)))
+                     or (re.search(HUE_BRIDGE, title)
+                         and re.search(r"lampe|birne|dimm|sensor|e27|gu10|lichtband|lightstrip", title)))
     if is_bundle:
         kind = "Bundle"
     else:
-        kind = _match_hue_kind(title) or _match_hue_kind(t) or "Hue"
+        head, extras = (HUE_EXTRAS.split(title, 1) + [""])[:2]
+        kind = _match_hue_kind(head) or _match_hue_kind(title) or _match_hue_kind(t) or "Hue"
+        if kind in ("Dimmer", "Switch", "Sensor") and _match_hue_kind(extras) in ("Bulb", "Lamp", "Strip"):
+            kind = "Bundle"                                   # "Dimmschalter mit Glühbirnen"; a lamp "inkl. Dimmer" stays a lamp
         if kind == "Dimmer" and re.search(r"rwl022|\bv2\b|2\.\s?gen|neues\s+modell", t):
             kind = "Dimmer V2"
 
@@ -759,7 +769,8 @@ def hue(ad):
         return "Hue-compatible clone, not genuine Hue"
     if HUE_PART_ONLY.search(title) or re.search(r"\b(?:leerkarton|leere?\s+ovp|nur\s+verpackung)\b", t):
         return "accessory/mount/PSU/empty box only"
-    if re.search(r"\bnetzteil\b", title) and not re.search(r"\b(?:mit|inkl\.?|inklusive|samt|\+)\s*(?:original[- ]?)?netzteil\b", title):
+    if (re.search(r"\bnetz(?:teil|gerät)\w*|\btrafo\b|transformator|power\s?supply", title)
+            and not re.search(r"\b(?:mit|inkl\.?|inklusive|samt|\+)\s*(?:original[- ]?)?netz(?:teil|gerät)\w*", title)):
         return "power supply only"
     if kind == "Bridge" and HUE_V1_BRIDGE.search(t):
         return "Hue Bridge v1 (EOL)"
@@ -786,6 +797,10 @@ def hue_shortlist(ads, n):
     return interleave_buckets([controls[:3 * k], color_bulbs[:2 * k], lamps_strips[:2 * k], bundles[:k]], full, n)
 
 
+CATEGORY = {                                                  # willhaben category a profile's ads belong in: id, URL path
+    "laptop": (LAPTOP_CAT, "computer-tablets/notebooks-5831"),
+    "pc": (PC_CAT, "computer-tablets/pcs-5833"),
+}
 PROFILES = {
     "laptop": (laptop, laptop_shortlist),
     "pc": (pc, pc_shortlist),
