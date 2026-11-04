@@ -73,7 +73,7 @@ Notes in the notes folder (`notes` in the config, `WH_NOTES` overrides), with YA
 - `for:` (`me`, `homelab`, `<name> (friend)` …) says who a purchase is for. `hunt` puts it at the top of what Claude sees ("judge only by this person's needs"); `sweep` and `hunt` warn when it's missing. `wh deal <ad> --for "a friend"` does the same for a single ad; without `--for`, Claude is told not to assume it's for you.
 - `wh-area: wien, noe` marks the ads in those states (a "Near" column, "N in Wien/NÖ" in the sweep line, and a hint for Claude in `hunt`). It never filters anything out: a good deal further away can still be picked up or shipped.
 
-`wh` only writes `checked`, `updated` and its own blocks between `<!-- wh:sweep -->` / `<!-- wh:picks -->` markers. `hunt` saves the sweep before asking Claude, so a failed Claude call doesn't lose it.
+`wh` only writes `checked`, `updated` and its own blocks between `<!-- wh:sweep -->` / `<!-- wh:picks -->` markers. It reads the note again right before each (atomic) write, so what you type while a sweep or Claude runs stays. `hunt` saves the sweep before asking Claude, so a failed Claude call doesn't lose it. Hidden folders (Obsidian's `.trash` and `.obsidian`) are never read.
 
 A sweep's "new", "price cuts" and "gone" compare with earlier runs of the same search URL (changing a URL starts over). "Gone" compares with the last run that read every page. `--dry-run` records no run, so the next real sweep still compares with the last real one.
 
@@ -114,4 +114,4 @@ The AI commands (`deal`, `advise`, `hunt`) are the exception: they send what the
 | `WH_DELAY` | `1.1` seconds between requests once willhaben pushes back |
 | `WH_MODEL` | Claude Code's default model |
 
-There's no timer: wh runs when I run it.
+wh has no timer of its own; `wh sweep --json --no-write` is made for one (a systemd timer, cron, an agent).
