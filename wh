@@ -546,24 +546,34 @@ def strip_blocks(text):
     return re.sub(r"<!-- wh:(\w+) -->.*?<!-- /wh:\1 -->\n?", "", text, flags=re.S)
 
 
+def md_files(root):
+    """The notes under a folder, skipping hidden folders: Obsidian's .trash holds deleted notes, .obsidian settings."""
+    for d, dirs, fs in os.walk(root):
+        dirs[:] = [x for x in dirs if not x.startswith(".")]
+        yield from (os.path.join(d, f) for f in fs if f.endswith(".md") and not f.startswith("."))
+
+
 def find_notes(args, types=None, statuses=None):
     files = []
     for p in args or [NOTES]:
         p = os.path.expanduser(p)
         if os.path.isdir(p):
-            files += [os.path.join(d, f) for d, _, fs in os.walk(p) for f in fs if f.endswith(".md")]
+            files += md_files(p)
         elif os.path.isfile(p):
             files.append(p)
         else:                                               # a note name, found under NOTES
             want = p.lower().removesuffix(".md")
-            hits = [os.path.join(d, f) for d, _, fs in os.walk(NOTES) for f in fs
-                    if f.endswith(".md") and f[:-3].lower() == want]
+            hits = [f for f in md_files(NOTES) if os.path.basename(f)[:-3].lower() == want]
             if not hits:
                 sys.exit("wh: no note %r under %s" % (p, NOTES))
             files += hits
     out = []
     for f in sorted(set(files)):
-        text, props = read_note(f)
+        try:
+            text, props = read_note(f)
+        except (OSError, UnicodeDecodeError) as e:
+            log("wh: skipped %s: %s" % (f, e))
+            continue
         if (types and props.get("type") not in types) or (statuses and props.get("status") not in statuses):
             continue
         out.append((f, text, props))

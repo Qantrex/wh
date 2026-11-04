@@ -438,6 +438,20 @@ class WhTests(TmpDbCase):
         self.assertIn("updated", props2)
         self.assertIn("<!-- wh:sweep -->", text2)
 
+    def test_find_notes_skips_hidden_folders_and_unreadable_notes(self):
+        notes = os.path.join(self.tmp.name, "vault")
+        for sub in ("Buying", ".trash", ".obsidian"):
+            os.makedirs(os.path.join(notes, sub))
+        for sub in ("Buying", ".trash"):
+            with open(os.path.join(notes, sub, "Laptop.md"), "w", encoding="utf-8") as f:
+                f.write("---\ntype: buy\nstatus: open\n---\n")
+        with open(os.path.join(notes, "Buying", "Latin1.md"), "wb") as f:
+            f.write(b"---\ntype: buy\n---\nK\xe4se\n")
+        with mock.patch.object(wh, "NOTES", notes), mock.patch.object(wh, "log") as log:
+            self.assertEqual([f for f, *_ in wh.find_notes([])], [os.path.join(notes, "Buying", "Laptop.md")])
+            self.assertEqual(len(wh.find_notes(["laptop"])), 1)          # by name: not the deleted copy either
+        self.assertIn("Latin1.md", log.call_args[0][0])
+
     def test_cmd_hunt_formats_metadata_and_splits_warnings_resiliently(self):
         note_path = os.path.join(self.tmp.name, "Laptop.md")
         with open(note_path, "w", encoding="utf-8") as f:
