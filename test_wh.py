@@ -8,10 +8,17 @@ import tempfile
 import unittest
 from unittest import mock
 
-import profiles
+import sys
 
-os.environ["WH_CONFIG"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "no-such-config")  # tests never read personal settings
-loader = importlib.machinery.SourceFileLoader("wh_mod", os.path.join(os.path.dirname(__file__), "wh"))
+HERE = os.path.dirname(os.path.abspath(__file__))     # runnable from any folder: python3 path/to/test_wh.py
+os.environ["WH_CONFIG"] = os.path.join(HERE, "no-such-config")   # before the imports: tests never read personal
+os.environ.pop("WH_TEMPLATES", None)                             # settings or templates
+for k in ("WH_NOTES", "WH_SKILL", "WH_DB", "WH_MODEL"):
+    os.environ.pop(k, None)
+sys.path.insert(0, HERE)
+import profiles  # noqa: E402
+
+loader = importlib.machinery.SourceFileLoader("wh_mod", os.path.join(HERE, "wh"))
 spec = importlib.util.spec_from_loader("wh_mod", loader)
 wh = importlib.util.module_from_spec(spec)
 loader.exec_module(wh)
@@ -790,6 +797,10 @@ min_score = 1
                dict(id=2, title="b", price=9, published="2026-10-29", junk=None),
                dict(id=3, title="c", price=1, published="2026-10-30", junk=None)]
         self.assertEqual([a["id"] for a in profiles.template_shortlist(tpl, ads, 10)], [3, 2, 1])
+
+    def test_tests_never_read_personal_templates(self):
+        home = os.path.expanduser("~/.config/wh")
+        self.assertFalse([d for d in profiles.TEMPLATE_DIRS if d.startswith(home)], profiles.TEMPLATE_DIRS)
 
     def test_shipped_example_template(self):
         profiles.load_templates()
