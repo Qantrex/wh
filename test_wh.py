@@ -247,6 +247,17 @@ class WhTests(TmpDbCase):
             _, text = wh.fetch("https://www.willhaben.at/ok")
         self.assertEqual(text, "hello willhaben")
 
+    def test_dates_are_austrian_days(self):
+        if wh.TZ is wh.timezone.utc:
+            self.skipTest("no tz database")
+        self.assertEqual(wh.day("1760911200000"), "2025-10-20")            # 2025-10-19T22:00Z, midnight in Vienna
+        self.assertEqual(wh.day("1760911200"), "2025-10-20")
+        self.assertEqual(wh.day("2026-10-19T23:30:00Z"), "2026-10-20")
+        self.assertEqual(wh.day("2026-10-19T23:30:00+02:00"), "2026-10-19")         # summer time
+        self.assertEqual(wh.day("2026-10-19"), "2026-10-19")
+        self.assertEqual(wh.day("2026-10-19T23:30:00"), "2026-10-19")       # no zone: as written
+        self.assertEqual((wh.day(None), wh.day("garbage")), ("", "garbage"))
+
     def test_comp_words_keeps_digits_and_strips_seller_noise(self):
         self.assertEqual(wh.comp_words("Preis Fix! Apple MacBook Air 15 M4 16GB"), "apple macbook air 15")
         self.assertEqual(wh.comp_words("(reserviert) Apple Mac mini M4 16GB"), "apple mac mini m4")

@@ -34,6 +34,11 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import profiles  # noqa: E402
 
 BASE = "https://www.willhaben.at"
+try:
+    from zoneinfo import ZoneInfo
+    TZ = ZoneInfo("Europe/Vienna")                         # willhaben's dates are Austrian days
+except Exception:                                          # no tz database (some Windows Pythons)
+    TZ = timezone.utc
 SEARCH = BASE + "/iad/kaufen-und-verkaufen/marktplatz"
 UA = "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0"
 
@@ -187,12 +192,20 @@ def num(s):
 
 
 def day(v):
-    """YYYY-MM-DD from an ISO date or a Unix timestamp (seconds or milliseconds)."""
-    v = str(v or "")
+    """YYYY-MM-DD in Austria from an ISO date or time or a Unix timestamp (seconds or milliseconds). A time in UTC
+    just before midnight is already the next day in Vienna."""
+    v = str(v or "").strip()
     if v.isdigit():
         n = int(v)
-        return datetime.fromtimestamp(n / 1000 if n > 1e11 else n, timezone.utc).date().isoformat()
-    return v[:10]
+        dt = datetime.fromtimestamp(n / 1000 if n > 1e11 else n, timezone.utc)
+    else:
+        try:
+            dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+        except ValueError:
+            return v[:10]
+        if dt.tzinfo is None:
+            return dt.date().isoformat()
+    return dt.astimezone(TZ).date().isoformat()
 
 
 def ad_id(s):
@@ -412,8 +425,8 @@ def fetch_detail(i, prev):
                  loc=" ".join(x for x in (addr.get("postCode"), addr.get("postalName"), addr.get("province")) if x),
                  private=bool(seller.get("private", g("ISPRIVATE") == "1")), seller=seller.get("name"),
                  seller_since=(seller.get("registerDate") or "")[:7], seller_ads=seller.get("activeAdCount"),
-                 first_published=(ad.get("firstPublishedDate") or "")[:10], changed=(ad.get("changedDate") or "")[:10],
-                 ends=(ad.get("endDate") or "")[:10], info=info, descr=clean(g("DESCRIPTION")),
+                 first_published=day(ad.get("firstPublishedDate")), changed=day(ad.get("changedDate")),
+                 ends=day(ad.get("endDate")), info=info, descr=clean(g("DESCRIPTION")),
                  images=[u for u in (x.get("referenceImageUrl") or x.get("mainImageUrl") for x in imgs) if u],
                  url=final if "/d/" in final else "%s/iad/object?adId=%d" % (BASE, i))
     return d
