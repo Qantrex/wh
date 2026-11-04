@@ -859,5 +859,30 @@ class NoteProfileTests(TmpDbCase):
         self.assertIn("Laptop", warned[0])
 
 
+class AdviseRulesTest(unittest.TestCase):
+    def test_advise_sends_the_pricing_rules(self):
+        """advise asked for "Pricing advice for my ads", the skill says "for the user's ads": the rules never got sent."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "SKILL.md")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("## Ground rules\n\nG\n\n## Selling\n\nS\n\n### Pricing advice for the user's ads\n\nPRICING\n")
+            jobs = []
+            with mock.patch.object(wh, "SKILL", path), mock.patch.object(wh, "find_notes", return_value=[
+                    ("/n/Item.md", "---\n---\n", {"type": "sell", "ad": "1234567"})]), \
+                 mock.patch.object(wh, "details_many", return_value={1234567: dict(
+                     id=1234567, status="active", title="Item", price=10, old_price=None, loc="", private=True,
+                     seller="s", seller_since="", seller_ads=1, first_published="", changed="", ends="", info=[],
+                     descr="", images=[], url="u")}), \
+                 mock.patch.object(wh, "run_searches", return_value=[dict(ads=[], found=0, complete=True, error=None)]), \
+                 mock.patch.object(wh, "db", return_value=mock.Mock()), \
+                 mock.patch.object(wh, "price_history", return_value=[]), \
+                 mock.patch.object(wh, "attach_details", side_effect=lambda c, ads: ads), \
+                 mock.patch.object(wh, "ask_all", side_effect=lambda a, j: jobs.extend(j) or ["ok"] * len(j)), \
+                 mock.patch("sys.stdout", io.StringIO()):
+                wh.cmd_advise(mock.Mock(notes=[], pages=1, limit=5, no_ai=False))
+                rules = wh.skill_rules(*jobs[0][2:])
+        self.assertIn("PRICING", rules)
+
+
 if __name__ == "__main__":
     unittest.main()
