@@ -653,28 +653,55 @@ def system_prompt():
             % (", who lives in %s" % where if where else ""))
 
 
-def skill_rules(*headings):
+# Which rules each AI command sends. The skill is split: SKILL.md (commands + ground rules) plus one file per task;
+# only SKILL.md's ground rules and the task's file go into the prompt. An old single-file SKILL.md still works: then
+# the matching sections are taken from it instead.
+RULES = {
+    "buy": ("buying.md", ("Ground rules", "Judging a deal (buying)")),
+    "sell": ("selling.md", ("Ground rules", "Selling", "Pricing advice for", "willhaben quirks")),
+}
+SHIPPED_SKILL = os.path.join(os.path.dirname(os.path.realpath(__file__)), "skill", "willhaben", "SKILL.md")
+
+
+def skill_path():
+    """SKILL.md as configured (a file or its folder); the copy next to wh when the configured one isn't there."""
+    path = os.path.join(SKILL, "SKILL.md") if os.path.isdir(SKILL) else SKILL
+    return path if os.path.isfile(path) or not os.path.isfile(SHIPPED_SKILL) else SHIPPED_SKILL
+
+
+def skill_section(text, heading):
+    """The `## heading…` (or ###) section of a Markdown text, heading line included; '' if there is none.
+    `heading` may be a prefix of the real heading."""
+    m = re.search(r"^(#{2,3}) %s[^\n]*\n(.*?)(?=^#{2,3} |\Z)" % re.escape(heading), text, re.M | re.S)
+    return "%s\n%s" % (m.group(0).split("\n", 1)[0], m.group(2).strip()) if m else ""
+
+
+def skill_rules(kind):
+    """The rules for one kind of AI command ("buy": deal, hunt; "sell": advise) as one text."""
+    path = skill_path()
     try:
-        with open(SKILL, encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             text = f.read()
     except OSError:
-        log("  note: %s not found, running without skill rules" % SKILL)
+        log("  note: %s not found, running without skill rules" % path)
         return ""
-    out = []
-    for h in headings:
-        m = re.search(r"^(#{2,3}) %s[^\n]*\n(.*?)(?=^#{2,3} |\Z)" % re.escape(h), text, re.M | re.S)
-        if m:
-            out.append("%s %s\n%s" % (m.group(1), h, m.group(2).strip()))
-    return "\n\n".join(out)
+    part, fallback = RULES[kind]
+    try:
+        with open(os.path.join(os.path.dirname(path), part), encoding="utf-8") as f:
+            extra = f.read()
+    except OSError:                                             # old single-file skill
+        return "\n\n".join(s for s in (skill_section(text, h) for h in fallback) if s)
+    extra = extra[extra.find("\n## ") + 1:] if "\n## " in extra else extra   # drop the file's title and intro
+    return "\n\n".join(s for s in (skill_section(text, "Ground rules"), extra.strip()) if s)
 
 
-def ask_claude(a, task, data, *rule_headings):
+def ask_claude(a, task, data, rules="buy"):
     prompt = "%s\n\n%s" % (task, data)
     if a.no_ai:
         print(prompt)
         return None
     cmd = ["claude", "-p", "--tools", "", "--strict-mcp-config", "--no-session-persistence", "--output-format", "text",
-           "--append-system-prompt", system_prompt() + skill_rules(*rule_headings)]
+           "--append-system-prompt", system_prompt() + skill_rules(rules)]
     if a.model or os.environ.get("WH_MODEL"):
         cmd += ["--model", a.model or os.environ["WH_MODEL"]]
     log("  asking Claude …")
@@ -991,7 +1018,7 @@ def cmd_deal(a):
             "first.")
     if a.question:
         task += "\nAlso answer: " + a.question
-    ans = ask_claude(a, task, data, "Ground rules", "Judging a deal (buying)")
+    ans = ask_claude(a, task, data, "buy")
     if ans:
         print(ans)
 
@@ -1023,7 +1050,7 @@ def cmd_advise(a):
         data = ("## My note\n\n%s\n\n## My ad now\n\n%s\n\n## Comparable ads on willhaben now\n\nSearch \"%s\": %s; "
                 "%s.\n\n%s" % (strip_blocks(text), fmt_details(d, c), words, found, market(comps),
                                table(comps[:a.limit], profile, True)))
-        jobs.append((task, data, "Ground rules", "Selling", "Pricing advice for"))
+        jobs.append((task, data, "sell"))
     if a.no_ai:
         for (f, *_), job in zip(live, jobs):
             if len(live) > 1:
@@ -1083,7 +1110,7 @@ def cmd_hunt(a):
             "`## Picks`: the ads you'd actually recommend, best first, as a numbered list. For each: price and link, why "
             "it's good value against the market, what to check or ask the seller, and a suggested offer. `## Warnings`: "
             "ads that look like scams or too good to be true, one line each with the link and why.")
-    ans = ask_claude(a, task, data, "Ground rules", "Judging a deal (buying)")
+    ans = ask_claude(a, task, data, "buy")
     if ans is None:
         return
     parts = re.split(r"^#{2,3}\s+Warnings\b[^\n]*\n?", ans, maxsplit=1, flags=re.M | re.I)

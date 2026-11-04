@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -267,7 +268,8 @@ class WhTests(TmpDbCase):
     def test_run_search_incomplete_when_search_result_missing(self):
         c = wh.db()
         self.addCleanup(c.close)
-        with mock.patch.object(wh, "fetch", return_value=("https://x", "<html>blocked</html>")):
+        with mock.patch.object(wh, "fetch", return_value=("https://x", "<html>blocked</html>")), \
+             mock.patch.object(wh, "log"):
             ads, found, complete = wh.run_search(c, "https://www.willhaben.at/s?rows=200", pages=2, key="k1")
         self.assertEqual(ads, [])
         self.assertEqual(found, 0)
@@ -880,8 +882,178 @@ class AdviseRulesTest(unittest.TestCase):
                  mock.patch.object(wh, "ask_all", side_effect=lambda a, j: jobs.extend(j) or ["ok"] * len(j)), \
                  mock.patch("sys.stdout", io.StringIO()):
                 wh.cmd_advise(mock.Mock(notes=[], pages=1, limit=5, no_ai=False))
-                rules = wh.skill_rules(*jobs[0][2:])
+                rules = wh.skill_rules(jobs[0][2])
         self.assertIn("PRICING", rules)
+
+
+
+SPLIT_SKILL = """---
+name: willhaben
+---
+
+# willhaben
+
+## wh: use it instead of writing scripts
+
+| `wh search` | lists ads |
+
+## Read before the task
+
+- buying.md, selling.md
+
+## Ground rules
+
+- GROUND-RULE
+"""
+
+OLD_SKILL = """# willhaben
+
+## wh: use it instead of writing scripts
+
+COMMAND-TABLE
+
+## Ground rules
+
+- GROUND-RULE
+
+## Getting the data (no browser needed)
+
+DATA-RULE
+
+## Judging a deal (buying)
+
+BUY-RULE
+
+## Selling
+
+SELL-RULE
+
+### Pricing advice for the user's ads
+
+PRICING-RULE
+
+## willhaben quirks
+
+- QUIRK-RULE
+"""
+
+
+class SkillRulesTest(unittest.TestCase):
+    """Which rules the AI commands send: SKILL.md's ground rules plus buying.md (deal, hunt) or selling.md (advise)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.skill = os.path.join(self.tmp.name, "SKILL.md")
+        patcher = mock.patch.object(wh, "SKILL", self.skill)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write(self, name, text):
+        with open(os.path.join(self.tmp.name, name), "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def write_split(self):
+        self.write("SKILL.md", SPLIT_SKILL)
+        self.write("buying.md", "# willhaben: buying\n\nBUY-INTRO\n\n## Judging a deal (buying)\n\nBUY-RULE\n")
+        self.write("selling.md", "# willhaben: selling\n\nSELL-INTRO\n\n## Selling\n\nSELL-RULE\n")
+        self.write("data.md", "## Getting the data\n\nDATA-RULE\n")
+
+    def test_split_buy_sends_ground_rules_and_buying_only(self):
+        self.write_split()
+        r = wh.skill_rules("buy")
+        self.assertTrue(r.startswith("## Ground rules\n- GROUND-RULE"))
+        self.assertIn("## Judging a deal (buying)\n\nBUY-RULE", r)
+        for other in ("SELL-RULE", "DATA-RULE", "lists ads", "BUY-INTRO", "name: willhaben", "Read before"):
+            self.assertNotIn(other, r)
+
+    def test_split_sell_sends_ground_rules_and_selling_only(self):
+        self.write_split()
+        r = wh.skill_rules("sell")
+        self.assertIn("GROUND-RULE", r)
+        self.assertIn("## Selling\n\nSELL-RULE", r)
+        for other in ("BUY-RULE", "DATA-RULE", "lists ads", "SELL-INTRO"):
+            self.assertNotIn(other, r)
+
+    def test_old_single_file_skill_still_works(self):
+        self.write("SKILL.md", OLD_SKILL)
+        buy, sell = wh.skill_rules("buy"), wh.skill_rules("sell")
+        self.assertIn("GROUND-RULE", buy)
+        self.assertIn("BUY-RULE", buy)
+        self.assertNotIn("SELL-RULE", buy)
+        for rule in ("GROUND-RULE", "SELL-RULE", "PRICING-RULE", "QUIRK-RULE"):   # pricing was lost before the split
+            self.assertIn(rule, sell)
+        self.assertIn("### Pricing advice for the user's ads", sell)
+        for rule in ("BUY-RULE", "DATA-RULE", "COMMAND-TABLE"):
+            self.assertNotIn(rule, sell)
+
+    def test_one_split_file_missing_falls_back_for_that_kind(self):
+        self.write("SKILL.md", OLD_SKILL)
+        self.write("buying.md", "# t\n\n## Judging a deal (buying)\n\nNEW-BUY-RULE\n")
+        self.assertIn("NEW-BUY-RULE", wh.skill_rules("buy"))
+        self.assertIn("SELL-RULE", wh.skill_rules("sell"))
+
+    def test_no_skill_gives_no_rules(self):
+        with mock.patch.object(wh, "SHIPPED_SKILL", os.path.join(self.tmp.name, "nope", "SKILL.md")), \
+             mock.patch.object(wh, "log") as log:
+            self.assertEqual(wh.skill_rules("buy"), "")
+        self.assertIn("not found", log.call_args[0][0])
+
+    def test_ask_claude_puts_the_kinds_rules_in_the_system_prompt(self):
+        self.write_split()
+        ns = mock.Mock(no_ai=False, model=None, timeout=5)
+        done = subprocess.CompletedProcess([], 0, stdout=" ok \n", stderr="")
+        with mock.patch.object(wh.subprocess, "run", return_value=done) as run, mock.patch.object(wh, "log"), \
+             mock.patch.dict(os.environ, {"WH_MODEL": ""}):
+            self.assertEqual(wh.ask_claude(ns, "task", "data", "sell"), "ok")
+            self.assertEqual(wh.ask_claude(ns, "task", "data"), "ok")          # default: buying rules
+        (sell_cmd,), _ = run.call_args_list[0]
+        (buy_cmd,), _ = run.call_args_list[1]
+        sell_sys = sell_cmd[sell_cmd.index("--append-system-prompt") + 1]
+        buy_sys = buy_cmd[buy_cmd.index("--append-system-prompt") + 1]
+        self.assertTrue(sell_sys.startswith(wh.system_prompt()))
+        self.assertIn("SELL-RULE", sell_sys)
+        self.assertNotIn("BUY-RULE", sell_sys)
+        self.assertIn("BUY-RULE", buy_sys)
+        self.assertNotIn("SELL-RULE", buy_sys)
+
+    def test_commands_ask_for_the_right_kind(self):
+        with open(os.path.join(HERE, "wh"), encoding="utf-8") as f:
+            src = f.read()
+        for cmd, kind in (("cmd_deal", "buy"), ("cmd_hunt", "buy"), ("cmd_advise", "sell")):
+            body = src[src.index("def %s(" % cmd):]
+            body = body[:body.index("\ndef ", 1)]
+            self.assertIn('"%s")' % kind, body, cmd)
+
+    def test_shipped_skill_split_sizes(self):
+        skill = os.path.join(HERE, "skill", "willhaben", "SKILL.md")
+        with mock.patch.object(wh, "SKILL", skill):
+            buy, sell = wh.skill_rules("buy"), wh.skill_rules("sell")
+        self.assertIn("Judging a deal", buy)
+        self.assertIn("Pricing advice", sell)
+        self.assertNotIn("Pricing advice", buy)
+        self.assertNotIn("Judging a deal", sell)
+        self.assertLessEqual(len(sell.encode()), 5000)    # keep the rules each call sends small
+        self.assertLessEqual(len(buy.encode()), 5000)
+
+
+    def test_skill_may_name_the_folder(self):
+        self.write_split()
+        with mock.patch.object(wh, "SKILL", self.tmp.name):
+            self.assertIn("SELL-RULE", wh.skill_rules("sell"))
+
+    def test_missing_skill_falls_back_to_the_shipped_one(self):
+        with mock.patch.object(wh, "SKILL", os.path.join(self.tmp.name, "nope", "SKILL.md")):
+            self.assertEqual(wh.skill_path(), wh.SHIPPED_SKILL)
+            self.assertIn("Pricing advice", wh.skill_rules("sell"))
+
+    def test_shipped_skill_has_no_personal_data(self):
+        d = os.path.dirname(wh.SHIPPED_SKILL)
+        for name in sorted(os.listdir(d)):
+            with open(os.path.join(d, name), encoding="utf-8") as f:
+                text = f.read()
+            for word in ("Anna", "girlfriend", "~/Notes", "kbauer", "pi-two", "homelab repo", "sport-gloves"):
+                self.assertNotIn(word, text, name)
 
 
 if __name__ == "__main__":

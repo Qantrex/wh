@@ -17,7 +17,7 @@ wh advise                               # AI: should my live ads get a lower pri
 wh hunt Laptop                          # AI: sweep a buy note, Claude writes the best picks into it
 ```
 
-The AI commands gather the data and ask `claude -p` (no tools, so it only reasons over what wh gives it) with the rules from the `willhaben` skill (`~/.claude/skills/willhaben/SKILL.md`). `--no-ai` prints the data and the task instead, which is what Claude itself uses inside a session.
+The AI commands gather the data and ask `claude -p` (no tools, so it only reasons over what wh gives it) with the rules from the `willhaben` skill (`skill/willhaben/` in this repo, installed as `~/.claude/skills/willhaben`): the ground rules from `SKILL.md` plus `buying.md` for `deal` and `hunt`, or `selling.md` for `advise`. An old single-file `SKILL.md` still works (wh takes the matching sections from it), and without an installed skill wh uses the copy in this repo. `--no-ai` prints the data and the task instead, which is what Claude itself uses inside a session.
 
 ## Speed
 
@@ -30,7 +30,8 @@ If willhaben pushes back (HTTP 403/429/503 or a Cloudflare challenge page), ever
 - `wh`: the command (Python 3, standard library only). Linked as `~/.local/bin/wh`.
 - `profiles.py`: per-category knowledge that turns ads into comparable specs and filters junk: the built-in profiles (`laptop`, `pc`, `server`, `hue`) and the template engine. A buy note picks one with `wh-profile: laptop`.
 - `templates/example.toml`: a sample template. Your own live in `~/.config/wh/templates/` (see [Templates](#templates)).
-- `test_wh.py`: unit tests (`python3 -m unittest`), no network.
+- `skill/willhaben/`: the Claude skill. `SKILL.md` (commands + ground rules) plus `buying.md`, `selling.md` and `data.md`, read when needed.
+- `test_wh.py`: unit tests, no network, from any folder: `python3 test_wh.py`.
 
 ## Templates
 
@@ -82,7 +83,7 @@ The AI commands (`deal`, `advise`, `hunt`) are the exception: they send what the
 | `WH_CONFIG` | `~/.config/wh` |
 | `WH_DB` | `~/.local/share/wh/wh.db` |
 | `WH_NOTES` | `notes` in the config, else `~/.local/share/wh/notes` |
-| `WH_SKILL` | `skill` in the config, else `~/.claude/skills/willhaben/SKILL.md` |
+| `WH_SKILL` | `skill` in the config, else `~/.claude/skills/willhaben/SKILL.md` (a file or its folder; `buying.md`/`selling.md` are read next to it) |
 | `WH_TEMPLATES` | extra template directories |
 | `WH_WORKERS` | `4` requests at once (`1` for one at a time) |
 | `WH_RATE` | `4` requests per second, all workers together |
