@@ -1042,6 +1042,50 @@ class NoteProfileTests(TmpDbCase):
         with open(path, encoding="utf-8") as f:
             self.assertIn("<!-- wh:sweep -->", f.read())
 
+    def doctor(self, **patches):
+        with mock.patch.multiple(wh, **patches), \
+             mock.patch.object(wh.shutil, "which", side_effect=lambda t: "/usr/bin/" + t if t == "claude" else None):
+            return wh.doctor_checks()
+
+    def test_doctor_checks_notes_skill_database_and_tools(self):
+        notes = os.path.join(self.tmp.name, "notes")
+        os.makedirs(notes)
+        for name, props in (("Laptop", "type: buy\nstatus: open\nsearch: x\nwh-area: graz\nwh-profile: nope\n"),
+                            ("Bike", "type: sell\nstatus: live\nad: soon\n")):
+            with open(os.path.join(notes, name + ".md"), "w", encoding="utf-8") as f:
+                f.write("---\n%s---\n" % props)
+        skills = os.path.join(self.tmp.name, "skills")
+        os.makedirs(skills)
+        os.symlink(os.path.dirname(wh.SHIPPED_SKILL), os.path.join(skills, "willhaben"))
+        c = wh.db()
+        c.close()
+        config = os.path.join(self.tmp.name, "config.toml")
+        with open(config, "w", encoding="utf-8") as f:
+            f.write('notes = "x"\nlocaton = "1010 Wien"\n')
+        checks = self.doctor(NOTES=notes, SKILL=os.path.join(skills, "willhaben", "SKILL.md"), CONFIG_PATH=config,
+                             CONFIG=wh.load_config(config))
+        text = "\n".join("%s %s %s" % x for x in checks)
+        self.assertIn("warn config unknown key 'locaton'", text)
+        self.assertIn("1 open buy/wanted (1 with `search:`), 1 live sell", text)
+        for warning in ("Laptop has no `for:`", "Laptop: unknown wh-profile 'nope'", "Laptop: unknown area 'graz'",
+                        "Bike: no willhaben ad id in 'soon'", "wh is not on PATH"):
+            self.assertIn(warning, text)
+        self.assertRegex(text, r"ok skill .*SKILL.md \(links to this repo\)")
+        self.assertRegex(text, r"ok database .*intact, 0 ads")
+        self.assertIn("ok tools claude found", text)
+        self.assertNotIn("FAIL", text)
+
+    def test_doctor_fails_without_notes_and_warns_without_a_skill(self):
+        checks = self.doctor(NOTES=os.path.join(self.tmp.name, "none"), SKILL=os.path.join(self.tmp.name, "SKILL.md"),
+                             CONFIG_PATH=os.path.join(self.tmp.name, "none.toml"), CONFIG={})
+        levels = {(lvl, what) for lvl, what, _ in checks}
+        self.assertIn(("FAIL", "notes"), levels)
+        self.assertIn(("warn", "skill"), levels)
+        self.assertIn(("info", "database"), levels)
+        with mock.patch.object(wh, "doctor_checks", return_value=checks), mock.patch("sys.stdout", io.StringIO()):
+            with self.assertRaises(SystemExit):
+                wh.cmd_doctor(None)
+
     def test_sweep_warns_about_notes_without_for(self):
         notes = os.path.join(self.tmp.name, "notes")
         os.makedirs(notes)

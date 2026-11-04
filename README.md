@@ -13,6 +13,7 @@ wh status                               # online? price? for every open Marketpl
 wh sweep                                # run the `search:` of every open buy/wanted note, write the results in
 wh sweep --json --no-write              # the same as JSON for a script or a timer, notes left alone
 wh profiles                             # built-in profiles and templates a note's `wh-profile` can name
+wh doctor                               # check config, notes, skill install, templates, database and tools
 
 wh deal <link> --for "a friend"         # AI: worth buying (for whom)? verdict, comparables, offer, questions
 wh advise                               # AI: should my live ads get a lower price? (one Claude call per ad, in parallel)
