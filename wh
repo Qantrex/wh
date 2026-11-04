@@ -26,6 +26,7 @@ import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
 
@@ -132,7 +133,7 @@ def fetch(url, binary=False):
             if e.code in (403, 429, 503):
                 slow_down("HTTP %d" % e.code)
             err = e
-        except (http.client.HTTPException, OSError) as e:
+        except (http.client.HTTPException, OSError, EOFError, zlib.error) as e:   # EOFError: a cut-off gzip body
             err = e
         if attempt < 2:
             log("  retry %d: %s" % (attempt + 1, err))

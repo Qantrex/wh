@@ -728,6 +728,18 @@ class FetchSweepTests(TmpDbCase):
         self.assertIn("rowsFound", text)
         self.assertTrue(wh._slow[0])
 
+    def test_a_cut_off_gzip_body_is_retried_not_a_traceback(self):
+        cut = gzip.compress(b"x" * 1000)[:20]
+        good = gzip.compress(b"<html>ok</html>")
+        with mock.patch("urllib.request.urlopen", side_effect=[
+                FakeResp(cut, {"Content-Encoding": "gzip"}), FakeResp(good, {"Content-Encoding": "gzip"})]), \
+             mock.patch("time.sleep"), mock.patch.object(wh, "log"):
+            self.assertEqual(wh.fetch("https://www.willhaben.at/x")[1], "<html>ok</html>")
+        with mock.patch("urllib.request.urlopen", side_effect=lambda *a, **k: FakeResp(cut, {"Content-Encoding": "gzip"})), \
+             mock.patch("time.sleep"), mock.patch.object(wh, "log"):
+            with self.assertRaises(wh.FetchError):
+                wh.fetch("https://www.willhaben.at/x")
+
     def test_a_cloudflare_challenge_is_never_returned_as_a_page(self):
         challenge = b"<html><head><title>Just a moment...</title></head></html>"
         with mock.patch("urllib.request.urlopen", side_effect=lambda *a, **k: FakeResp(challenge)), \
