@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """wh: willhaben.at from the terminal. Fast public data with a local cache; Claude does the judging.
 
-Data commands (no AI):  search, facets, ad, photos, status, sweep, profiles
+Data commands (no AI):  search, facets, ad, history, photos, status, sweep, profiles, doctor
 AI commands:            deal, advise, hunt   (gather the data, then ask `claude -p` with the willhaben skill's rules;
                                               --no-ai prints the gathered data instead, for use inside a Claude session)
 
@@ -847,6 +847,38 @@ def cmd_ad(a):
     print(fmt_details(details(c, ad_id(a.ad), refresh=a.refresh), c))
 
 
+def cmd_history(a):
+    """What wh has seen of one ad, from the database only (no request): prices over time, first and last seen."""
+    c = db()
+    i = ad_id(a.ad)
+    row = c.execute("select * from ads where id=?", (i,)).fetchone()
+    det = c.execute("select fetched, data from details where id=?", (i,)).fetchone()
+    if not row and not det:
+        raise WhError("ad %d is not in the database yet; `wh ad %d` fetches it" % (i, i))
+    d, row = (json.loads(det["data"]) if det else {}), dict(row or {})
+    hist = price_history(c, i)
+    out = dict(id=i, title=d.get("title") or row.get("title"), url=d.get("url") or row.get("url"),
+               first_seen=(row.get("first_seen") or "")[:10] or None, last_seen=(row.get("last_seen") or "")[:10] or None,
+               status=d.get("status"), checked=det["fetched"][:10] if det else None,
+               old_price=d.get("old_price"), price_cut_on=d.get("price_cut_on") or None,
+               prices=[dict(day=t, price=p) for t, p in hist])
+    if a.json:
+        print(json.dumps(out, ensure_ascii=False, indent=1))
+        return
+    print("**%s**\n%s" % (out["title"] or "?", out["url"] or ""))
+    seen = "Seen by wh %s to %s" % (out["first_seen"], out["last_seen"]) if out["first_seen"] else "Not seen in a search"
+    print(seen + (" · %s on %s" % (out["status"], out["checked"]) if out["status"] else ""))
+    if out["old_price"]:
+        print("willhaben says: cut from %s on %s" % (euro(out["old_price"]), out["price_cut_on"] or "?"))
+    prev = None
+    for t, p in hist:
+        change = ""
+        if prev and p is not None:
+            change = "  %s%s (%+d %%)" % ("−" if p < prev else "+", euro(abs(p - prev)), round(100 * (p - prev) / prev))
+        print("  %s  %s%s" % (t, euro(p), change))
+        prev = p if p else prev
+
+
 def cmd_photos(a):
     c = db()
     d = details(c, ad_id(a.ad), refresh=True)
@@ -1301,6 +1333,11 @@ def main():
     s.add_argument("ad", help="ad ID or link")
     s.add_argument("--refresh", action="store_true")
     s.set_defaults(fn=cmd_ad)
+
+    s = sub.add_parser("history", help="an ad's prices over time as wh saw them (database only, no request)")
+    s.add_argument("ad", help="ad ID or link")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_history)
 
     s = sub.add_parser("photos", help="download an ad's photos as JPEG (WebP gets converted)")
     s.add_argument("ad")

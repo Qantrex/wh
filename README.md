@@ -7,6 +7,7 @@ wh search dji fpv goggles v2            # list ads (junk filtered), --md for a n
 wh search --url computer-tablets/notebooks-5831 --max 800 --profile laptop --area wien,noe
 wh facets rtx --url computer-tablets-5828   # willhaben's subcategories and filters for a search, with counts
 wh ad 1041160074                        # one ad in full, with seller info and price history
+wh history 1041160074                   # its prices over time as wh saw them (database only, no request; --json)
 wh photos 1041160074 ./photos           # photos as JPEG (WebP gets converted with magick)
 wh status                               # online? price? for every open Marketplace note with an `ad:`
 wh sweep                                # run the `search:` of every open buy/wanted note, write the results in
