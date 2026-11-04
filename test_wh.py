@@ -452,6 +452,21 @@ class WhTests(TmpDbCase):
             self.assertEqual(len(wh.find_notes(["laptop"])), 1)          # by name: not the deleted copy either
         self.assertIn("Latin1.md", log.call_args[0][0])
 
+    def test_frontmatter_edge_cases_never_get_a_second_frontmatter(self):
+        self.assertEqual(wh.set_prop("---\n---\nBody\n", "checked", "2026-11-04"), "---\nchecked: 2026-11-04\n---\nBody\n")
+        self.assertEqual(wh.set_prop("---\ntype: buy\n---", "checked", "x"), "---\ntype: buy\nchecked: x\n---\n")
+        self.assertEqual(wh.set_prop("---\r\ntype: buy\r\n---\r\nB", "type", "sell").count("---"), 2)
+        self.assertEqual(wh.FM.match("---\ntype: buy\n---").group(1), "type: buy\n")
+        self.assertEqual(wh.set_prop("# no props\n", "a", "1"), "---\na: 1\n---\n# no props\n")
+        text = "---\na: 1\n---\nBody\n\n---\n\nmore"                  # a horizontal rule later stays text
+        self.assertEqual(wh.set_prop(text, "b", "2"), "---\na: 1\nb: 2\n---\nBody\n\n---\n\nmore")
+
+    def test_put_block_ignores_a_stray_end_marker_before_the_block(self):
+        text = "Uses <!-- /wh:sweep --> as marker.\n\n<!-- wh:sweep -->\nold\n<!-- /wh:sweep -->\n"
+        once = wh.put_block(text, "sweep", "new")
+        self.assertEqual(once, "Uses <!-- /wh:sweep --> as marker.\n\n<!-- wh:sweep -->\nnew\n<!-- /wh:sweep -->\n")
+        self.assertEqual(wh.put_block(once, "sweep", "new"), once)       # no copy appended on every sweep
+
     def test_cmd_hunt_formats_metadata_and_splits_warnings_resiliently(self):
         note_path = os.path.join(self.tmp.name, "Laptop.md")
         with open(note_path, "w", encoding="utf-8") as f:
