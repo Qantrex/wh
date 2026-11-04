@@ -307,6 +307,23 @@ class WhTests(TmpDbCase):
             wh.cmd_photos(ns)
         self.assertTrue(os.path.exists(os.path.join(photo_dir, "9999991-01.webp")))
 
+    def test_a_page_without_ad_data_is_an_error_not_an_offline_ad(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        with mock.patch.object(wh, "fetch", return_value=("u", make_detail_html(4242424, "Item", 50))):
+            wh.details(c, 4242424, refresh=True)
+        for page in ("<html><h1>Wartungsarbeiten</h1></html>",
+                     '<script id="__NEXT_DATA__" type="application/json">{"props": </script>',
+                     '<script id="__NEXT_DATA__" type="application/json">{"other": 1}</script>'):
+            with mock.patch.object(wh, "fetch", return_value=("u", page)):
+                with self.assertRaises(wh.FetchError):
+                    wh.details(c, 4242424, refresh=True)
+        cached = json.loads(c.execute("select data from details where id=4242424").fetchone()[0])
+        self.assertEqual(cached["status"], "active")             # the cache still says what was last known
+        with mock.patch.object(wh, "fetch", return_value=("u", "<html>maintenance</html>")), \
+             mock.patch.object(wh, "log"):
+            self.assertIsNone(wh.read_page("https://x?rows=200&page=1"))
+
     def test_sweep_note_multi_search_dedupes_and_preserves_was_price(self):
         c = wh.db()
         self.addCleanup(c.close)
