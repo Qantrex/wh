@@ -10,6 +10,7 @@ wh ad 1041160074                        # one ad in full, with seller info and p
 wh photos 1041160074 ./photos           # photos as JPEG (WebP gets converted with magick)
 wh status                               # online? price? for every open Marketplace note with an `ad:`
 wh sweep                                # run the `search:` of every open buy/wanted note, write the results in
+wh sweep --json --no-write              # the same as JSON for a script or a timer, notes left alone
 wh profiles                             # built-in profiles and templates a note's `wh-profile` can name
 
 wh deal <link> --for "a friend"         # AI: worth buying (for whom)? verdict, comparables, offer, questions
@@ -54,6 +55,8 @@ Notes in the notes folder (`notes` in the config, `WH_NOTES` overrides), with YA
 `wh` only writes `checked`, `updated` and its own blocks between `<!-- wh:sweep -->` / `<!-- wh:picks -->` markers. `hunt` saves the sweep before asking Claude, so a failed Claude call doesn't lose it.
 
 A sweep's "new", "price cuts" and "gone" compare with earlier runs of the same search URL (changing a URL starts over). "Gone" compares with the last run that read every page. `--dry-run` records no run, so the next real sweep still compares with the last real one.
+
+`wh sweep --json` prints, per note, the market line, the new ads, the price cuts (with `was`), the gone ads, the shortlist and any warnings, for a script or an agent on a timer. Progress goes to stderr, so stdout is only the JSON. `--no-write` records the run (so the next sweep's "new" starts from here) but leaves the notes alone, for a machine that only has a copy of them.
 
 When most ads of a search fall outside the profile's willhaben category (`profiles.CATEGORY`), the sweep says so and suggests the URL inside it. Category ids count, slugs don't: `laptops-notebooks-5824` is all of "Computer / Software", the notebooks are `computer-tablets/notebooks-5831`. `wh facets` shows the subcategories of any search.
 

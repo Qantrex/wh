@@ -17,7 +17,7 @@ Setup: the Install section of the `wh` README (github.com/Qantrex/wh). Notes fol
 | `wh ad <id or link>` | the full ad: description, seller (member since, active ads), price cut, price history |
 | `wh photos <id> <dir>` | downloads the photos, converting WebP to JPEG |
 | `wh status [notes]` | is each open note's `ad:` still online, at what price? |
-| `wh sweep [notes]` | runs the `search:` URLs of open buy/wanted notes and writes new ads, price cuts, gone ads and a shortlist into the note's `<!-- wh:sweep -->` block |
+| `wh sweep [notes] [--json] [--no-write]` | runs the `search:` URLs of open buy/wanted notes and writes new ads, price cuts, gone ads and a shortlist into the note's `<!-- wh:sweep -->` block; `--json` prints the same for scripts, `--no-write` leaves the notes alone |
 | `wh deal <id or link> [--compare "words"] [--question "…"]` | **AI:** verdict, comparable ads, a suggested offer, questions for the seller |
 | `wh advise [notes]` | **AI:** should your live ads (sell notes) get a lower price? |
 | `wh hunt <note>` | **AI:** sweep, then Claude writes the best picks into the note's `<!-- wh:picks -->` block |
