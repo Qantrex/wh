@@ -1023,7 +1023,7 @@ def cmd_advise(a):
         data = ("## My note\n\n%s\n\n## My ad now\n\n%s\n\n## Comparable ads on willhaben now\n\nSearch \"%s\": %s; "
                 "%s.\n\n%s" % (strip_blocks(text), fmt_details(d, c), words, found, market(comps),
                                table(comps[:a.limit], profile, True)))
-        jobs.append((task, data, "Ground rules", "Selling", "Pricing advice for my ads"))
+        jobs.append((task, data, "Ground rules", "Selling", "Pricing advice for"))
     if a.no_ai:
         for (f, *_), job in zip(live, jobs):
             if len(live) > 1:
