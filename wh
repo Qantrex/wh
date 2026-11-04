@@ -921,7 +921,8 @@ def sweep_plan(c, path, props):
     searches = searches if isinstance(searches, list) else [searches]
     items = []
     for s in searches:
-        is_url = s.startswith("http") or "/" in s or re.fullmatch(r"[a-z0-9-]+-\d{3,}", s)
+        is_url = s.startswith("http") or (not re.search(r"\s", s)                # "rtx 3060/3070" is keywords
+                                          and ("/" in s or re.fullmatch(r"[a-z0-9-]+-\d{3,}", s)))
         url = search_url(url=s) if is_url else search_url(s)
         key = "note:%s:%s" % (name_of(path), url)
         last = c.execute("select run, at from runs where key=? order by run desc limit 1", (key,)).fetchone()
@@ -1037,7 +1038,14 @@ def cmd_sweep(a):
         sys.exit("wh: no open buy/wanted note with a `search:` property")
     for f, _, p in todo:
         note_for(p, f)
-    plans = [sweep_plan(c, f, p) for f, _, p in todo]       # before this run records anything
+    plans, ok = [], []
+    for note in todo:                                       # before this run records anything
+        try:
+            plans.append(sweep_plan(c, note[0], note[2]))
+            ok.append(note)
+        except WhError as e:                                # e.g. a typo in wh-area: skip this note only
+            print("%s: skipped: %s" % (name_of(note[0]), e))
+    todo = ok
     jobs = [(x["url"], x["key"]) for plan in plans for x in plan["items"]]
     log("%d notes, %d searches:" % (len(todo), len(jobs)))
     fetched = iter(run_searches(c, jobs, a.pages, record=not a.dry_run))   # one queue for every note

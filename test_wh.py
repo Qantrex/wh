@@ -951,6 +951,26 @@ class NoteProfileTests(TmpDbCase):
         self.assertIn("unless it says it's for me", block)
         self.assertIn("Don't assume it's for me", wh.who_block(None))
 
+    def test_sweep_skips_a_note_with_a_bad_area_and_reads_keywords_with_a_slash(self):
+        notes = os.path.join(self.tmp.name, "notes")
+        os.makedirs(notes)
+        for name, extra in (("Typo", "wh-area: graz\n"), ("Gpu", "")):
+            with open(os.path.join(notes, name + ".md"), "w", encoding="utf-8") as f:
+                f.write("---\ntype: buy\nstatus: open\nfor: me\n%ssearch: rtx 3060/3070\n---\n" % extra)
+        urls = []
+        empty = next_page({"searchResult": {"rowsFound": 0, "advertSummaryList": {"advertSummary": []}}})
+        c = wh.db()
+        self.addCleanup(c.close)
+        out = io.StringIO()
+        with mock.patch.object(wh, "NOTES", notes), mock.patch.object(wh, "db", return_value=c), \
+             mock.patch.object(wh, "fetch", side_effect=lambda u, binary=False: urls.append(u) or (u, empty)), \
+             mock.patch.object(wh, "log"), mock.patch("sys.stdout", out):
+            wh.cmd_sweep(mock.Mock(notes=[], pages=1, limit=5, dry_run=True, json=False))
+        self.assertIn("Typo: skipped: unknown area 'graz'", out.getvalue())
+        self.assertIn("## Sweep", out.getvalue())
+        self.assertEqual(len(urls), 1)
+        self.assertIn("/marktplatz?keyword=rtx+3060%2F3070", urls[0])
+
     def test_sweep_warns_about_notes_without_for(self):
         notes = os.path.join(self.tmp.name, "notes")
         os.makedirs(notes)
