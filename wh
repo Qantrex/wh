@@ -156,11 +156,16 @@ def pmap(fn, items):
 
 
 def page_props(h):
+    """The page's __NEXT_DATA__ pageProps, {} when it has none. Broken JSON raises FetchError instead of a traceback."""
     i = h.find('<script id="__NEXT_DATA__"')
     j = h.find("</script>", i) if i >= 0 else -1
     if j < 0:
         return {}
-    return json.loads(h[h.index(">", i) + 1:j])["props"]["pageProps"]
+    try:
+        props = json.loads(h[h.index(">", i) + 1:j])["props"]["pageProps"]
+    except (ValueError, KeyError, TypeError) as e:
+        raise FetchError("can't read willhaben's page data (%s: %s); did the site change?" % (type(e).__name__, e))
+    return props if isinstance(props, dict) else {}
 
 
 def attrs(obj):
@@ -373,6 +378,8 @@ def run_search(c, url, pages=5, key=None, record=True):
 def fetch_detail(i, prev):
     """The full ad page as a dict, without touching the database. A gone ad keeps what was known, as 'offline'."""
     final, h = fetch("%s/iad/object?adId=%d" % (BASE, i))
+    if h and '<script id="__NEXT_DATA__"' not in h:            # an error or changed page, not a gone ad
+        raise FetchError("no ad data on the page for ad %d (willhaben down, or its HTML changed?)" % i)
     ad = page_props(h).get("advertDetails") if h else None
     if not ad:
         d = dict(prev, id=i, status="offline", url=prev.get("url") or "%s/iad/object?adId=%d" % (BASE, i))
