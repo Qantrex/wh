@@ -467,6 +467,32 @@ class WhTests(TmpDbCase):
         self.assertEqual(once, "Uses <!-- /wh:sweep --> as marker.\n\n<!-- wh:sweep -->\nnew\n<!-- /wh:sweep -->\n")
         self.assertEqual(wh.put_block(once, "sweep", "new"), once)       # no copy appended on every sweep
 
+    def test_hunt_keeps_edits_made_while_claude_thinks_and_symlinks_stay(self):
+        real = os.path.join(self.tmp.name, "real.md")
+        link = os.path.join(self.tmp.name, "Goggles.md")
+        with open(real, "w", encoding="utf-8") as f:
+            f.write("---\ntype: buy\nstatus: open\nfor: me\nsearch: goggles\n---\n# Goggles\n")
+        os.symlink(real, link)
+        page = search_page(1, [make_summary(1, "DJI Goggles V2", 180)])
+
+        def claude_while_the_owner_types(a, task, data, rules="buy"):
+            with open(link, "a", encoding="utf-8") as f:
+                f.write("\nAsked the seller about the battery.\n")
+            return "## Picks\n\n1. Goggles\n"
+        c = wh.db()
+        self.addCleanup(c.close)
+        ns = mock.Mock(note=link, pages=1, limit=10, details=0, dry_run=False, no_ai=False)
+        with mock.patch.object(wh, "db", return_value=c), mock.patch.object(wh, "fetch", return_value=("u", page)), \
+             mock.patch.object(wh, "ask_claude", side_effect=claude_while_the_owner_types), \
+             mock.patch.object(wh, "log"), mock.patch("sys.stdout", io.StringIO()):
+            wh.cmd_hunt(ns)
+        self.assertTrue(os.path.islink(link))
+        saved, props = wh.read_note(link)
+        self.assertIn("Asked the seller about the battery.", saved)
+        self.assertIn("<!-- wh:picks -->", saved)
+        self.assertIn("<!-- wh:sweep -->", saved)
+        self.assertEqual(props["for"], "me")
+
     def test_cmd_hunt_formats_metadata_and_splits_warnings_resiliently(self):
         note_path = os.path.join(self.tmp.name, "Laptop.md")
         with open(note_path, "w", encoding="utf-8") as f:

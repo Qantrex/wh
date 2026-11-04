@@ -584,7 +584,8 @@ def find_notes(args, types=None, statuses=None):
 
 def write_note(path, text):
     text = set_prop(text, "updated", date.today().isoformat())
-    d = os.path.dirname(os.path.abspath(path))
+    path = os.path.realpath(path)                           # a symlinked note stays a link, its target gets the text
+    d = os.path.dirname(path)
     mode = os.stat(path).st_mode if os.path.exists(path) else None
     fd, tmp = tempfile.mkstemp(dir=d, prefix=".wh-", suffix=".tmp")
     try:
@@ -597,6 +598,14 @@ def write_note(path, text):
         if os.path.exists(tmp):
             os.remove(tmp)
         raise
+
+
+def update_note(path, change):
+    """Write change(text) into a note, reading the note again first: an edit made in the editor while wh was
+    fetching or Claude was thinking stays, since wh only touches its own properties and blocks."""
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    write_note(path, change(text))
 
 
 def name_of(path):
@@ -873,7 +882,7 @@ def cmd_status(a):
                 line += "  (note says %s)" % euro(num(p["price"]))
         print(line)
         if not a.dry_run:
-            write_note(f, set_prop(text, "checked", date.today().isoformat()))
+            update_note(f, lambda t: set_prop(t, "checked", date.today().isoformat()))
 
 
 def note_for(props, path):
@@ -1036,7 +1045,7 @@ def cmd_sweep(a):
         if a.dry_run:
             print(block)
             continue
-        write_note(f, set_prop(put_block(text, "sweep", block), "checked", date.today().isoformat()))
+        update_note(f, lambda t: set_prop(put_block(t, "sweep", block), "checked", date.today().isoformat()))
         print("%s: %s; %d on the shortlist" % (name_of(f), mk, len(short)))
         for line in block.splitlines():
             if line.startswith("> "):
@@ -1113,8 +1122,7 @@ def cmd_hunt(a):
         sys.exit("wh: %s has no `search:` property" % name_of(f))
     block, short, good, mk = sweep_note(c, f, p, a.pages, a.limit, detail_count=a.details, record=not a.dry_run)
     if not a.dry_run:                                       # saved now, so a failed Claude call doesn't lose the sweep
-        text = set_prop(put_block(text, "sweep", block), "checked", date.today().isoformat())
-        write_note(f, text)
+        update_note(f, lambda t: set_prop(put_block(t, "sweep", block), "checked", date.today().isoformat()))
     profile = note_profile(p, f)
     who = note_for(p, f)
     states = area(p.get("wh-area"))
@@ -1160,7 +1168,7 @@ def cmd_hunt(a):
     picks = re.sub(r"\A.*?^#{2,3}\s+Picks\b[^\n]*\n?", "", picks, count=1, flags=re.M | re.S | re.I).strip()
     out = "## Picks\n\n*wh hunt %s (Claude)*\n\n%s" % (datetime.now().strftime("%Y-%m-%d %H:%M"), picks)
     if not a.dry_run:
-        write_note(f, put_block(text, "picks", out))
+        update_note(f, lambda t: put_block(t, "picks", out))
     print(out)
     if warnings.strip():
         print("\n## Warnings (not written to the note)\n\n" + warnings.strip())
