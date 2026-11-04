@@ -15,6 +15,7 @@ import http.client
 import json
 import os
 import re
+import shutil
 import sqlite3
 import statistics
 import subprocess
@@ -43,9 +44,12 @@ SEARCH = BASE + "/iad/kaufen-und-verkaufen/marktplatz"
 UA = "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0"
 
 
-def load_config():
+CONFIG_PATH = os.path.join(os.path.expanduser(os.environ.get("WH_CONFIG", "~/.config/wh")), "config.toml")
+CONFIG_KEYS = {"notes", "skill", "location"}
+
+
+def load_config(path=CONFIG_PATH):
     """Personal settings from ~/.config/wh/config.toml. They stay on this machine, never in this repo."""
-    path = os.path.join(os.path.expanduser(os.environ.get("WH_CONFIG", "~/.config/wh")), "config.toml")
     try:
         with open(path, "rb") as f:
             return tomllib.load(f)
@@ -1280,6 +1284,109 @@ def cmd_facets(a):
                 print("          … %d more" % (len(vals) - a.limit))
 
 
+def doctor_checks():
+    """(level, area, message) for everything wh depends on; level is ok, info, warn or FAIL. Sends no request."""
+    home = os.path.expanduser("~")
+    short = lambda p: p.replace(home, "~", 1) if p else p  # noqa: E731
+    out = []
+    add = lambda level, what, msg: out.append((level, what, msg))  # noqa: E731
+
+    if os.path.isfile(CONFIG_PATH):
+        add("ok", "config", "%s (%s)" % (short(CONFIG_PATH), ", ".join(sorted(CONFIG)) or "empty"))
+        for k in sorted(set(CONFIG) - CONFIG_KEYS):
+            add("warn", "config", "unknown key %r (known: %s)" % (k, ", ".join(sorted(CONFIG_KEYS))))
+    else:
+        add("info", "config", "no %s, using the defaults" % short(CONFIG_PATH))
+
+    if not os.path.isdir(NOTES):
+        add("FAIL", "notes", "no folder %s: set `notes` in the config or WH_NOTES" % short(NOTES))
+    else:
+        notes = find_notes([NOTES])
+        buy = [(f, p) for f, _, p in notes if p.get("type") in ("buy", "wanted") and p.get("status") in OPEN]
+        sell = [(f, p) for f, _, p in notes if p.get("type") == "sell" and p.get("status") in OPEN | {"draft"}]
+        add("ok", "notes", "%s: %d notes, %d open buy/wanted (%d with `search:`), %d live sell" % (
+            short(NOTES), len(notes), len(buy), sum(1 for _, p in buy if p.get("search")), len(sell)))
+        for f, p in buy:
+            if not p.get("for"):
+                add("warn", "notes", "%s has no `for:`" % name_of(f))
+            name = p.get("wh-profile")
+            if name and name not in profiles.PROFILES:
+                add("warn", "notes", "%s: unknown wh-profile %r" % (name_of(f), name))
+            try:
+                area(p.get("wh-area"))
+            except WhError as e:
+                add("warn", "notes", "%s: %s" % (name_of(f), e))
+        for f, p in sell:
+            if p.get("ad"):
+                try:
+                    ad_id(p["ad"])
+                except WhError as e:
+                    add("warn", "notes", "%s: %s" % (name_of(f), e))
+
+    path = skill_path()
+    configured = os.path.join(SKILL, "SKILL.md") if os.path.isdir(SKILL) else SKILL
+    if not os.path.isfile(configured) and path == SHIPPED_SKILL:
+        add("warn", "skill", "%s not found, the AI commands use the repo's copy; for Claude Code: ln -sfn %s %s" % (
+            short(SKILL), short(os.path.dirname(SHIPPED_SKILL)), short(os.path.dirname(SKILL))))
+    elif not os.path.isfile(path):
+        add("FAIL", "skill", "no %s and no copy next to wh: the AI commands run without rules" % short(path))
+    else:
+        d = os.path.dirname(path)
+        link = os.path.islink(d) and os.path.realpath(d) == os.path.dirname(SHIPPED_SKILL)
+        add("ok", "skill", "%s%s" % (short(path), " (links to this repo)" if link else ""))
+        missing = [f for f in ("buying.md", "selling.md") if not os.path.isfile(os.path.join(d, f))]
+        if missing:
+            add("warn", "skill", "single-file skill (no %s): the rules come from SKILL.md's sections; link the repo's "
+                "skill/willhaben instead" % ", ".join(missing))
+        elif not link and os.path.isfile(SHIPPED_SKILL) and os.path.realpath(d) != os.path.dirname(SHIPPED_SKILL):
+            with open(path, encoding="utf-8") as f1, open(SHIPPED_SKILL, encoding="utf-8") as f2:
+                if f1.read() != f2.read():
+                    add("info", "skill", "a copy that differs from the repo's; a symlink would follow git")
+        if "Judging a deal" not in skill_rules("buy") or "Pricing advice" not in skill_rules("sell"):
+            add("warn", "skill", "the buying or pricing rules are missing: deal/hunt/advise send less to Claude")
+
+    add("ok", "templates", "%d built-in profiles, %d template%s" % (
+        len(profiles.BUILTIN), len(profiles.TEMPLATES), "" if len(profiles.TEMPLATES) == 1 else "s"))
+    for p, err in profiles.TEMPLATE_ERRORS.items():
+        add("warn", "templates", "%s skipped: %s" % (short(p), err))
+
+    if not os.path.exists(DB):
+        add("info", "database", "%s doesn't exist yet; the first search creates it" % short(DB))
+    else:
+        try:
+            c = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(DB), uri=True, timeout=10)
+            try:
+                check = c.execute("pragma quick_check").fetchone()[0]
+                ads = c.execute("select count(*) from ads").fetchone()[0]
+                last = c.execute("select max(at) from runs").fetchone()[0]
+            finally:
+                c.close()
+        except sqlite3.Error as e:
+            add("FAIL", "database", "%s: %s" % (short(DB), e))
+        else:
+            add("ok" if check == "ok" else "FAIL", "database", "%s: %s, %d ads, %.1f MB, last search %s" % (
+                short(DB), "intact" if check == "ok" else check, ads, os.path.getsize(DB) / 1e6, last or "never"))
+
+    me, on_path = os.path.realpath(__file__), shutil.which("wh")
+    if not on_path:
+        add("warn", "tools", "wh is not on PATH: ln -sf %s ~/.local/bin/wh" % short(me))
+    elif os.path.realpath(on_path) != me:
+        add("warn", "tools", "`wh` on PATH is %s, not this one (%s)" % (short(os.path.realpath(on_path)), short(me)))
+    add("ok" if shutil.which("claude") else "warn", "tools", "claude %s" % (
+        "found" if shutil.which("claude") else "not found: deal/advise/hunt only work with --no-ai"))
+    if not (shutil.which("magick") or shutil.which("convert")):
+        add("info", "tools", "no ImageMagick: `wh photos` keeps WebP photos as they are")
+    return out
+
+
+def cmd_doctor(a):
+    checks = doctor_checks()
+    for level, what, msg in checks:
+        print("%-5s %-10s %s" % (level, what, msg))
+    if any(level == "FAIL" for level, *_ in checks):
+        sys.exit(1)
+
+
 def cmd_profiles(a):
     home = os.path.expanduser("~")
     for name in sorted(profiles.PROFILES):
@@ -1328,6 +1435,10 @@ def main():
     s = sub.add_parser("profiles", help="the built-in profiles and the templates (templates/*.toml) a note's "
                                         "`wh-profile` or --profile can name, and any template that's broken")
     s.set_defaults(fn=cmd_profiles)
+
+    s = sub.add_parser("doctor", help="check the config, notes, skill install, templates, database and tools "
+                                      "(no request to willhaben)")
+    s.set_defaults(fn=cmd_doctor)
 
     s = sub.add_parser("ad", help="one ad in full (description, seller, price history)")
     s.add_argument("ad", help="ad ID or link")
@@ -1385,7 +1496,7 @@ def main():
         s.set_defaults(fn=fn)
 
     a = ap.parse_args()
-    if a.cmd != "profiles":
+    if a.cmd not in ("profiles", "doctor"):
         for path in profiles.TEMPLATE_ERRORS:
             log("wh: skipped the broken template %s (see `wh profiles`)" % os.path.basename(path))
     try:

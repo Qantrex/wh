@@ -5,7 +5,7 @@ description: Anything on willhaben.at, plus used-market searches on Kleinanzeige
 
 # willhaben
 
-Setup: the Install section of the `wh` README (github.com/Qantrex/wh). Notes folder, the database and note properties: [data.md](data.md).
+Setup: the Install section of the `wh` README (github.com/Qantrex/wh); `wh doctor` checks it. Notes folder, the database and note properties: [data.md](data.md).
 
 ## wh: use it instead of writing scripts
 
@@ -14,6 +14,7 @@ Setup: the Install section of the `wh` README (github.com/Qantrex/wh). Notes fol
 | `wh search <words> [--url <search URL or category slug>] [--min N] [--max N] [--pages N] [--profile NAME] [--area wien,noe] [--md\|--json]` | lists ads, without junk (defects, wanted ads, parts) unless `--all` |
 | `wh facets <words> [--url …] [--min N] [--max N]` | willhaben's own breakdown of a search: subcategories with ready URLs, condition, region, brand … with counts. Use it to write a note's `search:` lines |
 | `wh profiles` | the built-in profiles and templates a note's `wh-profile` can name, plus broken templates with the reason |
+| `wh doctor` | checks the config, notes (missing `for:`, unknown profiles or areas, bad `ad:`), the skill install, templates, the database and tools; run it first when something looks wrong |
 | `wh ad <id or link>` | the full ad: description, seller (member since, active ads), price cut, price history |
 | `wh history <id or link> [--json]` | the prices wh has seen for an ad over time, from the database only (no request) |
 | `wh photos <id> <dir>` | downloads the photos, converting WebP to JPEG |
