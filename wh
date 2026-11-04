@@ -455,6 +455,17 @@ def attach_details(c, ads):
     return ads
 
 
+def last_prices(c, ids, at):
+    """{id: the last price recorded at or before `at`} for these ads (only their rows, not the whole table)."""
+    out, ids = {}, sorted(ids)
+    for k in range(0, len(ids), 500):
+        chunk = ids[k:k + 500]
+        for r in c.execute("select id, price from prices where id in (%s) and seen <= ? order by id, seen, rowid"
+                           % ",".join("?" * len(chunk)), chunk + [at]):
+            out[r["id"]] = r["price"]
+    return out
+
+
 def price_history(c, i):
     return [(r["seen"][:10], r["price"]) for r in c.execute("select price, seen from prices where id=? order by seen", (i,))]
 
@@ -878,9 +889,8 @@ def sweep_plan(c, path, props):
                                            " where r.key=?", (key,))}
         items.append(dict(search=s, url=url, key=key, last=last, full=full, seen=seen))
     ats = [x["last"]["at"] for x in items if x["last"]]
-    prev_prices = ({r["id"]: r["price"] for r in c.execute(
-        "select id, price from prices where seen <= ? order by seen, rowid", (max(ats),))} if ats else {})
-    return dict(items=items, prev_prices=prev_prices, seen=set().union(*(x["seen"] for x in items)),
+    seen = set().union(*(x["seen"] for x in items))
+    return dict(items=items, prev_prices=last_prices(c, seen, max(ats)) if ats else {}, seen=seen,
                 profile=note_profile(props, path), near=area(props.get("wh-area")))
 
 
