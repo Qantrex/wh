@@ -22,19 +22,38 @@ wh hunt Laptop                          # AI: sweep a buy note, Claude writes th
 
 The AI commands gather the data and ask `claude -p` (no tools, so it only reasons over what wh gives it) with the rules from the `willhaben` skill (`skill/willhaben/` in this repo, installed as `~/.claude/skills/willhaben`): the ground rules from `SKILL.md` plus `buying.md` for `deal` and `hunt`, or `selling.md` for `advise`. An old single-file `SKILL.md` still works (wh takes the matching sections from it), and without an installed skill wh uses the copy in this repo. `--no-ai` prints the data and the task instead, which is what Claude itself uses inside a session.
 
+## Install
+
+Needs Python 3.11+ (standard library only) and, for the AI commands, Claude Code. Both links point into the clone, so a `git pull` updates the tool and the skill at once.
+
+```bash
+git clone https://github.com/Qantrex/wh ~/Projects/wh && cd ~/Projects/wh
+mkdir -p ~/.local/bin ~/.claude/skills ~/.config/wh/templates
+ln -sf "$PWD/wh" ~/.local/bin/wh                      # ~/.local/bin must be on your PATH
+[ -d ~/.claude/skills/willhaben ] && [ ! -L ~/.claude/skills/willhaben ] &&
+  mv ~/.claude/skills/willhaben ~/.claude/skills/willhaben.old   # an old copied skill: keep it aside
+ln -sfn "$PWD/skill/willhaben" ~/.claude/skills/willhaben
+[ -f ~/.config/wh/config.toml ] || printf 'notes = "~/path/to/marketplace-notes"\n' > ~/.config/wh/config.toml
+wh doctor                                             # checks all of the above, sends no request
+python3 test_wh.py                                    # offline tests
+```
+
+The database (`~/.local/share/wh/wh.db`) starts empty and builds up the price history as you search.
+
 ## Speed
 
-A full `wh sweep` of the five buy notes (28 searches, 41 pages) takes about 12 s; one request every 1.1 s took 46 s. The time is almost all network: parsing a 200-ad page takes ~14 ms, the profiles ~0.25 ms per ad. `sweep` puts the searches of every note into one queue, page 1 of each search first (it says how many pages there are), then the rest.
+A full `wh sweep` of the five buy notes (28 searches, 41 pages) takes about 12 s; one request every 1.1 s took 46 s. The time is almost all network: parsing a 200-ad page takes ~14 ms, the profiles ~0.25 ms per ad, storing 1000 ads ~6 ms (one transaction per run). Preparing a 28-note sweep on a database with 800k price rows takes under a second. `sweep` puts the searches of every note into one queue, page 1 of each search first (it says how many pages there are), then the rest.
 
 If willhaben pushes back (HTTP 403/429/503 or a Cloudflare challenge page), every worker drops to one request per `WH_DELAY` for the rest of the run. A request that keeps failing marks its search incomplete in the note instead of stopping the run.
 
 ## Files
 
-- `wh`: the command (Python 3, standard library only). Linked as `~/.local/bin/wh`.
+- `wh`: the command (Python 3.11+, standard library only). Linked as `~/.local/bin/wh`.
 - `profiles.py`: per-category knowledge that turns ads into comparable specs and filters junk: the built-in profiles (`laptop`, `pc`, `server`, `hue`) and the template engine. A buy note picks one with `wh-profile: laptop`.
 - `templates/example.toml`: a sample template. Your own live in `~/.config/wh/templates/` (see [Templates](#templates)).
 - `skill/willhaben/`: the Claude skill. `SKILL.md` (commands + ground rules) plus `buying.md`, `selling.md` and `data.md`, read when needed.
-- `test_wh.py`: unit tests, no network, from any folder: `python3 test_wh.py`.
+- `test_wh.py`: unit tests, no network, from any folder: `python3 test_wh.py`. GitHub Actions runs them on every push.
+- `CLAUDE.md`: notes for Claude Code working on this repo.
 
 ## Templates
 
