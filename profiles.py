@@ -613,7 +613,7 @@ def server(ad):
 
 
 def server_shortlist(ads, n):
-    """Interleave: <=€100 budget TinyMiniMicro (pi-two replacement), QuickSync 8th-gen+/N100 Tiny nodes,
+    """Interleave: <=€100 budget TinyMiniMicro (home-server replacement), QuickSync 8th-gen+/N100 Tiny nodes,
     x86 NAS & MicroServers, and quiet Tower servers."""
     ok = [a for a in ads if not a.get("junk")]
     tiny_budget = sorted((a for a in ok if a.get("form") == "Tiny/Mini" and a["price"] <= 110
@@ -792,7 +792,7 @@ def hue(ad):
 
 def hue_shortlist(ads, n):
     """Interleave: switches/dimmers/sensors (Dimmer V2 first!), colour bulb deals, lamps/strips/Play, and bundles.
-    Standalone Bridges stay out unless needed to fill n (owner already runs a Bridge)."""
+    Standalone Bridges stay out unless needed to fill n (most setups already have one)."""
     ok = [a for a in ads if not a.get("junk")]
     controls = sorted((a for a in ok if a.get("kind") in ("Dimmer V2", "Switch", "Sensor", "Dimmer")),
                       key=lambda a: (0 if a["kind"] == "Dimmer V2" else 1, -a["best"], a["price"]))
