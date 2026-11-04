@@ -965,7 +965,7 @@ def category_notes(plan, fetched):
 
 def sweep_report(c, plan, fetched, limit, detail_count=0):
     """The sweep block from this run's results (one run_searches() dict per search of the plan).
-    Returns (markdown block, shortlist, all good ads, market line)."""
+    Returns (markdown block, shortlist, all good ads, market line); the same facts for scripts go in plan["report"]."""
     profile = plan["profile"]
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     allads, new_ids, gone_ids, notes = {}, set(), set(), []
@@ -1033,7 +1033,26 @@ def sweep_report(c, plan, fetched, limit, detail_count=0):
         out += ["", "### Gone since last sweep", "", "Usually just expired, not sold."]
         out += ["- [%s](%s), %s" % (link_text(g["title"], 70), g["url"], euro(g["price"])) for g in gone[:limit]]
     out += ["", "### Shortlist", "", table(short, profile, True) if short else "Nothing matches."]
+    plan["report"] = dict(
+        market=mk, ads=len(good), near=sum(1 for x in good if x["near"]) if plan["near"] else None,
+        warnings=notes, new=[ad_json(x, profile) for x in new[:limit]],
+        cuts=[ad_json(x, profile, was=prev_prices.get(x["id"])) for x in cuts[:limit]],
+        gone=[ad_json(g, profile) for g in gone[:limit]], shortlist=[ad_json(x, profile) for x in short])
     return "\n".join(out), short, good, mk
+
+
+def ad_json(a, profile=None, was=None):
+    """An ad in a few fields, for --json output."""
+    d = {k: a.get(k) for k in ("id", "title", "price", "loc", "url", "published")}
+    d["private"] = bool(a.get("private"))
+    if a.get("near") is not None:
+        d["near"] = a["near"]
+    if was is not None:
+        d["was"] = was
+    sp = specs(a, profile)
+    if sp:
+        d["specs"] = sp
+    return d
 
 
 def sweep_note(c, path, props, pages, limit, detail_count=0, record=True):
@@ -1051,27 +1070,35 @@ def cmd_sweep(a):
         sys.exit("wh: no open buy/wanted note with a `search:` property")
     for f, _, p in todo:
         note_for(p, f)
-    plans, ok = [], []
+    plans, ok, report = [], [], []
     for note in todo:                                       # before this run records anything
         try:
             plans.append(sweep_plan(c, note[0], note[2]))
             ok.append(note)
         except WhError as e:                                # e.g. a typo in wh-area: skip this note only
-            print("%s: skipped: %s" % (name_of(note[0]), e))
+            report.append(dict(note=name_of(note[0]), path=note[0], error=str(e)))
+            (log if a.json else print)("%s: skipped: %s" % (name_of(note[0]), e))
     todo = ok
     jobs = [(x["url"], x["key"]) for plan in plans for x in plan["items"]]
     log("%d notes, %d searches:" % (len(todo), len(jobs)))
     fetched = iter(run_searches(c, jobs, a.pages, record=not a.dry_run))   # one queue for every note
     for (f, text, p), plan in zip(todo, plans):
         block, short, good, mk = sweep_report(c, plan, [next(fetched) for _ in plan["items"]], a.limit)
+        if a.json:
+            report.append(dict(note=name_of(f), path=f, **plan["report"]))
+        if not (a.dry_run or a.no_write):
+            update_note(f, lambda t: set_prop(put_block(t, "sweep", block), "checked", date.today().isoformat()))
+        if a.json:
+            continue
         if a.dry_run:
             print(block)
             continue
-        update_note(f, lambda t: set_prop(put_block(t, "sweep", block), "checked", date.today().isoformat()))
         print("%s: %s; %d on the shortlist" % (name_of(f), mk, len(short)))
         for line in block.splitlines():
             if line.startswith("> "):
                 print("  " + line[2:])
+    if a.json:
+        print(json.dumps(dict(at=now(), dry_run=bool(a.dry_run), notes=report), ensure_ascii=False, indent=1))
 
 
 def cmd_deal(a):
@@ -1290,7 +1317,10 @@ def main():
     s.add_argument("notes", nargs="*")
     s.add_argument("--pages", type=int, default=5)
     s.add_argument("--limit", type=int, default=30)
-    s.add_argument("--dry-run", action="store_true", help="print the block instead of writing it")
+    s.add_argument("--dry-run", action="store_true", help="print the block instead of writing it; records no run")
+    s.add_argument("--no-write", action="store_true", help="record the run but leave the notes alone (for a timer)")
+    s.add_argument("--json", action="store_true", help="print new ads, price cuts, gone ads and the shortlist per "
+                                                       "note as JSON (for scripts); notes are written as usual")
     s.set_defaults(fn=cmd_sweep)
 
     for name, fn, hlp in (("deal", cmd_deal, "AI: is this ad worth buying? verdict, comparables, offer, questions"),

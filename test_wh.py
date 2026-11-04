@@ -976,11 +976,49 @@ class NoteProfileTests(TmpDbCase):
         with mock.patch.object(wh, "NOTES", notes), mock.patch.object(wh, "db", return_value=c), \
              mock.patch.object(wh, "fetch", side_effect=lambda u, binary=False: urls.append(u) or (u, empty)), \
              mock.patch.object(wh, "log"), mock.patch("sys.stdout", out):
-            wh.cmd_sweep(mock.Mock(notes=[], pages=1, limit=5, dry_run=True, json=False))
+            wh.cmd_sweep(mock.Mock(notes=[], pages=1, limit=5, dry_run=True, no_write=False, json=False))
         self.assertIn("Typo: skipped: unknown area 'graz'", out.getvalue())
         self.assertIn("## Sweep", out.getvalue())
         self.assertEqual(len(urls), 1)
         self.assertIn("/marktplatz?keyword=rtx+3060%2F3070", urls[0])
+
+    def test_sweep_json_lists_new_ads_and_cuts_and_no_write_leaves_the_note(self):
+        notes = os.path.join(self.tmp.name, "notes")
+        os.makedirs(notes)
+        path = os.path.join(notes, "Goggles.md")
+        original = "---\ntype: buy\nstatus: open\nfor: me\nsearch: goggles\n---\n# Goggles\n"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(original)
+        c = wh.db()
+        self.addCleanup(c.close)
+
+        def sweep(ads, at, **kw):
+            out = io.StringIO()
+            ns = mock.Mock(notes=[], pages=1, limit=5, **dict(dict(dry_run=False, no_write=True, json=True), **kw))
+            with mock.patch.object(wh, "NOTES", notes), mock.patch.object(wh, "db", return_value=c), \
+                 mock.patch.object(wh, "fetch", return_value=("u", search_page(len(ads), ads))), \
+                 mock.patch.object(wh, "now", return_value=at), \
+                 mock.patch.object(wh, "log"), mock.patch("sys.stdout", out):
+                wh.cmd_sweep(ns)
+            return out.getvalue()
+
+        sweep([make_summary(1, "DJI Goggles V2", 180)], "2026-11-01T10:00:00Z")
+        out = sweep([make_summary(1, "DJI Goggles V2", 150), make_summary(2, "DJI Goggles 2", 300)],
+                    "2026-11-02T10:00:00Z")
+        r = json.loads(out)
+        note = r["notes"][0]
+        self.assertEqual((note["note"], note["ads"]), ("Goggles", 2))
+        self.assertEqual([(x["id"], x["price"]) for x in note["new"]], [(2, 300)])
+        self.assertEqual([(x["id"], x["price"], x["was"]) for x in note["cuts"]], [(1, 150, 180)])
+        self.assertEqual(note["gone"], [])
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), original)                        # --no-write
+        self.assertEqual(c.execute("select count(*) from runs").fetchone()[0], 2)
+        out = sweep([make_summary(1, "DJI Goggles V2", 150), make_summary(2, "DJI Goggles 2", 300)],
+                    "2026-11-03T10:00:00Z", no_write=False, json=False)
+        self.assertIn("Goggles: 2 ads", out)
+        with open(path, encoding="utf-8") as f:
+            self.assertIn("<!-- wh:sweep -->", f.read())
 
     def test_sweep_warns_about_notes_without_for(self):
         notes = os.path.join(self.tmp.name, "notes")
@@ -989,7 +1027,7 @@ class NoteProfileTests(TmpDbCase):
             with open(os.path.join(notes, name + ".md"), "w", encoding="utf-8") as f:
                 f.write("---\ntype: buy\nstatus: open\n%ssearch: x\n---\n# %s\n" % (extra, name))
         empty = next_page({"searchResult": {"rowsFound": 0, "advertSummaryList": {"advertSummary": []}}})
-        ns = mock.Mock(notes=[], pages=1, limit=5, dry_run=True)
+        ns = mock.Mock(notes=[], pages=1, limit=5, dry_run=True, no_write=False, json=False)
         c = wh.db()
         self.addCleanup(c.close)
         with mock.patch.object(wh, "NOTES", notes), mock.patch.object(wh, "fetch", return_value=("u", empty)), \
