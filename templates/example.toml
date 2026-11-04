@@ -1,0 +1,40 @@
+# Example template: copy it to ~/.config/wh/templates/<name>.toml. The file name is the profile name, used as
+# `wh-profile: <name>` in a note or `--profile <name>`. Your own templates stay there, out of this repo.
+#
+# How a template works (all patterns are Python regexes, case-insensitive, on lowercased text; 'single quotes'
+# keep backslashes as they are). "title" is the ad's title, "text" is title + description + full ad if fetched.
+#   [[junk]]    the ad is junk when every pattern it gives (title, text) matches, unless `unless` matches the text
+#   [[require]] the ad is junk when its patterns do NOT all match
+#   [[field]]   a column: the first value whose `match` hits is shown (`value`, may use \1; default the match);
+#               its `score` adds to the ad's score, `new` (a new price in €) adds a "new €X (−Y %)" column
+#   [shortlist] `min_score` drops lower-scored ads; `sort` keys: score, below_new, price, published (- = highest
+#               first; default ["-score", "-below_new", "price"])
+#   category    willhaben category the ads belong in; the sweep warns when a search mostly lands outside it
+# Test changes with: wh search --url '<search URL>' --profile <name> --all --json   (shows junk + score)
+# and `wh profiles`, which lists broken templates with the reason.
+
+about = "Example: a used espresso machine"
+
+[[junk]]
+reason = "wanted ad"
+title = '^\s*(?:suche|gesucht|ankauf)\b'
+
+[[junk]]
+reason = "part or accessory"
+title = '\b(?:tamper|siebträger|ersatzteil\w*|dichtung)\b'
+unless = 'komplett|inklusive maschine'
+
+[[require]]
+reason = "not a machine"
+text = 'espresso|siebträger'
+
+[[field]]
+name = "brand"
+values = [
+  { match = 'rancilio', value = "Rancilio", score = 3, new = 800 },
+  { match = 'gaggia', value = "Gaggia", score = 2, new = 500 },
+]
+
+[shortlist]
+min_score = 1
+sort = ["-score", "-below_new", "price"]
