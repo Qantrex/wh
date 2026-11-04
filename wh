@@ -490,7 +490,7 @@ def price_history(c, i):
 
 # ---- notes ----------------------------------------------------------------------------------------------------
 
-FM = re.compile(r"\A---\r?\n(.*?)\r?\n---\r?\n", re.S)
+FM = re.compile(r"\A---[ \t]*\r?\n(.*?)^---[ \t]*(?:\r?\n|\Z)", re.S | re.M)   # also empty, or at the end
 
 
 def clean_val(v):
@@ -524,12 +524,12 @@ def set_prop(text, key, value):
     m = FM.match(text)
     if not m:
         return "---\n%s: %s\n---\n" % (key, value) + text
-    fm = m.group(1)
+    fm = m.group(1).rstrip("\r\n")
     repl = "%s: %s" % (key, value)
     if re.search(r"^%s:.*$" % re.escape(key), fm, re.M):
         fm = re.sub(r"^%s:.*$" % re.escape(key), lambda _: repl, fm, count=1, flags=re.M)
     else:
-        fm += "\n" + repl
+        fm += ("\n" if fm else "") + repl
     return "---\n" + fm + "\n---\n" + text[m.end():]
 
 
@@ -537,8 +537,10 @@ def put_block(text, name, content):
     """Replace (or append) the generated block <!-- wh:name --> … <!-- /wh:name --> in a note."""
     start, end = "<!-- wh:%s -->" % name, "<!-- /wh:%s -->" % name
     block = "%s\n%s\n%s" % (start, content.strip(), end)
-    if start in text and end in text and text.index(start) < text.index(end):
-        return text[:text.index(start)] + block + text[text.index(end) + len(end):]
+    i = text.find(start)
+    j = text.find(end, i) if i >= 0 else -1                  # the end marker after the start, not a stray one before
+    if j >= 0:
+        return text[:i] + block + text[j + len(end):]
     return text.rstrip() + "\n\n" + block + "\n"
 
 
