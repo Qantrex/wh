@@ -324,6 +324,22 @@ class WhTests(TmpDbCase):
              mock.patch.object(wh, "log"):
             self.assertIsNone(wh.read_page("https://x?rows=200&page=1"))
 
+    def test_status_reports_a_bad_ad_property_and_checks_the_other_notes(self):
+        notes = os.path.join(self.tmp.name, "notes")
+        os.makedirs(notes)
+        for name, ad in (("Bad", "see chat"), ("Good", "1234567")):
+            with open(os.path.join(notes, name + ".md"), "w", encoding="utf-8") as f:
+                f.write("---\ntype: sell\nstatus: live\nad: %s\n---\n" % ad)
+        c = wh.db()
+        self.addCleanup(c.close)
+        out = io.StringIO()
+        with mock.patch.object(wh, "db", return_value=c), mock.patch.object(wh, "NOTES", notes), \
+             mock.patch.object(wh, "fetch", return_value=("u", make_detail_html(1234567, "Item", 40))), \
+             mock.patch("sys.stdout", out):
+            wh.cmd_status(mock.Mock(notes=[], dry_run=True))
+        self.assertIn("no willhaben ad id in 'see chat'", out.getvalue())
+        self.assertRegex(out.getvalue(), r"Good\s+active\s+€40")
+
     def test_sweep_note_multi_search_dedupes_and_preserves_was_price(self):
         c = wh.db()
         self.addCleanup(c.close)

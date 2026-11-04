@@ -198,8 +198,19 @@ def ad_id(s):
     s = str(s)
     m = re.search(r"adId=(\d+)", s) or re.search(r"-(\d{6,})/?(?:[?#]|$)", s) or re.fullmatch(r"\s*(\d{6,})\s*", s)
     if not m:
-        sys.exit("wh: no willhaben ad id in %r" % s)
+        raise WhError("no willhaben ad id in %r" % s)
     return int(m.group(1))
+
+
+def note_ads(todo):
+    """The `ad:` id of every (path, text, props) note, or the WhError that says why it has none."""
+    out = []
+    for _, _, p in todo:
+        try:
+            out.append(ad_id(p["ad"]))
+        except WhError as e:
+            out.append(e)
+    return out
 
 
 def search_url(words=None, url=None, pmin=None, pmax=None, rows=200):
@@ -834,10 +845,11 @@ def cmd_photos(a):
 def cmd_status(a):
     c = db()
     todo = [(f, text, p) for f, text, p in find_notes(a.notes, statuses=OPEN) if p.get("ad")]
-    got = details_many(c, [ad_id(p["ad"]) for _, _, p in todo], refresh=True)
-    for f, text, p in todo:
-        d = got[ad_id(p["ad"])]
-        if isinstance(d, FetchError):
+    ids = note_ads(todo)
+    got = details_many(c, [i for i in ids if isinstance(i, int)], refresh=True)
+    for (f, text, p), i in zip(todo, ids):
+        d = got.get(i, i)
+        if isinstance(d, WhError):
             print("%-32s couldn't check: %s" % (name_of(f), d))
             continue
         line = "%-32s %s" % (name_of(f), d["status"])
@@ -1045,11 +1057,12 @@ def cmd_advise(a):
     todo = [(f, t, p) for f, t, p in find_notes(a.notes, types={"sell"}, statuses=OPEN | {"draft"}) if p.get("ad")]
     if not todo:
         sys.exit("wh: no live sell note with an `ad:` property")
-    got = details_many(c, [ad_id(p["ad"]) for _, _, p in todo], refresh=True)
+    ids = note_ads(todo)
+    got = details_many(c, [i for i in ids if isinstance(i, int)], refresh=True)
     live = []
-    for f, text, p in todo:
-        d = got[ad_id(p["ad"])]
-        if isinstance(d, FetchError):
+    for (f, text, p), i in zip(todo, ids):
+        d = got.get(i, i)
+        if isinstance(d, WhError):
             print("## %s\n\nwh: %s\n" % (name_of(f), d))
         elif d["status"] == "offline":
             print("## %s\n\nThe ad is offline (usually just expired): renew or relist it.\n" % name_of(f))
