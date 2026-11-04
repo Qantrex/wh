@@ -348,6 +348,15 @@ class WhTests(TmpDbCase):
         self.assertIn("1 new · 1 price cuts · 1 gone", block)
         self.assertIn("| €620 | €700 |", block)                # Was column shows €700, NOT clobbered €620!
 
+    def test_last_prices_reads_only_the_asked_ads_up_to_a_time(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        c.executemany("insert into prices values (?,?,?)", [
+            (1, 100, "2026-10-01T10:00:00Z"), (1, 90, "2026-10-02T10:00:00Z"), (1, 80, "2026-10-03T10:00:00Z"),
+            (2, 50, "2026-10-01T10:00:00Z"), (3, 70, "2026-10-01T10:00:00Z")])
+        self.assertEqual(wh.last_prices(c, {1, 2}, "2026-10-02T10:00:00Z"), {1: 90, 2: 50})
+        self.assertEqual(wh.last_prices(c, set(range(1, 1200)), "2026-10-01T10:00:00Z"), {1: 100, 2: 50, 3: 70})
+
     def test_sweep_note_detail_enrichment_filters_offline_and_updates_specs(self):
         c = wh.db()
         self.addCleanup(c.close)
