@@ -1,1 +1,8 @@
 __pycache__/
+# Personal data stays out of this repo: see "Private data" in the README.
+config.toml
+*.db
+*.csv
+seed/
+templates/*
+!templates/example.toml

@@ -2,10 +2,9 @@
 
 annotate(ads, name) sets `junk` on every ad (a reason, or None) and adds the profile's own fields.
 shortlist(ads, name, n) picks the ads worth a closer look. FIELDS[name] are the extra columns to show.
-The laptop tables come from the 2026-10-25 laptop hunt (seed/analyze.py, seed/rank.py).
 
 Two kinds: built-in profiles (Python, below) for items that need real parsing, and templates (TOML files in
-templates/ or a WH_TEMPLATES directory) for everything else: junk rules, columns, scores and new prices as data.
+~/.config/wh/templates, templates/ or a WH_TEMPLATES directory) for everything else: junk rules, columns, scores and new prices as data.
 """
 import glob
 import os
@@ -834,7 +833,8 @@ BUILTIN = frozenset(PROFILES)
 
 # ---- templates: profiles as data -----------------------------------------------------------------------------
 
-TEMPLATE_DIRS = ([os.path.join(os.path.dirname(os.path.realpath(__file__)), "templates")]
+TEMPLATE_DIRS = ([os.path.join(os.path.dirname(os.path.realpath(__file__)), "templates"),
+                  os.path.join(os.path.expanduser(os.environ.get("WH_CONFIG", "~/.config/wh")), "templates")]
                  + [os.path.expanduser(d) for d in os.environ.get("WH_TEMPLATES", "").split(os.pathsep) if d])
 TEMPLATES = {}                                                # name -> parsed template
 TEMPLATE_ERRORS = {}                                          # path -> what's wrong (the template is skipped)

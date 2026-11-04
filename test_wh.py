@@ -10,6 +10,7 @@ from unittest import mock
 
 import profiles
 
+os.environ["WH_CONFIG"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "no-such-config")  # tests never read personal settings
 loader = importlib.machinery.SourceFileLoader("wh_mod", os.path.join(os.path.dirname(__file__), "wh"))
 spec = importlib.util.spec_from_loader("wh_mod", loader)
 wh = importlib.util.module_from_spec(spec)
@@ -30,7 +31,7 @@ def make_summary(ad_id, heading, price, body="", seo="", cats="5824;5831", priva
             {"name": "PRICE", "values": [str(price)] if price is not None else []},
             {"name": "LOCATION", "values": [loc]},
             {"name": "STATE", "values": [state]},
-            {"name": "POSTCODE", "values": ["1230"]},
+            {"name": "POSTCODE", "values": ["1010"]},
             {"name": "ISPRIVATE", "values": [private]},
             {"name": "PUBLISHED_String", "values": ["2026-10-20T10:00:00Z"]},
             {"name": "SEO_URL", "values": [seo or ("kaufen-und-verkaufen/d/ad-%d/" % ad_id)]},
@@ -69,8 +70,8 @@ def make_detail_html(ad_id, title, price, descr="", status="active", images=None
         "firstPublishedDate": "2026-10-15T12:00:00Z",
         "changedDate": "2026-10-20T12:00:00Z",
         "endDate": "2026-11-15T12:00:00Z",
-        "sellerProfileUserData": {"private": True, "name": "Anna", "registerDate": "2021-05-01", "activeAdCount": 3},
-        "advertAddressDetails": {"postCode": "1230", "postalName": "Wien"},
+        "sellerProfileUserData": {"private": True, "name": "Seller", "registerDate": "2021-05-01", "activeAdCount": 3},
+        "advertAddressDetails": {"postCode": "1010", "postalName": "Wien"},
         "attributes": {"attribute": attrs},
         "attributeInformation": attr_info,
         "advertImageList": {"advertImage": [{"referenceImageUrl": u} for u in (images or [])]},
@@ -790,29 +791,23 @@ min_score = 1
                dict(id=3, title="c", price=1, published="2026-10-30", junk=None)]
         self.assertEqual([a["id"] for a in profiles.template_shortlist(tpl, ads, 10)], [3, 2, 1])
 
-    def test_shipped_sport_gloves_template(self):
+    def test_shipped_example_template(self):
         profiles.load_templates()
-        self.assertIn("sport-gloves", profiles.TEMPLATES, profiles.TEMPLATE_ERRORS)
+        self.assertIn("example", profiles.TEMPLATES, profiles.TEMPLATE_ERRORS)
         ads = profiles.annotate([
-            self.ad("Alpinestars GP Pro R3 Handschuhe Gr. L", 90, "Känguruleder, sturzfrei"),
-            self.ad("Alpinestars SMX-2 Air Carbon kurz", 40),
-            self.ad("Damen Motorradhandschuhe Dainese", 50, "racing"),
-            self.ad("Held Phantom 9L", 57, "keine Löcher, Nähte und Protektoren intakt"),
-            self.ad("Alpinestars GP Pro R3 schwarz", 49, "Ein Finger und Handballen haben Reparaturstellen"),
-            self.ad("Vanucci Handschuhe", 30, "Leder mit Titan Knöchelschutz, sportlich"),
-            self.ad("Alpinestars KTM GP plus R2", 50, "neuwertig"),
-        ], "sport-gloves")
+            self.ad("Rancilio Silvia Espressomaschine", 300),
+            self.ad("Suche Gaggia Espressomaschine", 100),
+            self.ad("Tamper für Siebträger", 20),
+            self.ad("Gaggia Classic", 150, "Espresso"),
+            self.ad("Toaster", 10),
+        ], "example")
         by = {a["title"]: a for a in ads}
-        r3 = by["Alpinestars GP Pro R3 Handschuhe Gr. L"]
-        self.assertEqual((r3["junk"], r3["model"], r3["palm"], r3["crash"]), (None, "GP Pro R3", "kangaroo", "crash-free"))
-        self.assertTrue(by["Alpinestars SMX-2 Air Carbon kurz"]["junk"])
-        self.assertTrue(by["Damen Motorradhandschuhe Dainese"]["junk"])
-        self.assertIsNone(by["Held Phantom 9L"]["junk"])                     # "keine Löcher" is not damage
-        self.assertEqual(by["Alpinestars GP Pro R3 schwarz"]["junk"], "damage or a crash mentioned")
-        self.assertIsNone(by["Vanucci Handschuhe"]["model"])                 # "Titan" alone isn't a Held Titan
-        self.assertEqual((by["Alpinestars KTM GP plus R2"]["model"], by["Alpinestars KTM GP plus R2"]["vs_new"]),
-                         ("GP Plus R2", None))                               # not the R v2 and its new price
-
+        self.assertEqual((by["Rancilio Silvia Espressomaschine"]["junk"], by["Rancilio Silvia Espressomaschine"]["brand"]),
+                         (None, "Rancilio"))
+        self.assertEqual(by["Suche Gaggia Espressomaschine"]["junk"], "wanted ad")
+        self.assertEqual(by["Tamper für Siebträger"]["junk"], "part or accessory")
+        self.assertIsNone(by["Gaggia Classic"]["junk"])
+        self.assertEqual(by["Toaster"]["junk"], "not a machine")
 
 class NoteProfileTests(TmpDbCase):
     def test_unknown_wh_profile_warns_and_sweeps_without_one(self):
@@ -826,11 +821,11 @@ class NoteProfileTests(TmpDbCase):
             self.assertIsNone(wh.note_for({}, "/x/Laptop.md"))
             self.assertIn("Laptop has no `for:`", log.call_args[0][0])
             log.reset_mock()
-            self.assertEqual(wh.note_for({"for": "girlfriend"}, "/x/Laptop.md"), "girlfriend")
+            self.assertEqual(wh.note_for({"for": "a friend"}, "/x/Laptop.md"), "a friend")
             self.assertEqual(wh.note_for({"for": ["me", "homelab"]}, "/x/Mixed.md"), "me, homelab")
             log.assert_not_called()
-        block = wh.who_block("girlfriend")
-        self.assertTrue(block.startswith("## Who it's for\n\ngirlfriend. Judge only by"))
+        block = wh.who_block("a friend")
+        self.assertTrue(block.startswith("## Who it's for\n\na friend. Judge only by"))
         self.assertIn("unless it says it's for me", block)
         self.assertIn("Don't assume it's for me", wh.who_block(None))
 
