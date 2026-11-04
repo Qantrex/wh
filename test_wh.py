@@ -258,6 +258,28 @@ class WhTests(TmpDbCase):
         self.assertEqual(wh.day("2026-10-19T23:30:00"), "2026-10-19")       # no zone: as written
         self.assertEqual((wh.day(None), wh.day("garbage")), ("", "garbage"))
 
+    def test_history_shows_prices_over_time_without_a_request(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        for at, price in (("2026-10-01T10:00:00Z", 200), ("2026-10-08T10:00:00Z", 200), ("2026-10-15T10:00:00Z", 170)):
+            wh.store(c, [wh.summary(make_summary(5555555, "Fahrrad Cube", price))], at)
+        c.commit()
+        out = io.StringIO()
+        with mock.patch.object(wh, "db", return_value=c), mock.patch.object(wh, "fetch") as fetch, \
+             mock.patch("sys.stdout", out):
+            wh.cmd_history(mock.Mock(ad="https://www.willhaben.at/iad/kaufen-und-verkaufen/d/fahrrad-5555555/", json=False))
+            wh.cmd_history(mock.Mock(ad="5555555", json=True))
+        fetch.assert_not_called()
+        text, js = out.getvalue().split("\n{", 1)
+        self.assertIn("**Fahrrad Cube**", text)
+        self.assertIn("Seen by wh 2026-10-01 to 2026-10-15", text)
+        self.assertIn("2026-10-15  €170  −€30 (-15 %)", text)
+        r = json.loads("{" + js)
+        self.assertEqual(r["prices"], [{"day": "2026-10-01", "price": 200}, {"day": "2026-10-15", "price": 170}])
+        with mock.patch.object(wh, "db", return_value=c):
+            with self.assertRaisesRegex(wh.WhError, "not in the database"):
+                wh.cmd_history(mock.Mock(ad="1234567", json=False))
+
     def test_comp_words_keeps_digits_and_strips_seller_noise(self):
         self.assertEqual(wh.comp_words("Preis Fix! Apple MacBook Air 15 M4 16GB"), "apple macbook air 15")
         self.assertEqual(wh.comp_words("(reserviert) Apple Mac mini M4 16GB"), "apple mac mini m4")

@@ -15,6 +15,7 @@ Setup: the Install section of the `wh` README (github.com/Qantrex/wh). Notes fol
 | `wh facets <words> [--url …] [--min N] [--max N]` | willhaben's own breakdown of a search: subcategories with ready URLs, condition, region, brand … with counts. Use it to write a note's `search:` lines |
 | `wh profiles` | the built-in profiles and templates a note's `wh-profile` can name, plus broken templates with the reason |
 | `wh ad <id or link>` | the full ad: description, seller (member since, active ads), price cut, price history |
+| `wh history <id or link> [--json]` | the prices wh has seen for an ad over time, from the database only (no request) |
 | `wh photos <id> <dir>` | downloads the photos, converting WebP to JPEG |
 | `wh status [notes]` | is each open note's `ad:` still online, at what price? |
 | `wh sweep [notes] [--json] [--no-write]` | runs the `search:` URLs of open buy/wanted notes and writes new ads, price cuts, gone ads and a shortlist into the note's `<!-- wh:sweep -->` block; `--json` prints the same for scripts, `--no-write` leaves the notes alone |
