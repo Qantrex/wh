@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """wh: willhaben.at from the terminal. Fast public data with a local cache; Claude does the judging.
 
-Data commands (no AI):  search, facets, ad, photos, status, sweep, profiles
+Data commands (no AI):  search, facets, ad, history, photos, status, sweep, profiles, doctor
 AI commands:            deal, advise, hunt   (gather the data, then ask `claude -p` with the willhaben skill's rules;
                                               --no-ai prints the gathered data instead, for use inside a Claude session)
 
@@ -15,6 +15,7 @@ import http.client
 import json
 import os
 import re
+import shutil
 import sqlite3
 import statistics
 import subprocess
@@ -26,6 +27,7 @@ import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
 
@@ -33,13 +35,21 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import profiles  # noqa: E402
 
 BASE = "https://www.willhaben.at"
+try:
+    from zoneinfo import ZoneInfo
+    TZ = ZoneInfo("Europe/Vienna")                         # willhaben's dates are Austrian days
+except Exception:                                          # no tz database (some Windows Pythons)
+    TZ = timezone.utc
 SEARCH = BASE + "/iad/kaufen-und-verkaufen/marktplatz"
 UA = "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0"
 
 
-def load_config():
+CONFIG_PATH = os.path.join(os.path.expanduser(os.environ.get("WH_CONFIG", "~/.config/wh")), "config.toml")
+CONFIG_KEYS = {"notes", "skill", "location"}
+
+
+def load_config(path=CONFIG_PATH):
     """Personal settings from ~/.config/wh/config.toml. They stay on this machine, never in this repo."""
-    path = os.path.join(os.path.expanduser(os.environ.get("WH_CONFIG", "~/.config/wh")), "config.toml")
     try:
         with open(path, "rb") as f:
             return tomllib.load(f)
@@ -132,7 +142,7 @@ def fetch(url, binary=False):
             if e.code in (403, 429, 503):
                 slow_down("HTTP %d" % e.code)
             err = e
-        except (http.client.HTTPException, OSError) as e:
+        except (http.client.HTTPException, OSError, EOFError, zlib.error) as e:   # EOFError: a cut-off gzip body
             err = e
         if attempt < 2:
             log("  retry %d: %s" % (attempt + 1, err))
@@ -156,11 +166,16 @@ def pmap(fn, items):
 
 
 def page_props(h):
+    """The page's __NEXT_DATA__ pageProps, {} when it has none. Broken JSON raises FetchError instead of a traceback."""
     i = h.find('<script id="__NEXT_DATA__"')
     j = h.find("</script>", i) if i >= 0 else -1
     if j < 0:
         return {}
-    return json.loads(h[h.index(">", i) + 1:j])["props"]["pageProps"]
+    try:
+        props = json.loads(h[h.index(">", i) + 1:j])["props"]["pageProps"]
+    except (ValueError, KeyError, TypeError) as e:
+        raise FetchError("can't read willhaben's page data (%s: %s); did the site change?" % (type(e).__name__, e))
+    return props if isinstance(props, dict) else {}
 
 
 def attrs(obj):
@@ -181,20 +196,39 @@ def num(s):
 
 
 def day(v):
-    """YYYY-MM-DD from an ISO date or a Unix timestamp (seconds or milliseconds)."""
-    v = str(v or "")
+    """YYYY-MM-DD in Austria from an ISO date or time or a Unix timestamp (seconds or milliseconds). A time in UTC
+    just before midnight is already the next day in Vienna."""
+    v = str(v or "").strip()
     if v.isdigit():
         n = int(v)
-        return datetime.fromtimestamp(n / 1000 if n > 1e11 else n, timezone.utc).date().isoformat()
-    return v[:10]
+        dt = datetime.fromtimestamp(n / 1000 if n > 1e11 else n, timezone.utc)
+    else:
+        try:
+            dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+        except ValueError:
+            return v[:10]
+        if dt.tzinfo is None:
+            return dt.date().isoformat()
+    return dt.astimezone(TZ).date().isoformat()
 
 
 def ad_id(s):
     s = str(s)
     m = re.search(r"adId=(\d+)", s) or re.search(r"-(\d{6,})/?(?:[?#]|$)", s) or re.fullmatch(r"\s*(\d{6,})\s*", s)
     if not m:
-        sys.exit("wh: no willhaben ad id in %r" % s)
+        raise WhError("no willhaben ad id in %r" % s)
     return int(m.group(1))
+
+
+def note_ads(todo):
+    """The `ad:` id of every (path, text, props) note, or the WhError that says why it has none."""
+    out = []
+    for _, _, p in todo:
+        try:
+            out.append(ad_id(p["ad"]))
+        except WhError as e:
+            out.append(e)
+    return out
 
 
 def search_url(words=None, url=None, pmin=None, pmax=None, rows=200):
@@ -373,6 +407,8 @@ def run_search(c, url, pages=5, key=None, record=True):
 def fetch_detail(i, prev):
     """The full ad page as a dict, without touching the database. A gone ad keeps what was known, as 'offline'."""
     final, h = fetch("%s/iad/object?adId=%d" % (BASE, i))
+    if h and '<script id="__NEXT_DATA__"' not in h:            # an error or changed page, not a gone ad
+        raise FetchError("no ad data on the page for ad %d (willhaben down, or its HTML changed?)" % i)
     ad = page_props(h).get("advertDetails") if h else None
     if not ad:
         d = dict(prev, id=i, status="offline", url=prev.get("url") or "%s/iad/object?adId=%d" % (BASE, i))
@@ -393,8 +429,8 @@ def fetch_detail(i, prev):
                  loc=" ".join(x for x in (addr.get("postCode"), addr.get("postalName"), addr.get("province")) if x),
                  private=bool(seller.get("private", g("ISPRIVATE") == "1")), seller=seller.get("name"),
                  seller_since=(seller.get("registerDate") or "")[:7], seller_ads=seller.get("activeAdCount"),
-                 first_published=(ad.get("firstPublishedDate") or "")[:10], changed=(ad.get("changedDate") or "")[:10],
-                 ends=(ad.get("endDate") or "")[:10], info=info, descr=clean(g("DESCRIPTION")),
+                 first_published=day(ad.get("firstPublishedDate")), changed=day(ad.get("changedDate")),
+                 ends=day(ad.get("endDate")), info=info, descr=clean(g("DESCRIPTION")),
                  images=[u for u in (x.get("referenceImageUrl") or x.get("mainImageUrl") for x in imgs) if u],
                  url=final if "/d/" in final else "%s/iad/object?adId=%d" % (BASE, i))
     return d
@@ -455,13 +491,24 @@ def attach_details(c, ads):
     return ads
 
 
+def last_prices(c, ids, at):
+    """{id: the last price recorded at or before `at`} for these ads (only their rows, not the whole table)."""
+    out, ids = {}, sorted(ids)
+    for k in range(0, len(ids), 500):
+        chunk = ids[k:k + 500]
+        for r in c.execute("select id, price from prices where id in (%s) and seen <= ? order by id, seen, rowid"
+                           % ",".join("?" * len(chunk)), chunk + [at]):
+            out[r["id"]] = r["price"]
+    return out
+
+
 def price_history(c, i):
     return [(r["seen"][:10], r["price"]) for r in c.execute("select price, seen from prices where id=? order by seen", (i,))]
 
 
 # ---- notes ----------------------------------------------------------------------------------------------------
 
-FM = re.compile(r"\A---\r?\n(.*?)\r?\n---\r?\n", re.S)
+FM = re.compile(r"\A---[ \t]*\r?\n(.*?)^---[ \t]*(?:\r?\n|\Z)", re.S | re.M)   # also empty, or at the end
 
 
 def clean_val(v):
@@ -495,12 +542,12 @@ def set_prop(text, key, value):
     m = FM.match(text)
     if not m:
         return "---\n%s: %s\n---\n" % (key, value) + text
-    fm = m.group(1)
+    fm = m.group(1).rstrip("\r\n")
     repl = "%s: %s" % (key, value)
     if re.search(r"^%s:.*$" % re.escape(key), fm, re.M):
         fm = re.sub(r"^%s:.*$" % re.escape(key), lambda _: repl, fm, count=1, flags=re.M)
     else:
-        fm += "\n" + repl
+        fm += ("\n" if fm else "") + repl
     return "---\n" + fm + "\n---\n" + text[m.end():]
 
 
@@ -508,8 +555,10 @@ def put_block(text, name, content):
     """Replace (or append) the generated block <!-- wh:name --> … <!-- /wh:name --> in a note."""
     start, end = "<!-- wh:%s -->" % name, "<!-- /wh:%s -->" % name
     block = "%s\n%s\n%s" % (start, content.strip(), end)
-    if start in text and end in text and text.index(start) < text.index(end):
-        return text[:text.index(start)] + block + text[text.index(end) + len(end):]
+    i = text.find(start)
+    j = text.find(end, i) if i >= 0 else -1                  # the end marker after the start, not a stray one before
+    if j >= 0:
+        return text[:i] + block + text[j + len(end):]
     return text.rstrip() + "\n\n" + block + "\n"
 
 
@@ -517,24 +566,34 @@ def strip_blocks(text):
     return re.sub(r"<!-- wh:(\w+) -->.*?<!-- /wh:\1 -->\n?", "", text, flags=re.S)
 
 
+def md_files(root):
+    """The notes under a folder, skipping hidden folders: Obsidian's .trash holds deleted notes, .obsidian settings."""
+    for d, dirs, fs in os.walk(root):
+        dirs[:] = [x for x in dirs if not x.startswith(".")]
+        yield from (os.path.join(d, f) for f in fs if f.endswith(".md") and not f.startswith("."))
+
+
 def find_notes(args, types=None, statuses=None):
     files = []
     for p in args or [NOTES]:
         p = os.path.expanduser(p)
         if os.path.isdir(p):
-            files += [os.path.join(d, f) for d, _, fs in os.walk(p) for f in fs if f.endswith(".md")]
+            files += md_files(p)
         elif os.path.isfile(p):
             files.append(p)
         else:                                               # a note name, found under NOTES
             want = p.lower().removesuffix(".md")
-            hits = [os.path.join(d, f) for d, _, fs in os.walk(NOTES) for f in fs
-                    if f.endswith(".md") and f[:-3].lower() == want]
+            hits = [f for f in md_files(NOTES) if os.path.basename(f)[:-3].lower() == want]
             if not hits:
                 sys.exit("wh: no note %r under %s" % (p, NOTES))
             files += hits
     out = []
     for f in sorted(set(files)):
-        text, props = read_note(f)
+        try:
+            text, props = read_note(f)
+        except (OSError, UnicodeDecodeError) as e:
+            log("wh: skipped %s: %s" % (f, e))
+            continue
         if (types and props.get("type") not in types) or (statuses and props.get("status") not in statuses):
             continue
         out.append((f, text, props))
@@ -543,7 +602,8 @@ def find_notes(args, types=None, statuses=None):
 
 def write_note(path, text):
     text = set_prop(text, "updated", date.today().isoformat())
-    d = os.path.dirname(os.path.abspath(path))
+    path = os.path.realpath(path)                           # a symlinked note stays a link, its target gets the text
+    d = os.path.dirname(path)
     mode = os.stat(path).st_mode if os.path.exists(path) else None
     fd, tmp = tempfile.mkstemp(dir=d, prefix=".wh-", suffix=".tmp")
     try:
@@ -556,6 +616,14 @@ def write_note(path, text):
         if os.path.exists(tmp):
             os.remove(tmp)
         raise
+
+
+def update_note(path, change):
+    """Write change(text) into a note, reading the note again first: an edit made in the editor while wh was
+    fetching or Claude was thinking stays, since wh only touches its own properties and blocks."""
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    write_note(path, change(text))
 
 
 def name_of(path):
@@ -653,28 +721,55 @@ def system_prompt():
             % (", who lives in %s" % where if where else ""))
 
 
-def skill_rules(*headings):
+# Which rules each AI command sends. The skill is split: SKILL.md (commands + ground rules) plus one file per task;
+# only SKILL.md's ground rules and the task's file go into the prompt. An old single-file SKILL.md still works: then
+# the matching sections are taken from it instead.
+RULES = {
+    "buy": ("buying.md", ("Ground rules", "Judging a deal (buying)")),
+    "sell": ("selling.md", ("Ground rules", "Selling", "Pricing advice for", "willhaben quirks")),
+}
+SHIPPED_SKILL = os.path.join(os.path.dirname(os.path.realpath(__file__)), "skill", "willhaben", "SKILL.md")
+
+
+def skill_path():
+    """SKILL.md as configured (a file or its folder); the copy next to wh when the configured one isn't there."""
+    path = os.path.join(SKILL, "SKILL.md") if os.path.isdir(SKILL) else SKILL
+    return path if os.path.isfile(path) or not os.path.isfile(SHIPPED_SKILL) else SHIPPED_SKILL
+
+
+def skill_section(text, heading):
+    """The `## heading…` (or ###) section of a Markdown text, heading line included; '' if there is none.
+    `heading` may be a prefix of the real heading."""
+    m = re.search(r"^(#{2,3}) %s[^\n]*\n(.*?)(?=^#{2,3} |\Z)" % re.escape(heading), text, re.M | re.S)
+    return "%s\n%s" % (m.group(0).split("\n", 1)[0], m.group(2).strip()) if m else ""
+
+
+def skill_rules(kind):
+    """The rules for one kind of AI command ("buy": deal, hunt; "sell": advise) as one text."""
+    path = skill_path()
     try:
-        with open(SKILL, encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             text = f.read()
     except OSError:
-        log("  note: %s not found, running without skill rules" % SKILL)
+        log("  note: %s not found, running without skill rules" % path)
         return ""
-    out = []
-    for h in headings:
-        m = re.search(r"^(#{2,3}) %s[^\n]*\n(.*?)(?=^#{2,3} |\Z)" % re.escape(h), text, re.M | re.S)
-        if m:
-            out.append("%s %s\n%s" % (m.group(1), h, m.group(2).strip()))
-    return "\n\n".join(out)
+    part, fallback = RULES[kind]
+    try:
+        with open(os.path.join(os.path.dirname(path), part), encoding="utf-8") as f:
+            extra = f.read()
+    except OSError:                                             # old single-file skill
+        return "\n\n".join(s for s in (skill_section(text, h) for h in fallback) if s)
+    extra = extra[extra.find("\n## ") + 1:] if "\n## " in extra else extra   # drop the file's title and intro
+    return "\n\n".join(s for s in (skill_section(text, "Ground rules"), extra.strip()) if s)
 
 
-def ask_claude(a, task, data, *rule_headings):
+def ask_claude(a, task, data, rules="buy"):
     prompt = "%s\n\n%s" % (task, data)
     if a.no_ai:
         print(prompt)
         return None
     cmd = ["claude", "-p", "--tools", "", "--strict-mcp-config", "--no-session-persistence", "--output-format", "text",
-           "--append-system-prompt", system_prompt() + skill_rules(*rule_headings)]
+           "--append-system-prompt", system_prompt() + skill_rules(rules)]
     if a.model or os.environ.get("WH_MODEL"):
         cmd += ["--model", a.model or os.environ["WH_MODEL"]]
     log("  asking Claude …")
@@ -756,6 +851,38 @@ def cmd_ad(a):
     print(fmt_details(details(c, ad_id(a.ad), refresh=a.refresh), c))
 
 
+def cmd_history(a):
+    """What wh has seen of one ad, from the database only (no request): prices over time, first and last seen."""
+    c = db()
+    i = ad_id(a.ad)
+    row = c.execute("select * from ads where id=?", (i,)).fetchone()
+    det = c.execute("select fetched, data from details where id=?", (i,)).fetchone()
+    if not row and not det:
+        raise WhError("ad %d is not in the database yet; `wh ad %d` fetches it" % (i, i))
+    d, row = (json.loads(det["data"]) if det else {}), dict(row or {})
+    hist = price_history(c, i)
+    out = dict(id=i, title=d.get("title") or row.get("title"), url=d.get("url") or row.get("url"),
+               first_seen=(row.get("first_seen") or "")[:10] or None, last_seen=(row.get("last_seen") or "")[:10] or None,
+               status=d.get("status"), checked=det["fetched"][:10] if det else None,
+               old_price=d.get("old_price"), price_cut_on=d.get("price_cut_on") or None,
+               prices=[dict(day=t, price=p) for t, p in hist])
+    if a.json:
+        print(json.dumps(out, ensure_ascii=False, indent=1))
+        return
+    print("**%s**\n%s" % (out["title"] or "?", out["url"] or ""))
+    seen = "Seen by wh %s to %s" % (out["first_seen"], out["last_seen"]) if out["first_seen"] else "Not seen in a search"
+    print(seen + (" · %s on %s" % (out["status"], out["checked"]) if out["status"] else ""))
+    if out["old_price"]:
+        print("willhaben says: cut from %s on %s" % (euro(out["old_price"]), out["price_cut_on"] or "?"))
+    prev = None
+    for t, p in hist:
+        change = ""
+        if prev and p is not None:
+            change = "  %s%s (%+d %%)" % ("−" if p < prev else "+", euro(abs(p - prev)), round(100 * (p - prev) / prev))
+        print("  %s  %s%s" % (t, euro(p), change))
+        prev = p if p else prev
+
+
 def cmd_photos(a):
     c = db()
     d = details(c, ad_id(a.ad), refresh=True)
@@ -789,10 +916,11 @@ def cmd_photos(a):
 def cmd_status(a):
     c = db()
     todo = [(f, text, p) for f, text, p in find_notes(a.notes, statuses=OPEN) if p.get("ad")]
-    got = details_many(c, [ad_id(p["ad"]) for _, _, p in todo], refresh=True)
-    for f, text, p in todo:
-        d = got[ad_id(p["ad"])]
-        if isinstance(d, FetchError):
+    ids = note_ads(todo)
+    got = details_many(c, [i for i in ids if isinstance(i, int)], refresh=True)
+    for (f, text, p), i in zip(todo, ids):
+        d = got.get(i, i)
+        if isinstance(d, WhError):
             print("%-32s couldn't check: %s" % (name_of(f), d))
             continue
         line = "%-32s %s" % (name_of(f), d["status"])
@@ -804,7 +932,7 @@ def cmd_status(a):
                 line += "  (note says %s)" % euro(num(p["price"]))
         print(line)
         if not a.dry_run:
-            write_note(f, set_prop(text, "checked", date.today().isoformat()))
+            update_note(f, lambda t: set_prop(t, "checked", date.today().isoformat()))
 
 
 def note_for(props, path):
@@ -842,7 +970,8 @@ def sweep_plan(c, path, props):
     searches = searches if isinstance(searches, list) else [searches]
     items = []
     for s in searches:
-        is_url = s.startswith("http") or "/" in s or re.fullmatch(r"[a-z0-9-]+-\d{3,}", s)
+        is_url = s.startswith("http") or (not re.search(r"\s", s)                # "rtx 3060/3070" is keywords
+                                          and ("/" in s or re.fullmatch(r"[a-z0-9-]+-\d{3,}", s)))
         url = search_url(url=s) if is_url else search_url(s)
         key = "note:%s:%s" % (name_of(path), url)
         last = c.execute("select run, at from runs where key=? order by run desc limit 1", (key,)).fetchone()
@@ -851,9 +980,8 @@ def sweep_plan(c, path, props):
                                            " where r.key=?", (key,))}
         items.append(dict(search=s, url=url, key=key, last=last, full=full, seen=seen))
     ats = [x["last"]["at"] for x in items if x["last"]]
-    prev_prices = ({r["id"]: r["price"] for r in c.execute(
-        "select id, price from prices where seen <= ? order by seen, rowid", (max(ats),))} if ats else {})
-    return dict(items=items, prev_prices=prev_prices, seen=set().union(*(x["seen"] for x in items)),
+    seen = set().union(*(x["seen"] for x in items))
+    return dict(items=items, prev_prices=last_prices(c, seen, max(ats)) if ats else {}, seen=seen,
                 profile=note_profile(props, path), near=area(props.get("wh-area")))
 
 
@@ -873,7 +1001,7 @@ def category_notes(plan, fetched):
 
 def sweep_report(c, plan, fetched, limit, detail_count=0):
     """The sweep block from this run's results (one run_searches() dict per search of the plan).
-    Returns (markdown block, shortlist, all good ads, market line)."""
+    Returns (markdown block, shortlist, all good ads, market line); the same facts for scripts go in plan["report"]."""
     profile = plan["profile"]
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     allads, new_ids, gone_ids, notes = {}, set(), set(), []
@@ -941,7 +1069,26 @@ def sweep_report(c, plan, fetched, limit, detail_count=0):
         out += ["", "### Gone since last sweep", "", "Usually just expired, not sold."]
         out += ["- [%s](%s), %s" % (link_text(g["title"], 70), g["url"], euro(g["price"])) for g in gone[:limit]]
     out += ["", "### Shortlist", "", table(short, profile, True) if short else "Nothing matches."]
+    plan["report"] = dict(
+        market=mk, ads=len(good), near=sum(1 for x in good if x["near"]) if plan["near"] else None,
+        warnings=notes, new=[ad_json(x, profile) for x in new[:limit]],
+        cuts=[ad_json(x, profile, was=prev_prices.get(x["id"])) for x in cuts[:limit]],
+        gone=[ad_json(g, profile) for g in gone[:limit]], shortlist=[ad_json(x, profile) for x in short])
     return "\n".join(out), short, good, mk
+
+
+def ad_json(a, profile=None, was=None):
+    """An ad in a few fields, for --json output."""
+    d = {k: a.get(k) for k in ("id", "title", "price", "loc", "url", "published")}
+    d["private"] = bool(a.get("private"))
+    if a.get("near") is not None:
+        d["near"] = a["near"]
+    if was is not None:
+        d["was"] = was
+    sp = specs(a, profile)
+    if sp:
+        d["specs"] = sp
+    return d
 
 
 def sweep_note(c, path, props, pages, limit, detail_count=0, record=True):
@@ -959,20 +1106,35 @@ def cmd_sweep(a):
         sys.exit("wh: no open buy/wanted note with a `search:` property")
     for f, _, p in todo:
         note_for(p, f)
-    plans = [sweep_plan(c, f, p) for f, _, p in todo]       # before this run records anything
+    plans, ok, report = [], [], []
+    for note in todo:                                       # before this run records anything
+        try:
+            plans.append(sweep_plan(c, note[0], note[2]))
+            ok.append(note)
+        except WhError as e:                                # e.g. a typo in wh-area: skip this note only
+            report.append(dict(note=name_of(note[0]), path=note[0], error=str(e)))
+            (log if a.json else print)("%s: skipped: %s" % (name_of(note[0]), e))
+    todo = ok
     jobs = [(x["url"], x["key"]) for plan in plans for x in plan["items"]]
     log("%d notes, %d searches:" % (len(todo), len(jobs)))
     fetched = iter(run_searches(c, jobs, a.pages, record=not a.dry_run))   # one queue for every note
     for (f, text, p), plan in zip(todo, plans):
         block, short, good, mk = sweep_report(c, plan, [next(fetched) for _ in plan["items"]], a.limit)
+        if a.json:
+            report.append(dict(note=name_of(f), path=f, **plan["report"]))
+        if not (a.dry_run or a.no_write):
+            update_note(f, lambda t: set_prop(put_block(t, "sweep", block), "checked", date.today().isoformat()))
+        if a.json:
+            continue
         if a.dry_run:
             print(block)
             continue
-        write_note(f, set_prop(put_block(text, "sweep", block), "checked", date.today().isoformat()))
         print("%s: %s; %d on the shortlist" % (name_of(f), mk, len(short)))
         for line in block.splitlines():
             if line.startswith("> "):
                 print("  " + line[2:])
+    if a.json:
+        print(json.dumps(dict(at=now(), dry_run=bool(a.dry_run), notes=report), ensure_ascii=False, indent=1))
 
 
 def cmd_deal(a):
@@ -991,7 +1153,7 @@ def cmd_deal(a):
             "first.")
     if a.question:
         task += "\nAlso answer: " + a.question
-    ans = ask_claude(a, task, data, "Ground rules", "Judging a deal (buying)")
+    ans = ask_claude(a, task, data, "buy")
     if ans:
         print(ans)
 
@@ -1001,11 +1163,12 @@ def cmd_advise(a):
     todo = [(f, t, p) for f, t, p in find_notes(a.notes, types={"sell"}, statuses=OPEN | {"draft"}) if p.get("ad")]
     if not todo:
         sys.exit("wh: no live sell note with an `ad:` property")
-    got = details_many(c, [ad_id(p["ad"]) for _, _, p in todo], refresh=True)
+    ids = note_ads(todo)
+    got = details_many(c, [i for i in ids if isinstance(i, int)], refresh=True)
     live = []
-    for f, text, p in todo:
-        d = got[ad_id(p["ad"])]
-        if isinstance(d, FetchError):
+    for (f, text, p), i in zip(todo, ids):
+        d = got.get(i, i)
+        if isinstance(d, WhError):
             print("## %s\n\nwh: %s\n" % (name_of(f), d))
         elif d["status"] == "offline":
             print("## %s\n\nThe ad is offline (usually just expired): renew or relist it.\n" % name_of(f))
@@ -1023,7 +1186,7 @@ def cmd_advise(a):
         data = ("## My note\n\n%s\n\n## My ad now\n\n%s\n\n## Comparable ads on willhaben now\n\nSearch \"%s\": %s; "
                 "%s.\n\n%s" % (strip_blocks(text), fmt_details(d, c), words, found, market(comps),
                                table(comps[:a.limit], profile, True)))
-        jobs.append((task, data, "Ground rules", "Selling", "Pricing advice for my ads"))
+        jobs.append((task, data, "sell"))
     if a.no_ai:
         for (f, *_), job in zip(live, jobs):
             if len(live) > 1:
@@ -1044,8 +1207,7 @@ def cmd_hunt(a):
         sys.exit("wh: %s has no `search:` property" % name_of(f))
     block, short, good, mk = sweep_note(c, f, p, a.pages, a.limit, detail_count=a.details, record=not a.dry_run)
     if not a.dry_run:                                       # saved now, so a failed Claude call doesn't lose the sweep
-        text = set_prop(put_block(text, "sweep", block), "checked", date.today().isoformat())
-        write_note(f, text)
+        update_note(f, lambda t: set_prop(put_block(t, "sweep", block), "checked", date.today().isoformat()))
     profile = note_profile(p, f)
     who = note_for(p, f)
     states = area(p.get("wh-area"))
@@ -1083,7 +1245,7 @@ def cmd_hunt(a):
             "`## Picks`: the ads you'd actually recommend, best first, as a numbered list. For each: price and link, why "
             "it's good value against the market, what to check or ask the seller, and a suggested offer. `## Warnings`: "
             "ads that look like scams or too good to be true, one line each with the link and why.")
-    ans = ask_claude(a, task, data, "Ground rules", "Judging a deal (buying)")
+    ans = ask_claude(a, task, data, "buy")
     if ans is None:
         return
     parts = re.split(r"^#{2,3}\s+Warnings\b[^\n]*\n?", ans, maxsplit=1, flags=re.M | re.I)
@@ -1091,7 +1253,7 @@ def cmd_hunt(a):
     picks = re.sub(r"\A.*?^#{2,3}\s+Picks\b[^\n]*\n?", "", picks, count=1, flags=re.M | re.S | re.I).strip()
     out = "## Picks\n\n*wh hunt %s (Claude)*\n\n%s" % (datetime.now().strftime("%Y-%m-%d %H:%M"), picks)
     if not a.dry_run:
-        write_note(f, put_block(text, "picks", out))
+        update_note(f, lambda t: put_block(t, "picks", out))
     print(out)
     if warnings.strip():
         print("\n## Warnings (not written to the note)\n\n" + warnings.strip())
@@ -1120,6 +1282,109 @@ def cmd_facets(a):
                                            link or "%s=%s" % (x.get("urlParameterName"), x.get("value"))))
             if len(vals) > a.limit:
                 print("          … %d more" % (len(vals) - a.limit))
+
+
+def doctor_checks():
+    """(level, area, message) for everything wh depends on; level is ok, info, warn or FAIL. Sends no request."""
+    home = os.path.expanduser("~")
+    short = lambda p: p.replace(home, "~", 1) if p else p  # noqa: E731
+    out = []
+    add = lambda level, what, msg: out.append((level, what, msg))  # noqa: E731
+
+    if os.path.isfile(CONFIG_PATH):
+        add("ok", "config", "%s (%s)" % (short(CONFIG_PATH), ", ".join(sorted(CONFIG)) or "empty"))
+        for k in sorted(set(CONFIG) - CONFIG_KEYS):
+            add("warn", "config", "unknown key %r (known: %s)" % (k, ", ".join(sorted(CONFIG_KEYS))))
+    else:
+        add("info", "config", "no %s, using the defaults" % short(CONFIG_PATH))
+
+    if not os.path.isdir(NOTES):
+        add("FAIL", "notes", "no folder %s: set `notes` in the config or WH_NOTES" % short(NOTES))
+    else:
+        notes = find_notes([NOTES])
+        buy = [(f, p) for f, _, p in notes if p.get("type") in ("buy", "wanted") and p.get("status") in OPEN]
+        sell = [(f, p) for f, _, p in notes if p.get("type") == "sell" and p.get("status") in OPEN | {"draft"}]
+        add("ok", "notes", "%s: %d notes, %d open buy/wanted (%d with `search:`), %d live sell" % (
+            short(NOTES), len(notes), len(buy), sum(1 for _, p in buy if p.get("search")), len(sell)))
+        for f, p in buy:
+            if not p.get("for"):
+                add("warn", "notes", "%s has no `for:`" % name_of(f))
+            name = p.get("wh-profile")
+            if name and name not in profiles.PROFILES:
+                add("warn", "notes", "%s: unknown wh-profile %r" % (name_of(f), name))
+            try:
+                area(p.get("wh-area"))
+            except WhError as e:
+                add("warn", "notes", "%s: %s" % (name_of(f), e))
+        for f, p in sell:
+            if p.get("ad"):
+                try:
+                    ad_id(p["ad"])
+                except WhError as e:
+                    add("warn", "notes", "%s: %s" % (name_of(f), e))
+
+    path = skill_path()
+    configured = os.path.join(SKILL, "SKILL.md") if os.path.isdir(SKILL) else SKILL
+    if not os.path.isfile(configured) and path == SHIPPED_SKILL:
+        add("warn", "skill", "%s not found, the AI commands use the repo's copy; for Claude Code: ln -sfn %s %s" % (
+            short(SKILL), short(os.path.dirname(SHIPPED_SKILL)), short(os.path.dirname(SKILL))))
+    elif not os.path.isfile(path):
+        add("FAIL", "skill", "no %s and no copy next to wh: the AI commands run without rules" % short(path))
+    else:
+        d = os.path.dirname(path)
+        link = os.path.islink(d) and os.path.realpath(d) == os.path.dirname(SHIPPED_SKILL)
+        add("ok", "skill", "%s%s" % (short(path), " (links to this repo)" if link else ""))
+        missing = [f for f in ("buying.md", "selling.md") if not os.path.isfile(os.path.join(d, f))]
+        if missing:
+            add("warn", "skill", "single-file skill (no %s): the rules come from SKILL.md's sections; link the repo's "
+                "skill/willhaben instead" % ", ".join(missing))
+        elif not link and os.path.isfile(SHIPPED_SKILL) and os.path.realpath(d) != os.path.dirname(SHIPPED_SKILL):
+            with open(path, encoding="utf-8") as f1, open(SHIPPED_SKILL, encoding="utf-8") as f2:
+                if f1.read() != f2.read():
+                    add("info", "skill", "a copy that differs from the repo's; a symlink would follow git")
+        if "Judging a deal" not in skill_rules("buy") or "Pricing advice" not in skill_rules("sell"):
+            add("warn", "skill", "the buying or pricing rules are missing: deal/hunt/advise send less to Claude")
+
+    add("ok", "templates", "%d built-in profiles, %d template%s" % (
+        len(profiles.BUILTIN), len(profiles.TEMPLATES), "" if len(profiles.TEMPLATES) == 1 else "s"))
+    for p, err in profiles.TEMPLATE_ERRORS.items():
+        add("warn", "templates", "%s skipped: %s" % (short(p), err))
+
+    if not os.path.exists(DB):
+        add("info", "database", "%s doesn't exist yet; the first search creates it" % short(DB))
+    else:
+        try:
+            c = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(DB), uri=True, timeout=10)
+            try:
+                check = c.execute("pragma quick_check").fetchone()[0]
+                ads = c.execute("select count(*) from ads").fetchone()[0]
+                last = c.execute("select max(at) from runs").fetchone()[0]
+            finally:
+                c.close()
+        except sqlite3.Error as e:
+            add("FAIL", "database", "%s: %s" % (short(DB), e))
+        else:
+            add("ok" if check == "ok" else "FAIL", "database", "%s: %s, %d ads, %.1f MB, last search %s" % (
+                short(DB), "intact" if check == "ok" else check, ads, os.path.getsize(DB) / 1e6, last or "never"))
+
+    me, on_path = os.path.realpath(__file__), shutil.which("wh")
+    if not on_path:
+        add("warn", "tools", "wh is not on PATH: ln -sf %s ~/.local/bin/wh" % short(me))
+    elif os.path.realpath(on_path) != me:
+        add("warn", "tools", "`wh` on PATH is %s, not this one (%s)" % (short(os.path.realpath(on_path)), short(me)))
+    add("ok" if shutil.which("claude") else "warn", "tools", "claude %s" % (
+        "found" if shutil.which("claude") else "not found: deal/advise/hunt only work with --no-ai"))
+    if not (shutil.which("magick") or shutil.which("convert")):
+        add("info", "tools", "no ImageMagick: `wh photos` keeps WebP photos as they are")
+    return out
+
+
+def cmd_doctor(a):
+    checks = doctor_checks()
+    for level, what, msg in checks:
+        print("%-5s %-10s %s" % (level, what, msg))
+    if any(level == "FAIL" for level, *_ in checks):
+        sys.exit(1)
 
 
 def cmd_profiles(a):
@@ -1171,10 +1436,19 @@ def main():
                                         "`wh-profile` or --profile can name, and any template that's broken")
     s.set_defaults(fn=cmd_profiles)
 
+    s = sub.add_parser("doctor", help="check the config, notes, skill install, templates, database and tools "
+                                      "(no request to willhaben)")
+    s.set_defaults(fn=cmd_doctor)
+
     s = sub.add_parser("ad", help="one ad in full (description, seller, price history)")
     s.add_argument("ad", help="ad ID or link")
     s.add_argument("--refresh", action="store_true")
     s.set_defaults(fn=cmd_ad)
+
+    s = sub.add_parser("history", help="an ad's prices over time as wh saw them (database only, no request)")
+    s.add_argument("ad", help="ad ID or link")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_history)
 
     s = sub.add_parser("photos", help="download an ad's photos as JPEG (WebP gets converted)")
     s.add_argument("ad")
@@ -1191,7 +1465,10 @@ def main():
     s.add_argument("notes", nargs="*")
     s.add_argument("--pages", type=int, default=5)
     s.add_argument("--limit", type=int, default=30)
-    s.add_argument("--dry-run", action="store_true", help="print the block instead of writing it")
+    s.add_argument("--dry-run", action="store_true", help="print the block instead of writing it; records no run")
+    s.add_argument("--no-write", action="store_true", help="record the run but leave the notes alone (for a timer)")
+    s.add_argument("--json", action="store_true", help="print new ads, price cuts, gone ads and the shortlist per "
+                                                       "note as JSON (for scripts); notes are written as usual")
     s.set_defaults(fn=cmd_sweep)
 
     for name, fn, hlp in (("deal", cmd_deal, "AI: is this ad worth buying? verdict, comparables, offer, questions"),
@@ -1219,7 +1496,7 @@ def main():
         s.set_defaults(fn=fn)
 
     a = ap.parse_args()
-    if a.cmd != "profiles":
+    if a.cmd not in ("profiles", "doctor"):
         for path in profiles.TEMPLATE_ERRORS:
             log("wh: skipped the broken template %s (see `wh profiles`)" % os.path.basename(path))
     try:
