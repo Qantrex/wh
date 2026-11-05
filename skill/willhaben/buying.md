@@ -9,6 +9,7 @@ Always end with a clear verdict: **good deal / fair / overpriced / walk away**, 
 - **Market position:** compare with similar ads from the same sweep (same model or specs, similar condition). Say where this price sits ("cheapest of 9 comparable ads nearby, median €680"). Also check the new price across shops, shipping to Austria included.
 - **Total cost:** price + shipping + whatever would have to be added or fixed (charger, RAM upgrade, tyres, service).
 - **Does the ad match the title?** Model generation, year, size on the label, single-channel RAM, missing parts, "Bastler"/defect hints in the text.
+- **RAM sticks: read the label in the photos.** "DDR4 16GB" ads rarely say laptop or server (2026-11-06: 6 of 8 cheap "desktop" picks were not). Desktop UDIMM: `M378…`, `HMA…U6…`, `MTA…AZ`, `KVR…N…`, `PC4-…-U`. Laptop SO-DIMM: `M471…`, `HMA…S6…`, `MTA…HZ`, `-S…`. Server RDIMM (no desktop board): `M393…`, `HMA…R7/R4…`, `MTA…PZ`, `PC4-…P-R`, HPE/Dell sticker, register chip, mostly `2Rx4`.
 - **Scam and risk flags:** a price far below comparable ads, shipping only with payment outside PayLivery, a brand-new account, stock photos, a vague description, pressure to decide fast. A price that is too good to be true gets called out plainly.
 - **Questions for the seller** before buying: battery health, label photos, receipt or warranty, a test on site.
 - Private sellers and pickup nearby are a plus. Dealer warranty can be worth a higher price.
