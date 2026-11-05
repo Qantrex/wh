@@ -4,14 +4,22 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
 
-import profiles
+import sys
 
-os.environ["WH_CONFIG"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "no-such-config")  # tests never read personal settings
-loader = importlib.machinery.SourceFileLoader("wh_mod", os.path.join(os.path.dirname(__file__), "wh"))
+HERE = os.path.dirname(os.path.abspath(__file__))     # runnable from any folder: python3 path/to/test_wh.py
+os.environ["WH_CONFIG"] = os.path.join(HERE, "no-such-config")   # before the imports: tests never read personal
+os.environ.pop("WH_TEMPLATES", None)                             # settings or templates
+for k in ("WH_NOTES", "WH_SKILL", "WH_DB", "WH_MODEL"):
+    os.environ.pop(k, None)
+sys.path.insert(0, HERE)
+import profiles  # noqa: E402
+
+loader = importlib.machinery.SourceFileLoader("wh_mod", os.path.join(HERE, "wh"))
 spec = importlib.util.spec_from_loader("wh_mod", loader)
 wh = importlib.util.module_from_spec(spec)
 loader.exec_module(wh)
@@ -239,6 +247,39 @@ class WhTests(TmpDbCase):
             _, text = wh.fetch("https://www.willhaben.at/ok")
         self.assertEqual(text, "hello willhaben")
 
+    def test_dates_are_austrian_days(self):
+        if wh.TZ is wh.timezone.utc:
+            self.skipTest("no tz database")
+        self.assertEqual(wh.day("1760911200000"), "2025-10-20")            # 2025-10-19T22:00Z, midnight in Vienna
+        self.assertEqual(wh.day("1760911200"), "2025-10-20")
+        self.assertEqual(wh.day("2026-10-19T23:30:00Z"), "2026-10-20")
+        self.assertEqual(wh.day("2026-10-19T23:30:00+02:00"), "2026-10-19")         # summer time
+        self.assertEqual(wh.day("2026-10-19"), "2026-10-19")
+        self.assertEqual(wh.day("2026-10-19T23:30:00"), "2026-10-19")       # no zone: as written
+        self.assertEqual((wh.day(None), wh.day("garbage")), ("", "garbage"))
+
+    def test_history_shows_prices_over_time_without_a_request(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        for at, price in (("2026-10-01T10:00:00Z", 200), ("2026-10-08T10:00:00Z", 200), ("2026-10-15T10:00:00Z", 170)):
+            wh.store(c, [wh.summary(make_summary(5555555, "Fahrrad Cube", price))], at)
+        c.commit()
+        out = io.StringIO()
+        with mock.patch.object(wh, "db", return_value=c), mock.patch.object(wh, "fetch") as fetch, \
+             mock.patch("sys.stdout", out):
+            wh.cmd_history(mock.Mock(ad="https://www.willhaben.at/iad/kaufen-und-verkaufen/d/fahrrad-5555555/", json=False))
+            wh.cmd_history(mock.Mock(ad="5555555", json=True))
+        fetch.assert_not_called()
+        text, js = out.getvalue().split("\n{", 1)
+        self.assertIn("**Fahrrad Cube**", text)
+        self.assertIn("Seen by wh 2026-10-01 to 2026-10-15", text)
+        self.assertIn("2026-10-15  €170  −€30 (-15 %)", text)
+        r = json.loads("{" + js)
+        self.assertEqual(r["prices"], [{"day": "2026-10-01", "price": 200}, {"day": "2026-10-15", "price": 170}])
+        with mock.patch.object(wh, "db", return_value=c):
+            with self.assertRaisesRegex(wh.WhError, "not in the database"):
+                wh.cmd_history(mock.Mock(ad="1234567", json=False))
+
     def test_comp_words_keeps_digits_and_strips_seller_noise(self):
         self.assertEqual(wh.comp_words("Preis Fix! Apple MacBook Air 15 M4 16GB"), "apple macbook air 15")
         self.assertEqual(wh.comp_words("(reserviert) Apple Mac mini M4 16GB"), "apple mac mini m4")
@@ -260,7 +301,8 @@ class WhTests(TmpDbCase):
     def test_run_search_incomplete_when_search_result_missing(self):
         c = wh.db()
         self.addCleanup(c.close)
-        with mock.patch.object(wh, "fetch", return_value=("https://x", "<html>blocked</html>")):
+        with mock.patch.object(wh, "fetch", return_value=("https://x", "<html>blocked</html>")), \
+             mock.patch.object(wh, "log"):
             ads, found, complete = wh.run_search(c, "https://www.willhaben.at/s?rows=200", pages=2, key="k1")
         self.assertEqual(ads, [])
         self.assertEqual(found, 0)
@@ -297,6 +339,39 @@ class WhTests(TmpDbCase):
              mock.patch("sys.stdout", new_callable=io.StringIO):
             wh.cmd_photos(ns)
         self.assertTrue(os.path.exists(os.path.join(photo_dir, "9999991-01.webp")))
+
+    def test_a_page_without_ad_data_is_an_error_not_an_offline_ad(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        with mock.patch.object(wh, "fetch", return_value=("u", make_detail_html(4242424, "Item", 50))):
+            wh.details(c, 4242424, refresh=True)
+        for page in ("<html><h1>Wartungsarbeiten</h1></html>",
+                     '<script id="__NEXT_DATA__" type="application/json">{"props": </script>',
+                     '<script id="__NEXT_DATA__" type="application/json">{"other": 1}</script>'):
+            with mock.patch.object(wh, "fetch", return_value=("u", page)):
+                with self.assertRaises(wh.FetchError):
+                    wh.details(c, 4242424, refresh=True)
+        cached = json.loads(c.execute("select data from details where id=4242424").fetchone()[0])
+        self.assertEqual(cached["status"], "active")             # the cache still says what was last known
+        with mock.patch.object(wh, "fetch", return_value=("u", "<html>maintenance</html>")), \
+             mock.patch.object(wh, "log"):
+            self.assertIsNone(wh.read_page("https://x?rows=200&page=1"))
+
+    def test_status_reports_a_bad_ad_property_and_checks_the_other_notes(self):
+        notes = os.path.join(self.tmp.name, "notes")
+        os.makedirs(notes)
+        for name, ad in (("Bad", "see chat"), ("Good", "1234567")):
+            with open(os.path.join(notes, name + ".md"), "w", encoding="utf-8") as f:
+                f.write("---\ntype: sell\nstatus: live\nad: %s\n---\n" % ad)
+        c = wh.db()
+        self.addCleanup(c.close)
+        out = io.StringIO()
+        with mock.patch.object(wh, "db", return_value=c), mock.patch.object(wh, "NOTES", notes), \
+             mock.patch.object(wh, "fetch", return_value=("u", make_detail_html(1234567, "Item", 40))), \
+             mock.patch("sys.stdout", out):
+            wh.cmd_status(mock.Mock(notes=[], dry_run=True))
+        self.assertIn("no willhaben ad id in 'see chat'", out.getvalue())
+        self.assertRegex(out.getvalue(), r"Good\s+active\s+€40")
 
     def test_sweep_note_multi_search_dedupes_and_preserves_was_price(self):
         c = wh.db()
@@ -338,6 +413,15 @@ class WhTests(TmpDbCase):
 
         self.assertIn("1 new · 1 price cuts · 1 gone", block)
         self.assertIn("| €620 | €700 |", block)                # Was column shows €700, NOT clobbered €620!
+
+    def test_last_prices_reads_only_the_asked_ads_up_to_a_time(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        c.executemany("insert into prices values (?,?,?)", [
+            (1, 100, "2026-10-01T10:00:00Z"), (1, 90, "2026-10-02T10:00:00Z"), (1, 80, "2026-10-03T10:00:00Z"),
+            (2, 50, "2026-10-01T10:00:00Z"), (3, 70, "2026-10-01T10:00:00Z")])
+        self.assertEqual(wh.last_prices(c, {1, 2}, "2026-10-02T10:00:00Z"), {1: 90, 2: 50})
+        self.assertEqual(wh.last_prices(c, set(range(1, 1200)), "2026-10-01T10:00:00Z"), {1: 100, 2: 50, 3: 70})
 
     def test_sweep_note_detail_enrichment_filters_offline_and_updates_specs(self):
         c = wh.db()
@@ -386,6 +470,61 @@ class WhTests(TmpDbCase):
         text2, props2 = wh.read_note(p)
         self.assertIn("updated", props2)
         self.assertIn("<!-- wh:sweep -->", text2)
+
+    def test_find_notes_skips_hidden_folders_and_unreadable_notes(self):
+        notes = os.path.join(self.tmp.name, "vault")
+        for sub in ("Buying", ".trash", ".obsidian"):
+            os.makedirs(os.path.join(notes, sub))
+        for sub in ("Buying", ".trash"):
+            with open(os.path.join(notes, sub, "Laptop.md"), "w", encoding="utf-8") as f:
+                f.write("---\ntype: buy\nstatus: open\n---\n")
+        with open(os.path.join(notes, "Buying", "Latin1.md"), "wb") as f:
+            f.write(b"---\ntype: buy\n---\nK\xe4se\n")
+        with mock.patch.object(wh, "NOTES", notes), mock.patch.object(wh, "log") as log:
+            self.assertEqual([f for f, *_ in wh.find_notes([])], [os.path.join(notes, "Buying", "Laptop.md")])
+            self.assertEqual(len(wh.find_notes(["laptop"])), 1)          # by name: not the deleted copy either
+        self.assertIn("Latin1.md", log.call_args[0][0])
+
+    def test_frontmatter_edge_cases_never_get_a_second_frontmatter(self):
+        self.assertEqual(wh.set_prop("---\n---\nBody\n", "checked", "2026-11-04"), "---\nchecked: 2026-11-04\n---\nBody\n")
+        self.assertEqual(wh.set_prop("---\ntype: buy\n---", "checked", "x"), "---\ntype: buy\nchecked: x\n---\n")
+        self.assertEqual(wh.set_prop("---\r\ntype: buy\r\n---\r\nB", "type", "sell").count("---"), 2)
+        self.assertEqual(wh.FM.match("---\ntype: buy\n---").group(1), "type: buy\n")
+        self.assertEqual(wh.set_prop("# no props\n", "a", "1"), "---\na: 1\n---\n# no props\n")
+        text = "---\na: 1\n---\nBody\n\n---\n\nmore"                  # a horizontal rule later stays text
+        self.assertEqual(wh.set_prop(text, "b", "2"), "---\na: 1\nb: 2\n---\nBody\n\n---\n\nmore")
+
+    def test_put_block_ignores_a_stray_end_marker_before_the_block(self):
+        text = "Uses <!-- /wh:sweep --> as marker.\n\n<!-- wh:sweep -->\nold\n<!-- /wh:sweep -->\n"
+        once = wh.put_block(text, "sweep", "new")
+        self.assertEqual(once, "Uses <!-- /wh:sweep --> as marker.\n\n<!-- wh:sweep -->\nnew\n<!-- /wh:sweep -->\n")
+        self.assertEqual(wh.put_block(once, "sweep", "new"), once)       # no copy appended on every sweep
+
+    def test_hunt_keeps_edits_made_while_claude_thinks_and_symlinks_stay(self):
+        real = os.path.join(self.tmp.name, "real.md")
+        link = os.path.join(self.tmp.name, "Goggles.md")
+        with open(real, "w", encoding="utf-8") as f:
+            f.write("---\ntype: buy\nstatus: open\nfor: me\nsearch: goggles\n---\n# Goggles\n")
+        os.symlink(real, link)
+        page = search_page(1, [make_summary(1, "DJI Goggles V2", 180)])
+
+        def claude_while_the_owner_types(a, task, data, rules="buy"):
+            with open(link, "a", encoding="utf-8") as f:
+                f.write("\nAsked the seller about the battery.\n")
+            return "## Picks\n\n1. Goggles\n"
+        c = wh.db()
+        self.addCleanup(c.close)
+        ns = mock.Mock(note=link, pages=1, limit=10, details=0, dry_run=False, no_ai=False)
+        with mock.patch.object(wh, "db", return_value=c), mock.patch.object(wh, "fetch", return_value=("u", page)), \
+             mock.patch.object(wh, "ask_claude", side_effect=claude_while_the_owner_types), \
+             mock.patch.object(wh, "log"), mock.patch("sys.stdout", io.StringIO()):
+            wh.cmd_hunt(ns)
+        self.assertTrue(os.path.islink(link))
+        saved, props = wh.read_note(link)
+        self.assertIn("Asked the seller about the battery.", saved)
+        self.assertIn("<!-- wh:picks -->", saved)
+        self.assertIn("<!-- wh:sweep -->", saved)
+        self.assertEqual(props["for"], "me")
 
     def test_cmd_hunt_formats_metadata_and_splits_warnings_resiliently(self):
         note_path = os.path.join(self.tmp.name, "Laptop.md")
@@ -622,6 +761,18 @@ class FetchSweepTests(TmpDbCase):
         self.assertIn("rowsFound", text)
         self.assertTrue(wh._slow[0])
 
+    def test_a_cut_off_gzip_body_is_retried_not_a_traceback(self):
+        cut = gzip.compress(b"x" * 1000)[:20]
+        good = gzip.compress(b"<html>ok</html>")
+        with mock.patch("urllib.request.urlopen", side_effect=[
+                FakeResp(cut, {"Content-Encoding": "gzip"}), FakeResp(good, {"Content-Encoding": "gzip"})]), \
+             mock.patch("time.sleep"), mock.patch.object(wh, "log"):
+            self.assertEqual(wh.fetch("https://www.willhaben.at/x")[1], "<html>ok</html>")
+        with mock.patch("urllib.request.urlopen", side_effect=lambda *a, **k: FakeResp(cut, {"Content-Encoding": "gzip"})), \
+             mock.patch("time.sleep"), mock.patch.object(wh, "log"):
+            with self.assertRaises(wh.FetchError):
+                wh.fetch("https://www.willhaben.at/x")
+
     def test_a_cloudflare_challenge_is_never_returned_as_a_page(self):
         challenge = b"<html><head><title>Just a moment...</title></head></html>"
         with mock.patch("urllib.request.urlopen", side_effect=lambda *a, **k: FakeResp(challenge)), \
@@ -791,6 +942,10 @@ min_score = 1
                dict(id=3, title="c", price=1, published="2026-10-30", junk=None)]
         self.assertEqual([a["id"] for a in profiles.template_shortlist(tpl, ads, 10)], [3, 2, 1])
 
+    def test_tests_never_read_personal_templates(self):
+        home = os.path.expanduser("~/.config/wh")
+        self.assertFalse([d for d in profiles.TEMPLATE_DIRS if d.startswith(home)], profiles.TEMPLATE_DIRS)
+
     def test_shipped_example_template(self):
         profiles.load_templates()
         self.assertIn("example", profiles.TEMPLATES, profiles.TEMPLATE_ERRORS)
@@ -829,6 +984,108 @@ class NoteProfileTests(TmpDbCase):
         self.assertIn("unless it says it's for me", block)
         self.assertIn("Don't assume it's for me", wh.who_block(None))
 
+    def test_sweep_skips_a_note_with_a_bad_area_and_reads_keywords_with_a_slash(self):
+        notes = os.path.join(self.tmp.name, "notes")
+        os.makedirs(notes)
+        for name, extra in (("Typo", "wh-area: graz\n"), ("Gpu", "")):
+            with open(os.path.join(notes, name + ".md"), "w", encoding="utf-8") as f:
+                f.write("---\ntype: buy\nstatus: open\nfor: me\n%ssearch: rtx 3060/3070\n---\n" % extra)
+        urls = []
+        empty = next_page({"searchResult": {"rowsFound": 0, "advertSummaryList": {"advertSummary": []}}})
+        c = wh.db()
+        self.addCleanup(c.close)
+        out = io.StringIO()
+        with mock.patch.object(wh, "NOTES", notes), mock.patch.object(wh, "db", return_value=c), \
+             mock.patch.object(wh, "fetch", side_effect=lambda u, binary=False: urls.append(u) or (u, empty)), \
+             mock.patch.object(wh, "log"), mock.patch("sys.stdout", out):
+            wh.cmd_sweep(mock.Mock(notes=[], pages=1, limit=5, dry_run=True, no_write=False, json=False))
+        self.assertIn("Typo: skipped: unknown area 'graz'", out.getvalue())
+        self.assertIn("## Sweep", out.getvalue())
+        self.assertEqual(len(urls), 1)
+        self.assertIn("/marktplatz?keyword=rtx+3060%2F3070", urls[0])
+
+    def test_sweep_json_lists_new_ads_and_cuts_and_no_write_leaves_the_note(self):
+        notes = os.path.join(self.tmp.name, "notes")
+        os.makedirs(notes)
+        path = os.path.join(notes, "Goggles.md")
+        original = "---\ntype: buy\nstatus: open\nfor: me\nsearch: goggles\n---\n# Goggles\n"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(original)
+        c = wh.db()
+        self.addCleanup(c.close)
+
+        def sweep(ads, at, **kw):
+            out = io.StringIO()
+            ns = mock.Mock(notes=[], pages=1, limit=5, **dict(dict(dry_run=False, no_write=True, json=True), **kw))
+            with mock.patch.object(wh, "NOTES", notes), mock.patch.object(wh, "db", return_value=c), \
+                 mock.patch.object(wh, "fetch", return_value=("u", search_page(len(ads), ads))), \
+                 mock.patch.object(wh, "now", return_value=at), \
+                 mock.patch.object(wh, "log"), mock.patch("sys.stdout", out):
+                wh.cmd_sweep(ns)
+            return out.getvalue()
+
+        sweep([make_summary(1, "DJI Goggles V2", 180)], "2026-11-01T10:00:00Z")
+        out = sweep([make_summary(1, "DJI Goggles V2", 150), make_summary(2, "DJI Goggles 2", 300)],
+                    "2026-11-02T10:00:00Z")
+        r = json.loads(out)
+        note = r["notes"][0]
+        self.assertEqual((note["note"], note["ads"]), ("Goggles", 2))
+        self.assertEqual([(x["id"], x["price"]) for x in note["new"]], [(2, 300)])
+        self.assertEqual([(x["id"], x["price"], x["was"]) for x in note["cuts"]], [(1, 150, 180)])
+        self.assertEqual(note["gone"], [])
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), original)                        # --no-write
+        self.assertEqual(c.execute("select count(*) from runs").fetchone()[0], 2)
+        out = sweep([make_summary(1, "DJI Goggles V2", 150), make_summary(2, "DJI Goggles 2", 300)],
+                    "2026-11-03T10:00:00Z", no_write=False, json=False)
+        self.assertIn("Goggles: 2 ads", out)
+        with open(path, encoding="utf-8") as f:
+            self.assertIn("<!-- wh:sweep -->", f.read())
+
+    def doctor(self, **patches):
+        with mock.patch.multiple(wh, **patches), \
+             mock.patch.object(wh.shutil, "which", side_effect=lambda t: "/usr/bin/" + t if t == "claude" else None):
+            return wh.doctor_checks()
+
+    def test_doctor_checks_notes_skill_database_and_tools(self):
+        notes = os.path.join(self.tmp.name, "notes")
+        os.makedirs(notes)
+        for name, props in (("Laptop", "type: buy\nstatus: open\nsearch: x\nwh-area: graz\nwh-profile: nope\n"),
+                            ("Bike", "type: sell\nstatus: live\nad: soon\n")):
+            with open(os.path.join(notes, name + ".md"), "w", encoding="utf-8") as f:
+                f.write("---\n%s---\n" % props)
+        skills = os.path.join(self.tmp.name, "skills")
+        os.makedirs(skills)
+        os.symlink(os.path.dirname(wh.SHIPPED_SKILL), os.path.join(skills, "willhaben"))
+        c = wh.db()
+        c.close()
+        config = os.path.join(self.tmp.name, "config.toml")
+        with open(config, "w", encoding="utf-8") as f:
+            f.write('notes = "x"\nlocaton = "1010 Wien"\n')
+        checks = self.doctor(NOTES=notes, SKILL=os.path.join(skills, "willhaben", "SKILL.md"), CONFIG_PATH=config,
+                             CONFIG=wh.load_config(config))
+        text = "\n".join("%s %s %s" % x for x in checks)
+        self.assertIn("warn config unknown key 'locaton'", text)
+        self.assertIn("1 open buy/wanted (1 with `search:`), 1 live sell", text)
+        for warning in ("Laptop has no `for:`", "Laptop: unknown wh-profile 'nope'", "Laptop: unknown area 'graz'",
+                        "Bike: no willhaben ad id in 'soon'", "wh is not on PATH"):
+            self.assertIn(warning, text)
+        self.assertRegex(text, r"ok skill .*SKILL.md \(links to this repo\)")
+        self.assertRegex(text, r"ok database .*intact, 0 ads")
+        self.assertIn("ok tools claude found", text)
+        self.assertNotIn("FAIL", text)
+
+    def test_doctor_fails_without_notes_and_warns_without_a_skill(self):
+        checks = self.doctor(NOTES=os.path.join(self.tmp.name, "none"), SKILL=os.path.join(self.tmp.name, "SKILL.md"),
+                             CONFIG_PATH=os.path.join(self.tmp.name, "none.toml"), CONFIG={})
+        levels = {(lvl, what) for lvl, what, _ in checks}
+        self.assertIn(("FAIL", "notes"), levels)
+        self.assertIn(("warn", "skill"), levels)
+        self.assertIn(("info", "database"), levels)
+        with mock.patch.object(wh, "doctor_checks", return_value=checks), mock.patch("sys.stdout", io.StringIO()):
+            with self.assertRaises(SystemExit):
+                wh.cmd_doctor(None)
+
     def test_sweep_warns_about_notes_without_for(self):
         notes = os.path.join(self.tmp.name, "notes")
         os.makedirs(notes)
@@ -836,7 +1093,7 @@ class NoteProfileTests(TmpDbCase):
             with open(os.path.join(notes, name + ".md"), "w", encoding="utf-8") as f:
                 f.write("---\ntype: buy\nstatus: open\n%ssearch: x\n---\n# %s\n" % (extra, name))
         empty = next_page({"searchResult": {"rowsFound": 0, "advertSummaryList": {"advertSummary": []}}})
-        ns = mock.Mock(notes=[], pages=1, limit=5, dry_run=True)
+        ns = mock.Mock(notes=[], pages=1, limit=5, dry_run=True, no_write=False, json=False)
         c = wh.db()
         self.addCleanup(c.close)
         with mock.patch.object(wh, "NOTES", notes), mock.patch.object(wh, "fetch", return_value=("u", empty)), \
@@ -846,6 +1103,201 @@ class NoteProfileTests(TmpDbCase):
         warned = [c[0][0] for c in log.call_args_list if "no `for:`" in c[0][0]]
         self.assertEqual(len(warned), 1)
         self.assertIn("Laptop", warned[0])
+
+
+class AdviseRulesTest(unittest.TestCase):
+    def test_advise_sends_the_pricing_rules(self):
+        """advise asked for "Pricing advice for my ads", the skill says "for the user's ads": the rules never got sent."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "SKILL.md")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("## Ground rules\n\nG\n\n## Selling\n\nS\n\n### Pricing advice for the user's ads\n\nPRICING\n")
+            jobs = []
+            with mock.patch.object(wh, "SKILL", path), mock.patch.object(wh, "find_notes", return_value=[
+                    ("/n/Item.md", "---\n---\n", {"type": "sell", "ad": "1234567"})]), \
+                 mock.patch.object(wh, "details_many", return_value={1234567: dict(
+                     id=1234567, status="active", title="Item", price=10, old_price=None, loc="", private=True,
+                     seller="s", seller_since="", seller_ads=1, first_published="", changed="", ends="", info=[],
+                     descr="", images=[], url="u")}), \
+                 mock.patch.object(wh, "run_searches", return_value=[dict(ads=[], found=0, complete=True, error=None)]), \
+                 mock.patch.object(wh, "db", return_value=mock.Mock()), \
+                 mock.patch.object(wh, "price_history", return_value=[]), \
+                 mock.patch.object(wh, "attach_details", side_effect=lambda c, ads: ads), \
+                 mock.patch.object(wh, "ask_all", side_effect=lambda a, j: jobs.extend(j) or ["ok"] * len(j)), \
+                 mock.patch("sys.stdout", io.StringIO()):
+                wh.cmd_advise(mock.Mock(notes=[], pages=1, limit=5, no_ai=False))
+                rules = wh.skill_rules(jobs[0][2])
+        self.assertIn("PRICING", rules)
+
+
+
+SPLIT_SKILL = """---
+name: willhaben
+---
+
+# willhaben
+
+## wh: use it instead of writing scripts
+
+| `wh search` | lists ads |
+
+## Read before the task
+
+- buying.md, selling.md
+
+## Ground rules
+
+- GROUND-RULE
+"""
+
+OLD_SKILL = """# willhaben
+
+## wh: use it instead of writing scripts
+
+COMMAND-TABLE
+
+## Ground rules
+
+- GROUND-RULE
+
+## Getting the data (no browser needed)
+
+DATA-RULE
+
+## Judging a deal (buying)
+
+BUY-RULE
+
+## Selling
+
+SELL-RULE
+
+### Pricing advice for the user's ads
+
+PRICING-RULE
+
+## willhaben quirks
+
+- QUIRK-RULE
+"""
+
+
+class SkillRulesTest(unittest.TestCase):
+    """Which rules the AI commands send: SKILL.md's ground rules plus buying.md (deal, hunt) or selling.md (advise)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.skill = os.path.join(self.tmp.name, "SKILL.md")
+        patcher = mock.patch.object(wh, "SKILL", self.skill)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write(self, name, text):
+        with open(os.path.join(self.tmp.name, name), "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def write_split(self):
+        self.write("SKILL.md", SPLIT_SKILL)
+        self.write("buying.md", "# willhaben: buying\n\nBUY-INTRO\n\n## Judging a deal (buying)\n\nBUY-RULE\n")
+        self.write("selling.md", "# willhaben: selling\n\nSELL-INTRO\n\n## Selling\n\nSELL-RULE\n")
+        self.write("data.md", "## Getting the data\n\nDATA-RULE\n")
+
+    def test_split_buy_sends_ground_rules_and_buying_only(self):
+        self.write_split()
+        r = wh.skill_rules("buy")
+        self.assertTrue(r.startswith("## Ground rules\n- GROUND-RULE"))
+        self.assertIn("## Judging a deal (buying)\n\nBUY-RULE", r)
+        for other in ("SELL-RULE", "DATA-RULE", "lists ads", "BUY-INTRO", "name: willhaben", "Read before"):
+            self.assertNotIn(other, r)
+
+    def test_split_sell_sends_ground_rules_and_selling_only(self):
+        self.write_split()
+        r = wh.skill_rules("sell")
+        self.assertIn("GROUND-RULE", r)
+        self.assertIn("## Selling\n\nSELL-RULE", r)
+        for other in ("BUY-RULE", "DATA-RULE", "lists ads", "SELL-INTRO"):
+            self.assertNotIn(other, r)
+
+    def test_old_single_file_skill_still_works(self):
+        self.write("SKILL.md", OLD_SKILL)
+        buy, sell = wh.skill_rules("buy"), wh.skill_rules("sell")
+        self.assertIn("GROUND-RULE", buy)
+        self.assertIn("BUY-RULE", buy)
+        self.assertNotIn("SELL-RULE", buy)
+        for rule in ("GROUND-RULE", "SELL-RULE", "PRICING-RULE", "QUIRK-RULE"):   # pricing was lost before the split
+            self.assertIn(rule, sell)
+        self.assertIn("### Pricing advice for the user's ads", sell)
+        for rule in ("BUY-RULE", "DATA-RULE", "COMMAND-TABLE"):
+            self.assertNotIn(rule, sell)
+
+    def test_one_split_file_missing_falls_back_for_that_kind(self):
+        self.write("SKILL.md", OLD_SKILL)
+        self.write("buying.md", "# t\n\n## Judging a deal (buying)\n\nNEW-BUY-RULE\n")
+        self.assertIn("NEW-BUY-RULE", wh.skill_rules("buy"))
+        self.assertIn("SELL-RULE", wh.skill_rules("sell"))
+
+    def test_no_skill_gives_no_rules(self):
+        with mock.patch.object(wh, "SHIPPED_SKILL", os.path.join(self.tmp.name, "nope", "SKILL.md")), \
+             mock.patch.object(wh, "log") as log:
+            self.assertEqual(wh.skill_rules("buy"), "")
+        self.assertIn("not found", log.call_args[0][0])
+
+    def test_ask_claude_puts_the_kinds_rules_in_the_system_prompt(self):
+        self.write_split()
+        ns = mock.Mock(no_ai=False, model=None, timeout=5)
+        done = subprocess.CompletedProcess([], 0, stdout=" ok \n", stderr="")
+        with mock.patch.object(wh.subprocess, "run", return_value=done) as run, mock.patch.object(wh, "log"), \
+             mock.patch.dict(os.environ, {"WH_MODEL": ""}):
+            self.assertEqual(wh.ask_claude(ns, "task", "data", "sell"), "ok")
+            self.assertEqual(wh.ask_claude(ns, "task", "data"), "ok")          # default: buying rules
+        (sell_cmd,), _ = run.call_args_list[0]
+        (buy_cmd,), _ = run.call_args_list[1]
+        sell_sys = sell_cmd[sell_cmd.index("--append-system-prompt") + 1]
+        buy_sys = buy_cmd[buy_cmd.index("--append-system-prompt") + 1]
+        self.assertTrue(sell_sys.startswith(wh.system_prompt()))
+        self.assertIn("SELL-RULE", sell_sys)
+        self.assertNotIn("BUY-RULE", sell_sys)
+        self.assertIn("BUY-RULE", buy_sys)
+        self.assertNotIn("SELL-RULE", buy_sys)
+
+    def test_commands_ask_for_the_right_kind(self):
+        with open(os.path.join(HERE, "wh"), encoding="utf-8") as f:
+            src = f.read()
+        for cmd, kind in (("cmd_deal", "buy"), ("cmd_hunt", "buy"), ("cmd_advise", "sell")):
+            body = src[src.index("def %s(" % cmd):]
+            body = body[:body.index("\ndef ", 1)]
+            self.assertIn('"%s")' % kind, body, cmd)
+
+    def test_shipped_skill_split_sizes(self):
+        skill = os.path.join(HERE, "skill", "willhaben", "SKILL.md")
+        with mock.patch.object(wh, "SKILL", skill):
+            buy, sell = wh.skill_rules("buy"), wh.skill_rules("sell")
+        self.assertIn("Judging a deal", buy)
+        self.assertIn("Pricing advice", sell)
+        self.assertNotIn("Pricing advice", buy)
+        self.assertNotIn("Judging a deal", sell)
+        self.assertLessEqual(len(sell.encode()), 5000)    # keep the rules each call sends small
+        self.assertLessEqual(len(buy.encode()), 5000)
+
+
+    def test_skill_may_name_the_folder(self):
+        self.write_split()
+        with mock.patch.object(wh, "SKILL", self.tmp.name):
+            self.assertIn("SELL-RULE", wh.skill_rules("sell"))
+
+    def test_missing_skill_falls_back_to_the_shipped_one(self):
+        with mock.patch.object(wh, "SKILL", os.path.join(self.tmp.name, "nope", "SKILL.md")):
+            self.assertEqual(wh.skill_path(), wh.SHIPPED_SKILL)
+            self.assertIn("Pricing advice", wh.skill_rules("sell"))
+
+    def test_shipped_skill_has_no_personal_data(self):
+        d = os.path.dirname(wh.SHIPPED_SKILL)
+        for name in sorted(os.listdir(d)):
+            with open(os.path.join(d, name), encoding="utf-8") as f:
+                text = f.read()
+            for word in ("Anna", "girlfriend", "~/Notes", "kbauer", "pi-two", "homelab repo", "sport-gloves"):
+                self.assertNotIn(word, text, name)
 
 
 if __name__ == "__main__":
