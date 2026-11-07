@@ -29,7 +29,7 @@ Setup: the Install section of the `wh` README (github.com/Qantrex/wh); `wh docto
 | `wh hunt <note>` | **AI:** sweep, then Claude writes the best picks into the note's `<!-- wh:picks -->` block |
 
 - **Inside a Claude session,** run the AI commands with `--no-ai`. That prints the gathered data and the task, and you do the judging yourself with the rules below. Without `--no-ai`, wh calls `claude -p` (no tools, about 1 minute); that is for a terminal.
-- **"Find me the best deal on X"** → `wh find <X>` (add `--kind` if it guesses wrong, `--area wien,noe` to mark pickup). Then judge the top ads yourself with [buying.md](buying.md): read the full ad (`wh ad`) of the ones you'd pick. Kinds with a market value: ram, gpu, cpu, mainboard, psu, disk, monitor, tv, laptop, pc, server, phone, tablet, console, headphones, speakers, hifi, turntable. Anything else: `wh search` and judge the comparables yourself.
+- **"Find me the best deal on X"** → `wh find <X>` (add `--kind` if it guesses wrong, `--area wien,noe` to mark pickup). Then judge the top ads yourself with [buying.md](buying.md): read the full ad (`wh ad`) of the ones you'd pick. Kinds with a market value: ram, gpu, cpu, mainboard, psu, disk, monitor, tv, laptop, pc, server, phone, tablet, console, headphones, speakers, hifi, turntable. Anything else works too: `wh find sony a7 iii` searches by words and lets Claude (`claude -p`, a small model, about a minute) name the product in each ad; `--no-ai` counts every ad with all the words instead, at low confidence.
 - **Profiles** turn ads into comparable specs, filter junk and rank the sweep's shortlist. A buy note picks one with `wh-profile: <name>`; `wh profiles` lists them.
   - New kind of search: add a template, not a script ([data.md](data.md)).
 
