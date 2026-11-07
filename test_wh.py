@@ -3,6 +3,7 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import re
 import os
 import subprocess
 import tempfile
@@ -1298,6 +1299,260 @@ class SkillRulesTest(unittest.TestCase):
                 text = f.read()
             for word in ("Anna", "girlfriend", "~/Notes", "kbauer", "pi-two", "homelab repo", "sport-gloves"):
                 self.assertNotIn(word, text, name)
+
+
+import market  # noqa: E402
+
+
+def mad(title, price, body="", tattrs="", seller=None, private=1, i=None, cats=None, kind="ram", first="2026-11-01T00:00:00Z",
+        last="2026-11-07T00:00:00Z"):
+    """An annotated ad dict for market tests."""
+    ad = dict(id=i or abs(hash((title, price, seller))) % 10**9, title=title, price=price, body=body, tattrs=tattrs,
+              seller=seller, private=private, cats=cats or ";".join(market.KINDS[kind]["ids"][:1]),
+              first_seen=first, last_seen=last)
+    return market.specs(ad, kind)
+
+
+class MarketExtractTests(unittest.TestCase):
+    def test_ram_kit_speed_and_form(self):
+        s = mad("Corsair Vengeance 32GB (2x16GB) DDR4 3200MHz", 100)["specs"]
+        self.assertEqual((s["gen"], s["form"], s["kit"], s["speed"]), ("ddr4", "dimm", "2x16", 3200))
+        s = mad("Kingston 16GB DDR4 PC4-25600 SO-DIMM", 40)["specs"]
+        self.assertEqual((s["form"], s["speed"], s["total"]), ("sodimm", 3200, 16))
+        s = mad("2 Stk. 8GB DDR3 Riegel", 20)["specs"]
+        self.assertEqual(s["kit"], "2x8")
+        # a description that only mentions laptops or servers doesn't turn a desktop kit into something else
+        s = mad("G.Skill 2x16GB DDR4 3600", 120, body="passt nicht in Laptops, war in meinem Server")["specs"]
+        self.assertEqual(s["form"], "dimm")
+        self.assertEqual(mad("Ryzen 5 3600 + 16GB DDR4 RAM", 150)["junk"], "bundle or not RAM")
+
+    def test_gpu_models(self):
+        g = lambda t: mad(t, 200, kind="gpu")["specs"].get("model")  # noqa: E731
+        self.assertEqual(g("MSI GeForce RTX 3060 Ti Gaming X"), "rtx 3060 ti")
+        self.assertEqual(g("Gigabyte 3070 Gaming OC 8GB"), "rtx 3070")
+        self.assertEqual(g("Sapphire Radeon RX 6700 XT Pulse"), "rx 6700 xt")
+        self.assertEqual(g("Medion MSI GeForce GTX 550 Ti"), "gtx 550 ti")
+        self.assertEqual(mad("RTX 3060 12GB", 200, kind="gpu")["specs"]["vram"], 12)
+        self.assertEqual(mad("Gaming PC mit RTX 3070", 600, kind="gpu")["junk"], "a computer, not a card")
+
+    def test_consoles_and_their_accessories(self):
+        c = lambda t: mad(t, 200, kind="console")  # noqa: E731
+        self.assertEqual(c("PS5 Slim mit 2 Controllern")["specs"]["model"], "ps5 slim")
+        self.assertEqual(c("Xbox Series S - guter Zustand - mit Rechnung")["specs"]["model"], "xbox series s")
+        self.assertEqual(c("Nintendo Switch OLED + 3 Spiele")["specs"]["bundle"], "with games")
+        for t in ("Original Nintendo Switch Pro Controller", "Xbox Series S Wireless Controller", "PS4 Spiele",
+                  "Schale Case für PS Vita", "Red Dead Redemption 2 (PS4)"):
+            self.assertIsNotNone(c(t)["junk"], t)
+
+    def test_phones_keep_battery_notes_but_drop_cases(self):
+        p = mad("iPhone 16 Pro 256GB | 90% Akku", 700, kind="phone")
+        self.assertIsNone(p["junk"])
+        self.assertEqual(p["specs"], {"model": "iphone 16 pro", "storage": 256})
+        self.assertEqual(mad("Galaxy S23 Ultra", 500, kind="phone", tattrs="[7215;7216]")["specs"]["storage"], 256)
+        self.assertIsNotNone(mad("iPhone 15 Pro Hülle neu", 8, kind="phone")["junk"])
+        self.assertIsNone(mad("Samsung Galaxy XCover 7", 130, kind="phone")["junk"])
+
+    def test_tv_codes_sizes_and_parts(self):
+        s = mad("LG OLED55C17LB", 600, kind="tv")["specs"]
+        self.assertEqual((s["brand"], s["series"], s["size"], s["panel"], s["year"]), ("lg", "oled c1", 55, "oled", 2020))
+        s = mad("Samsung GQ55Q80T 4K", 500, kind="tv")["specs"]
+        self.assertEqual((s["series"], s["panel"]), ("q80t", "qled"))
+        self.assertEqual(mad("Fernseher 139 cm", 100, kind="tv")["specs"]["size"], 55)
+        self.assertEqual(mad("Fernseher", 100, kind="tv", tattrs="[5807;7316]")["specs"]["size"], 55)
+        for t in ("Samsung Netzteil für Smart TV", "Rückwand eines QE50Q60T", "LG 55UK Komplettchassis da Displaybruch"):
+            self.assertIsNotNone(mad(t, 20, kind="tv")["junk"], t)
+
+    def test_defect_condition_is_junk(self):
+        self.assertEqual(mad("RTX 3080", 300, kind="gpu", tattrs="[21;24]")["junk"], "marked defect")
+        self.assertEqual(mad("RTX 3080", 300, kind="gpu", tattrs="[21;2546]")["cond"], "like new")
+
+
+class MarketValueTests(unittest.TestCase):
+    def kits(self, prices, title="Kingston 2x16GB DDR4 3200", sellers=None, **kw):
+        return [mad(title, p, seller=(sellers[n] if sellers else "s%d" % n), i=1000 + n, **kw) for n, p in enumerate(prices)]
+
+    def test_value_is_a_robust_median_with_one_vote_per_seller(self):
+        ads = self.kits([90, 95, 100, 100, 105, 110, 2000])                       # 2000: an outlier
+        ads += [mad("Kingston 2x16GB DDR4 3200", 40, seller="dealer", i=2000 + n) for n in range(10)]   # one seller
+        idx = market.build_index(ads, "ram")
+        est = market.value_of(idx, "ram", ads[0]["specs"])
+        self.assertEqual(est["value"], 100)
+        self.assertEqual(est["n"], 7)          # the dealer's 10 ads count once, the outlier is dropped
+        self.assertEqual(est["level"], ("gen", "form", "kit", "speed"))
+
+    def test_too_few_sellers_fall_back_to_a_looser_key(self):
+        ads = self.kits([100, 100])                                                  # 3200: only 2 sellers
+        ads += self.kits([80, 85, 90, 95, 100], title="Kingston 2x16GB DDR4 2666")
+        for n, a in enumerate(ads):
+            a["id"] = 3000 + n
+            a["seller"] = "x%d" % n
+        idx = market.build_index(ads, "ram")
+        est = market.value_of(idx, "ram", ads[0]["specs"])
+        self.assertEqual(est["level"], ("gen", "form", "kit"))
+        self.assertIsNone(market.value_of({}, "ram", ads[0]["specs"]))
+
+    def test_dealer_new_stock_and_junk_dont_count(self):
+        ads = self.kits([100, 100, 100])
+        ads.append(mad("Kingston 2x16GB DDR4 3200", 300, seller="shop", private=0, tattrs="[21;22]", i=9))
+        ads.append(mad("Kingston 2x16GB DDR4 3200 defekt", 10, seller="z", i=10))
+        est = market.value_of(market.build_index(ads, "ram"), "ram", ads[0]["specs"])
+        self.assertEqual((est["value"], est["n"]), (100, 3))
+
+    def test_deal_flags_urgent_sales_instead_of_hiding_them(self):
+        est = dict(value=200.0, conf="high")
+        cheap = mad("RTX 3070 Notverkauf, muss weg", 60, kind="gpu")
+        d = market.deal(cheap, est)
+        self.assertEqual(d["discount"], 0.7)
+        self.assertEqual(d["urgent"], "notverkauf")
+        self.assertTrue(any("urgent sale" in f for f in d["flags"]))
+        self.assertFalse(market.odd(dict(cheap, **d)))           # explained: stays in the main ranking
+        plain = mad("RTX 3070", 60, kind="gpu")
+        self.assertTrue(market.odd(dict(plain, **market.deal(plain, est))))
+
+    def test_queries(self):
+        self.assertEqual(market.guess_kind("2x16gb ddr4 3200"), "ram")
+        self.assertEqual(market.guess_kind("rtx 3070"), "gpu")
+        self.assertEqual(market.guess_kind("ps5 slim"), "console")
+        self.assertEqual(market.guess_kind("tv 45-55 zoll"), "tv")
+        want = market.query_specs("2x16gb ddr4 3200", "ram")
+        self.assertEqual(want, {"gen": "ddr4", "form": "dimm", "kit": "2x16", "speed": 3200})
+        self.assertTrue(market.matches({"gen": "ddr4", "form": "dimm", "kit": "2x16", "speed": 3600}, want))  # faster ok
+        self.assertFalse(market.matches({"gen": "ddr4", "form": "dimm", "kit": "2x16", "speed": 2666}, want))
+        self.assertFalse(market.matches({"gen": "ddr4", "form": "sodimm", "kit": "2x16", "speed": 3200}, want))
+        self.assertEqual(market.size_range("tv 45-55 zoll"), (45, 55))
+        self.assertTrue(market.matches({"size": 50}, {}, (45, 55)))
+        self.assertFalse(market.matches({"size": 65}, {}, (45, 55)))
+
+
+class FindWatchTests(TmpDbCase):
+    """find and watch on a database filled through store(), the way crawls fill it."""
+    RAM = "pc-komponenten/ram-speicher-arbeitsspeicher-5887"
+
+    def fill(self, c, ads, at, full=True):
+        wh.store(c, [wh.summary(a) for a in ads], at)
+        if full:
+            wh.record_crawl(c, wh.search_url(url=self.RAM), self.RAM, len(ads), True, at)
+        c.commit()
+
+    def market_ads(self, start=100):
+        return [make_summary(start + n, "Kingston 2x16GB DDR4 3200", p, cats="5824;5878;5887") for n, p in
+                enumerate([95, 100, 100, 105, 110, 98, 102])]
+
+    def setUp(self):
+        super().setUp()
+        self.cfg = tempfile.TemporaryDirectory()
+        self.addCleanup(self.cfg.cleanup)
+        wh._ROWS.clear()
+        p = mock.patch.object(wh, "WATCHES", os.path.join(self.cfg.name, "watches.toml"))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def args(self, **kw):
+        base = dict(kind=None, size=None, min=None, max=None, area=None, details=0, limit=15, no_crawl=True,
+                    md=False, json=True, all=False, below=0.15)
+        base.update(kw)
+        return argparse_ns(**base)
+
+    def test_old_database_gets_the_new_columns(self):
+        import sqlite3
+        old = sqlite3.connect(self.db_path)
+        old.executescript("create table ads (id integer primary key, title text, price real, loc text, state text, "
+                          "postcode text, private integer, published text, url text, body text, cats text, "
+                          "first_seen text, last_seen text); insert into ads (id, title) values (1, 'x');")
+        old.commit()
+        old.close()
+        c = wh.db()
+        self.addCleanup(c.close)
+        cols = {r["name"] for r in c.execute("pragma table_info(ads)")}
+        self.assertTrue({"tattrs", "seller", "p2p", "coords"} <= cols)
+        self.assertEqual(c.execute("select title from ads where id=1").fetchone()[0], "x")
+
+    def test_find_lists_ads_below_value_best_first(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        ads = self.market_ads() + [make_summary(900, "G.Skill 32GB 2x16GB DDR4 3200", 60, cats="5824;5878;5887"),
+                                   make_summary(901, "Kingston 2x16GB DDR4 2400", 30, cats="5824;5878;5887")]
+        self.fill(c, ads, wh.now())
+        out = io.StringIO()
+        with mock.patch.object(wh, "db", return_value=c), mock.patch("sys.stdout", out), \
+                mock.patch.object(wh, "fetch") as fetch:
+            wh.cmd_find(self.args(words=["2x16gb", "ddr4", "3200"]))
+        fetch.assert_not_called()
+        r = json.loads(out.getvalue())
+        self.assertEqual(r["kind"], "ram")
+        self.assertEqual(r["market"]["value"], 100)
+        self.assertEqual([d["id"] for d in r["deals"]], [900])          # the 2400 kit doesn't match, the rest is fair
+        self.assertEqual(r["deals"][0]["discount"], 0.4)
+        self.assertTrue(r["deals"][0]["comps"])
+
+    def test_watch_reports_new_or_cheaper_ads_once_and_not_the_starting_stock(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        cheap = make_summary(900, "G.Skill 2x16GB DDR4 3200", 60, cats="5824;5878;5887")
+        self.fill(c, self.market_ads() + [cheap], "2026-11-01T00:00:00Z")      # first full crawl: starting stock
+        wh.save_watches([dict(name="ram", query="2x16gb ddr4 3200", below=0.2, conf="low")])
+        def run():
+            wh._ROWS.clear()
+            out = io.StringIO()
+            with mock.patch.object(wh, "db", return_value=c), mock.patch("sys.stdout", out):
+                wh.cmd_watch(argparse_ns(action="run", args=[], json=True, no_crawl=True, dry_run=False, details=0))
+            return [d["id"] for d in json.loads(out.getvalue())["watches"][0]["deals"]]
+        self.assertEqual(run(), [])                                          # 900 was there from the start
+        self.fill(c, [make_summary(901, "Kingston Fury 2x16GB DDR4 3200", 55, cats="5824;5878;5887")],
+                  wh.now(), full=False)
+        self.assertEqual(run(), [901])                                       # new and cheap
+        self.assertEqual(run(), [])                                          # reported once
+        self.fill(c, [make_summary(901, "Kingston Fury 2x16GB DDR4 3200", 45, cats="5824;5878;5887")],
+                  wh.now(), full=False)
+        self.assertEqual(run(), [901])                                       # cheaper again: reported again
+
+    def test_watch_file_round_trip(self):
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            wh.cmd_watch(argparse_ns(action="add", args=["tv", ""], kind="tv", size="45-55", min=None, max=None,
+                                     below=0.4, conf="high", area="wien", for_=None))
+            wh.cmd_watch(argparse_ns(action="add", args=["ram", "2x16gb", "ddr4"], kind=None, size=None, min=None,
+                                     max=150.0, below=0.25, conf="medium", area=None, for_="homelab"))
+        ws = wh.load_watches()
+        self.assertEqual([w["name"] for w in ws], ["tv", "ram"])
+        self.assertEqual((ws[0]["query"], ws[0]["size"], ws[1]["max"], ws[1]["for"]), ("", "45-55", 150.0, "homelab"))
+        with mock.patch("sys.stdout", out):
+            wh.cmd_watch(argparse_ns(action="rm", args=["tv"]))
+        self.assertEqual([w["name"] for w in wh.load_watches()], ["ram"])
+
+    def test_specs_are_cached_until_the_ad_changes(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        self.fill(c, self.market_ads(), wh.now())
+        rows = wh.kind_rows(c, "ram")
+        self.assertEqual(c.execute("select count(*) from specs").fetchone()[0], len(rows))
+        with mock.patch.object(market, "specs", side_effect=AssertionError("recomputed")):
+            wh.kind_rows(c, "ram")                                        # all from the cache
+        self.fill(c, [make_summary(100, "Kingston 2x8GB DDR4 3200", 50, cats="5824;5878;5887")], wh.now(), full=False)
+        rows = {r["id"]: r for r in wh.kind_rows(c, "ram")}
+        self.assertEqual(rows[100]["specs"]["kit"], "2x8")
+
+    def test_crawl_new_stops_at_a_page_with_nothing_new(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        known = self.market_ads()
+        self.fill(c, known, wh.now())
+        pages = {1: search_page(1000, [make_summary(950, "Neu 2x16GB DDR4 3200", 90, cats="5824;5878;5887")] + known[:3]),
+                 2: search_page(1000, known[3:]), 3: search_page(1000, [])}
+        calls = []
+        def fake(url, binary=False):
+            n = int(re.search(r"page=(\d+)", url).group(1))
+            calls.append(n)
+            return url, pages[n]
+        with mock.patch.object(wh, "fetch", side_effect=fake):
+            wh.crawl_new(c, [self.RAM])
+        self.assertEqual(calls, [1, 2])
+        self.assertIsNotNone(c.execute("select id from ads where id=950").fetchone())
+
+
+def argparse_ns(**kw):
+    import argparse
+    return argparse.Namespace(**kw)
 
 
 if __name__ == "__main__":
