@@ -1406,6 +1406,8 @@ def crawl(c, kinds, full=None, max_pages=400):
         crawl_new(c, fresh)
     if whole:
         prune(c)
+        for k in kinds:                                     # annotate now, so the next watch run starts warm
+            kind_rows(c, k)
 
 
 PRUNE_DAYS = 180
