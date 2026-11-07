@@ -549,6 +549,9 @@ def phone(ad):
         return "accessory or part, not a phone"
     if re.search(r"\b(?:\d)\s*(?:x|stk\.?|stück)\s*(?:iphone|handy|smartphone|galaxy)", title):
         return "several phones"
+    if re.search(r"reparatur|austausch|\blcd\b|display\s*(?:tausch|wechsel|service)|akkutausch|\bservice\b|"
+                 r"ankauf|wir\s+kaufen|handyshop|werkstatt", title):
+        return "a repair service or buyer, not a phone"
     if re.search(r"hülle|\bcase\b|(?<!x )(?<!x)\bcover\b|panzerglas|schutzglas|schutzfolie|\bfolie|ladekabel|ladegerät|adapter|"
                  r"halterung|tasche|armband|magsafe|kameraschutz|ersatzteil|platine|backcover|attrappe|dummy|"
                  r"für\s+(?:das\s+|ein\s+)?(?:iphone|samsung|galaxy|pixel)|^(?:neue?r?s?\s+)?(?:akku|display|kabel)\b",
@@ -623,6 +626,10 @@ CONSOLE_EXTRAS = (r"controller|joy-?cons?\b|gamepad|lenkrad|wheel|\bcase\b|schal
                   r"(?:ps[1-5]|playstation|xbox|switch|nintendo)")
 
 
+RETRO_HANDHELD_GAMES = {"gba", "gba sp", "game boy", "game boy color", "ds lite", "3ds", "3ds xl", "2ds", "new 3ds xl",
+                        "new 2ds xl", "n64", "snes", "nes", "mega drive", "gamecube", "wii", "wii u", "ps1", "ps2"}
+
+
 @kind("console", "game consoles", ["konsolen-2786"], keys=[("model", "edition", "bundle"), ("model", "edition"), ("model",)],
       fields=["model", "edition", "bundle"],
       words=r"\b(?:ps[1-5]|playstation|xbox|switch|steam\s*deck|konsole|wii|gameboy|game\s*boy|3ds|rog\s*ally)\b")
@@ -639,6 +646,9 @@ def console(ad):
                                                                  head(title)):
         return "accessory or game, not a console"
     model = next((name for rx, name in CONSOLES if re.search(rx, title)), None)
+    if model in RETRO_HANDHELD_GAMES and re.search(r"\bpal\b|\bmodul\b|cartridge|\bcart\b|\bspiel|\bgame\b", title) \
+            and not re.search(r"konsole|console|handheld|system|\bgerät", title):
+        return "a game, not a console"
     edition = None
     if model in ("steam deck", "steam deck oled"):
         s = storage(ad, title, "-") or storage(ad, t, "-")
@@ -697,11 +707,15 @@ def audio_model(t):
     return "%s %s" % (brand, name)
 
 
+AUDIO_PARTS = (r"ladecase|ladebox|lade-?case|charging\s*case|\bcase\b|hülle|ersatz|\beinzeln|\blinks\b|\brechts\b|"
+               r"ohrpolster|polster|kabel|ständer|halterung|fernbedienung|netzteil|nadel|tonabnehmer|riemen")
+
+
 def audio_kind(name, about, cats, words, not_this):
     @kind(name, about, cats, keys=[("model",)], fields=["model"], words=words)
     def fn(ad):
         title = low_title(ad)
-        if re.search(not_this, title):
+        if re.search(not_this, title) or re.search(AUDIO_PARTS, head(title)):
             return "accessory or part"
         return dict(model=audio_model(title))
     return fn
@@ -744,7 +758,8 @@ def laptop(ad):
     reason = profiles.laptop(a)
     if reason:
         return reason
-    return dict(model=laptop_model(low_title(ad)), cpu=a.get("cpu"), gpu=a.get("gpu") or "igpu", ram=a.get("ram"))
+    gpu = a.get("gpu") or ("igpu" if a.get("cpu") else None)   # no dGPU named: integrated, if we know the CPU
+    return dict(model=laptop_model(low_title(ad)), cpu=a.get("cpu"), gpu=gpu, ram=a.get("ram"))
 
 
 @kind("pc", "desktop PCs", ["computer-tablets/pcs-5833"], keys=[("gpu", "cpu", "ram"), ("gpu", "cpu")],
