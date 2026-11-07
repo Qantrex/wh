@@ -15,9 +15,11 @@ BAD = (r"\bdefekt(?:e|er|es|em|en)?\b|\bbastler(?:gerät|geraet|stück|stueck|wa
        r"|(?:als |für |fuer )?ersatzteil(?:spender|träger|traeger|lager|gerät|geraet)\b|(?:als |für |fuer )ersatzteile?\b"
        r"|\bfür teile\b|\bfuer teile\b|\bkaputt\w*\b|\bgebrochen\w*\b|bootet nicht|startet nicht|\bwasserschaden\b"
        r"|display[- ]?riss|funktioniert nicht|nicht funktions|\bdefects?\b|\bbroken\b|not working|\bgesperrt\b"
-       r"|\baktivierungssperre\b|icloud[- ]?(?:sperre|gesperrt|lock)|\bmdm\b|bios[- ]?passwort")
+       r"|\baktivierungssperre\b|icloud[- ]?(?:sperre|gesperrt|lock)|\bmdm\b|bios[- ]?passwort"
+       r"|\b(?:ge|zer)sprungen\b|\bsprung\s+(?:im|in\s+der|am)\b|\briss\s+(?:im|in\s+der|am)\b"
+       r"|(?:display|(?<!panzer)(?<!schutz)glas|rückseite|backcover|scheibe)\s+(?:ist\s+)?(?:gerissen|gesprungen|zersprungen)")
 NEG_BEFORE = re.compile(r"\b(?:kein(?:e|er|es|em|en|erlei)?|ohne|nichts|frei von|weder|no)\s+(?:[\w-]+\s+){0,2}$"
-                        r"|\bnicht\s+$")
+                        r"|\bnicht\s+$|(?:panzer|schutz)glas\s+(?:ist\s+)?(?:\w+\s+)?$")
 NEG_AFTER = re.compile(r"^[^\n.;!]{0,50}\b(?:deaktiviert|entfernt|aufgehoben|abgemeldet|frei)\b")
 WANTED = r"^\s*(suche|kaufe|ankauf|wir kaufen)\b"
 SWAP_PHRASE = re.compile(r"\b(?:tausch\w*|tasch)\s+(?:auch\s+)?(?:gegen|mit)\b[^\n.!?;)]{0,90}\)?")
