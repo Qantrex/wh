@@ -1355,6 +1355,7 @@ class MarketExtractTests(unittest.TestCase):
         self.assertIsNotNone(mad("Nintendo Gameboy Advance Spider-Man GBA PAL", 10, kind="console")["junk"])
         self.assertIsNone(mad("Gameboy Advance SP Konsole PAL", 60, kind="console")["junk"])
         self.assertIsNotNone(mad("Apple Airpods 4 Ladecase", 40, kind="headphones")["junk"])
+        self.assertIsNone(mad("JBL Tune 500BT On-Ear Kopfhörer kabellos", 34, kind="headphones")["junk"])
         self.assertEqual(market.query_specs("", "laptop"), {})
 
     def test_tv_codes_sizes_and_parts(self):

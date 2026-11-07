@@ -708,7 +708,7 @@ def audio_model(t):
 
 
 AUDIO_PARTS = (r"ladecase|ladebox|lade-?case|charging\s*case|\bcase\b|hülle|ersatz|\beinzeln|\blinks\b|\brechts\b|"
-               r"ohrpolster|polster|kabel|ständer|halterung|fernbedienung|netzteil|nadel|tonabnehmer|riemen")
+               r"ohrpolster|polster|\\bkabel\\b|ständer|halterung|fernbedienung|netzteil|nadel|tonabnehmer|riemen")
 
 
 def audio_kind(name, about, cats, words, not_this):
