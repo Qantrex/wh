@@ -15,12 +15,28 @@ wh sweep --json --no-write              # the same as JSON for a script or a tim
 wh profiles                             # built-in profiles and templates a note's `wh-profile` can name
 wh doctor                               # check config, notes, skill install, templates, database and tools
 
+wh find 2x16gb ddr4 3200 --area wien,noe   # the best deals: ads below their market value, best first
+wh find tv 45-55 zoll                   # works for whole kinds too (sizes for tv/monitor)
+wh value "LG OLED55C1"                  # what an item (or an ad link) is worth used, and the ads behind it
+wh crawl --list                         # the categories behind the market values, and when they were last read
+wh watch add gpu --kind gpu --below 0.35   # a saved find; `wh watch run --json` reports new deals once (for a timer)
+
 wh deal <link> --for "a friend"         # AI: worth buying (for whom)? verdict, comparables, offer, questions
 wh advise                               # AI: should my live ads get a lower price? (one Claude call per ad, in parallel)
 wh hunt Laptop                          # AI: sweep a buy note, Claude writes the best picks into it
 ```
 
 The AI commands gather the data and ask `claude -p` (no tools, so it only reasons over what wh gives it) with the rules from the `willhaben` skill (`skill/willhaben/` in this repo, installed as `~/.claude/skills/willhaben`): the ground rules from `SKILL.md` plus `buying.md` for `deal` and `hunt`, or `selling.md` for `advise`. An old single-file `SKILL.md` still works (wh takes the matching sections from it), and without an installed skill wh uses the copy in this repo. `--no-ai` prints the data and the task instead, which is what Claude itself uses inside a session.
+
+## Market values
+
+`find`, `value` and `watch` know 18 kinds of items: ram, gpu, cpu, mainboard, psu, disk, monitor, tv, laptop, pc, server, phone, tablet, console, headphones, speakers, hifi and turntable (`market.py`). Each kind reads its willhaben categories whole (`wh crawl`: about 180k ads in 4 minutes at the rate limit, then only the new ads; `find` and `value` crawl what they need by themselves, a full crawl at most once every 20 hours) and turns every ad into specs and *keys*: `ddr4 · dimm · 2x16 · 3200`, then `ddr4 · dimm · 2x16`, then `ddr4 · dimm · 32 GB`.
+
+- **Market value** = the weighted median asking price of ads with the same key over the last 90 days, at the most specific key with enough sellers. One vote per seller (dealers repost), outliers (below a third or above three times the median) dropped, ads that sat unsold for weeks or are gone count a bit less, dealers' new stock and defects not at all. The confidence (high/medium/low) comes from the number of sellers and how far apart their prices are.
+- **A deal** is an ad below that value. `find` shows the best first and checks the top ads in full (still online? does the description match? seller's account age, photos). Ads more than 55 % below value are listed separately unless the seller gives a reason ("Notverkauf", "muss weg", Umzug …): they're as often parts, defects or scams as they're bargains, so read them, but they're never hidden.
+- Ads without a clear key (no model, size or capacity in the text) get no value instead of a wrong one. Accessories and parts in the categories (controllers, cases, TV power boards …) are recognised and left out.
+- **Watches** (`~/.config/wh/watches.toml`, edited with `wh watch add/rm`): `wh watch run` reports matching ads that are new or cheaper since the watch's last run and at least `below` (default 25 %) under value, each once. The ads of a category's first full crawl are the starting stock, not news. `--json` is made for a timer or an agent.
+- Asking prices aren't selling prices, and the value is only as good as the key: check the comparables (`wh value <ad link>` lists them).
 
 ## Install
 
@@ -49,6 +65,7 @@ If willhaben pushes back (HTTP 403/429/503 or a Cloudflare challenge page), ever
 ## Files
 
 - `wh`: the command (Python 3.11+, standard library only). Linked as `~/.local/bin/wh`.
+- `market.py`: the kinds of items (categories, spec extractors, keys) and the market value maths, pure Python without network or database.
 - `profiles.py`: per-category knowledge that turns ads into comparable specs and filters junk: the built-in profiles (`laptop`, `pc`, `server`, `hue`) and the template engine. A buy note picks one with `wh-profile: laptop`.
 - `templates/example.toml`: a sample template. Your own live in `~/.config/wh/templates/` (see [Templates](#templates)).
 - `skill/willhaben/`: the Claude skill. `SKILL.md` (commands + ground rules) plus `buying.md`, `selling.md` and `data.md`, read when needed.

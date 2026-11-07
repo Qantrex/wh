@@ -20,11 +20,16 @@ Setup: the Install section of the `wh` README (github.com/Qantrex/wh); `wh docto
 | `wh photos <id> <dir>` | downloads the photos, converting WebP to JPEG |
 | `wh status [notes]` | is each open note's `ad:` still online, at what price? |
 | `wh sweep [notes] [--json] [--no-write]` | runs the `search:` URLs of open buy/wanted notes and writes new ads, price cuts, gone ads and a shortlist into the note's `<!-- wh:sweep -->` block; `--json` prints the same for scripts, `--no-write` leaves the notes alone |
+| `wh find <what> [--kind K] [--size 45-55] [--max N] [--area wien,noe] [--all] [--json]` | **best deals for an item:** ads below their market value, best first, e.g. `wh find 2x16gb ddr4 3200`, `wh find tv 45-55 zoll`. Checks the top 8 ads in full |
+| `wh value <what or ad link> [--price N] [--json]` | what an item or ad is worth used on willhaben: value, middle half, sellers, confidence, the ads behind it |
+| `wh crawl [kinds] [--full\|--new\|--list]` | reads whole categories into the database (the market values come from them); `find`/`value` do it by themselves |
+| `wh watch add NAME <what> [--kind K] [--below 0.25]` / `list` / `rm` / `run [--json]` | saved finds; `run` reports deals that are new or cheaper since the last run, once each |
 | `wh deal <id or link> [--compare "words"] [--question "…"]` | **AI:** verdict, comparable ads, a suggested offer, questions for the seller |
 | `wh advise [notes]` | **AI:** should your live ads (sell notes) get a lower price? |
 | `wh hunt <note>` | **AI:** sweep, then Claude writes the best picks into the note's `<!-- wh:picks -->` block |
 
 - **Inside a Claude session,** run the AI commands with `--no-ai`. That prints the gathered data and the task, and you do the judging yourself with the rules below. Without `--no-ai`, wh calls `claude -p` (no tools, about 1 minute); that is for a terminal.
+- **"Find me the best deal on X"** → `wh find <X>` (add `--kind` if it guesses wrong, `--area wien,noe` to mark pickup). Then judge the top ads yourself with [buying.md](buying.md): read the full ad (`wh ad`) of the ones you'd pick. Kinds with a market value: ram, gpu, cpu, mainboard, psu, disk, monitor, tv, laptop, pc, server, phone, tablet, console, headphones, speakers, hifi, turntable. Anything else: `wh search` and judge the comparables yourself.
 - **Profiles** turn ads into comparable specs, filter junk and rank the sweep's shortlist. A buy note picks one with `wh-profile: <name>`; `wh profiles` lists them.
   - New kind of search: add a template, not a script ([data.md](data.md)).
 
