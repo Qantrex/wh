@@ -97,6 +97,8 @@ class ProfilesTests(unittest.TestCase):
             "Aus der iCloud entfernt, hat keine Aktivierungssperre.",
             "Die iCloud-/Aktivierungssperre („Wo ist?“) wurde ordnungsgemäß deaktiviert.",
             "Display defektfrei, SIM ungesperrt, kein Wasserschaden, kein MDM.",
+            "Display nicht gesprungen, keine Risse.",
+            "Mit Panzerglas & Hülle. Das Panzerglas ist gesprungen, das Display darunter ist heil.",
             "iFlight Nazgul Komplettset + RC2 + Ersatzteile inklusive",
             "Akku kann bei Bedarf ersetzt werden, sofern ein passendes Ersatzteil gefunden wird.",
         ]
@@ -113,6 +115,8 @@ class ProfilesTests(unittest.TestCase):
             "Verkaufe Laptop als Ersatzteil / für Bastler",
             "Ersatzteilspender ohne Garantie",
             "Gerät hat BIOS-Passwort",
+            "Display gesprungen, Rückseite gesprungen, Akku 75 %",
+            "Kleiner Riss im Display",
         ]
         for body in dirty_cases:
             ad = {"id": 1, "title": "Laptop Test", "body": body, "price": 200}
