@@ -10,6 +10,7 @@ your notes folder (WH_NOTES or `notes` in ~/.config/wh/config.toml). Only public
 """
 import argparse
 import gzip
+import hashlib
 import html
 import http.client
 import json
@@ -33,6 +34,7 @@ from datetime import date, datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import profiles  # noqa: E402
+import market  # noqa: E402
 
 BASE = "https://www.willhaben.at"
 try:
@@ -314,15 +316,32 @@ create table if not exists details (id integer primary key, fetched text, data t
 create index if not exists hits_run on hits (run);
 create index if not exists prices_id on prices (id);
 create index if not exists runs_key on runs (key);
+create table if not exists products (id integer primary key, sig text, data text, at text);
+create table if not exists alerts (watch text, id integer, price real, at text, primary key (watch, id));
+create table if not exists watch_runs (watch text primary key, at text);
+create table if not exists specs (id integer, kind text, sig text, data text, primary key (id, kind));
 """
+# Columns added after the first release: a database from an older wh gets them on open (ALTER TABLE, no data lost).
+# tattrs: willhaben's filter values of the ad ("[21;23, 2535;2537]": condition, handover, size bucket, brand …),
+# seller: the seller's org id (one seller's reposts count once in a market value), p2p: PayLivery (shipping with
+# buyer protection), coords: "lat,lon".
+AD_COLUMNS = (("tattrs", "text"), ("seller", "text"), ("p2p", "integer"), ("coords", "text"))
+AD_FIELDS = ("id", "title", "price", "loc", "state", "postcode", "private", "published", "url", "body", "cats") + tuple(
+    n for n, _ in AD_COLUMNS)
 
 
 def db():
     os.makedirs(os.path.dirname(DB), exist_ok=True)
-    c = sqlite3.connect(DB, timeout=10)
+    c = sqlite3.connect(DB, timeout=30)
     c.row_factory = sqlite3.Row
     c.execute("pragma journal_mode=wal")
     c.executescript(SCHEMA)
+    have = {r["name"] for r in c.execute("pragma table_info(ads)")}
+    for name, typ in AD_COLUMNS:
+        if name not in have:
+            c.execute("alter table ads add column %s %s" % (name, typ))
+    c.execute("create index if not exists ads_last_seen on ads (last_seen)")
+    c.commit()
     return c
 
 
@@ -334,19 +353,22 @@ def summary(a):
                 loc=g("LOCATION"), state=g("STATE"), postcode=g("POSTCODE"), private=int(g("ISPRIVATE") == "1"),
                 published=g("PUBLISHED_String")[:10],
                 url=(BASE + "/iad/" + seo.lstrip("/")) if seo else "%s/iad/object?adId=%s" % (BASE, a["id"]),
-                body=clean(g("BODY_DYN")), cats=",".join(at.get("categorytreeids") or []))
+                body=clean(g("BODY_DYN")), cats=",".join(at.get("categorytreeids") or []),
+                tattrs=g("categorytreeattributeids"), seller=g("ORGID") or None,
+                p2p=int(g("p2penabled") == "true"), coords=g("COORDINATES") or None)
 
 
 def store(c, ads, t):
+    cols = ",".join(AD_FIELDS)
     for a in ads:
+        a = dict({k: None for k in AD_FIELDS}, **a)
         old = c.execute("select price from ads where id=?", (a["id"],)).fetchone()
         if old is None:
-            c.execute("insert into ads values (:id,:title,:price,:loc,:state,:postcode,:private,:published,:url,:body,"
-                      ":cats,:t,:t)", dict(a, t=t))
+            c.execute("insert into ads (%s, first_seen, last_seen) values (%s, :t, :t)"
+                      % (cols, ",".join(":" + k for k in AD_FIELDS)), dict(a, t=t))
         else:
-            c.execute("update ads set title=:title, price=:price, loc=:loc, state=:state, postcode=:postcode,"
-                      " private=:private, published=:published, url=:url, body=:body, cats=:cats, last_seen=:t"
-                      " where id=:id", dict(a, t=t))
+            c.execute("update ads set %s, last_seen=:t where id=:id"
+                      % ", ".join("%s=:%s" % (k, k) for k in AD_FIELDS if k != "id"), dict(a, t=t))
         if old is None or old["price"] != a["price"]:
             c.execute("insert into prices values (?,?,?)", (a["id"], a["price"], t))
 
@@ -679,7 +701,7 @@ def table(ads, profile=None, md=False, extra=None):
     return "\n".join(fmt(r) for r in rows)
 
 
-def market(ads):
+def market_line(ads):
     ps = sorted(a["price"] for a in ads if a.get("price"))
     if not ps:
         return "no prices"
@@ -843,7 +865,7 @@ def cmd_search(a):
         print(json.dumps(ads[:a.limit], ensure_ascii=False, indent=1))
         return
     print(table(ads[:a.limit], a.profile, a.md))
-    log("%d found, %d read%s; %s" % (found, len(ads), "" if complete else " (raise --pages for all)", market(ads)))
+    log("%d found, %d read%s; %s" % (found, len(ads), "" if complete else " (raise --pages for all)", market_line(ads)))
 
 
 def cmd_ad(a):
@@ -1053,7 +1075,7 @@ def sweep_report(c, plan, fetched, limit, detail_count=0):
     gone_rows = [dict(r) for i in sorted(gone_ids - set(allads))
                  for r in [c.execute("select * from ads where id=?", (i,)).fetchone()] if r]
     gone = [g for g in profiles.annotate(attach_details(c, gone_rows), profile) if not g["junk"]]
-    mk = market(good)
+    mk = market_line(good)
     near = (" · %d in %s" % (sum(1 for x in good if x["near"]), area_label(plan["near"]))) if plan["near"] else ""
     n = len(plan["items"])
     out = ["## Sweep", "", "*wh sweep %s · %d search%s · %s%s · %d new · %d price cuts · %d gone*"
@@ -1145,7 +1167,7 @@ def cmd_deal(a):
     words = a.compare or comp_words(d["title"])
     comps, found = comparables(c, d, words, a.pages, a.profile)
     data = who_block(a.for_) + "\n\n## The ad\n\n%s\n\n## Comparable ads on willhaben now\n\nSearch \"%s\": %s; %s. Some may not be " \
-           "truly comparable: judge from the titles.\n\n%s" % (fmt_details(d, c), words, found, market(comps),
+           "truly comparable: judge from the titles.\n\n%s" % (fmt_details(d, c), words, found, market_line(comps),
                                                               table(comps[:a.limit], a.profile, True))
     task = ("Should I buy this ad? Start with one verdict line: **good deal / fair / overpriced / walk away / likely "
             "scam**. Then: where the price sits against the comparable ads (with numbers), the total cost, anything in "
@@ -1184,7 +1206,7 @@ def cmd_advise(a):
         profile = note_profile(p, f)
         comps, found = comparables(c, d, words, a.pages, profile, fetched=r)
         data = ("## My note\n\n%s\n\n## My ad now\n\n%s\n\n## Comparable ads on willhaben now\n\nSearch \"%s\": %s; "
-                "%s.\n\n%s" % (strip_blocks(text), fmt_details(d, c), words, found, market(comps),
+                "%s.\n\n%s" % (strip_blocks(text), fmt_details(d, c), words, found, market_line(comps),
                                table(comps[:a.limit], profile, True)))
         jobs.append((task, data, "sell"))
     if a.no_ai:
@@ -1282,6 +1304,565 @@ def cmd_facets(a):
                                            link or "%s=%s" % (x.get("urlParameterName"), x.get("value"))))
             if len(vals) > a.limit:
                 print("          … %d more" % (len(vals) - a.limit))
+
+
+# ---- market value: crawl, find, value, watch -----------------------------------------------------------------
+
+FULL_CRAWL_H = 20                                          # a category's full crawl counts as fresh this long
+
+
+def crawl_key(path):
+    return "crawl:" + path
+
+
+def last_full_crawl(c, path):
+    r = c.execute("select max(at) a from runs where key=? and complete=1", (crawl_key(path),)).fetchone()
+    return r["a"] if r else None
+
+
+def record_crawl(c, url, path, found, complete, t):
+    c.execute("insert into runs (key, url, at, found, complete) values (?,?,?,?,?)",
+              (crawl_key(path), url, t, found, int(complete)))
+
+
+def crawl_new(c, paths, max_pages=10):
+    """Read each category from its newest ads until a page has nothing new or changed (at most max_pages pages).
+    Categories run side by side, pages within one one after the other. Returns {path: (found, ads read)}."""
+    known = {}
+    for p in paths:
+        cid = re.search(r"(\d+)$", p).group(1)
+        known[p] = {r["id"]: r["price"] for r in c.execute("select id, price from ads where cats like ?",
+                                                            ("%" + cid + "%",))}
+
+    def one(p):
+        url, got, found = search_url(url=p), [], 0
+        for page in range(1, max_pages + 1):
+            r = read_page("%s&page=%d" % (url, page))
+            if not isinstance(r, tuple):
+                break
+            found, ads = r
+            got += ads
+            if not any(known[p].get(a["id"], -1) != a["price"] for a in ads) or page * 200 >= found:
+                break
+        return found, got
+    t = now()
+    out = {}
+    for p, r in zip(paths, pmap(one, paths)):
+        if isinstance(r, FetchError):
+            log("  %s: %s" % (p, r))
+            continue
+        store(c, r[1], t)
+        record_crawl(c, search_url(url=p), p, r[0], False, t)
+        out[p] = r
+        log("  %s: %d new or changed of %d read" % (p.rsplit("/", 1)[-1], sum(
+            1 for a in r[1] if known[p].get(a["id"], -1) != a["price"]), len(r[1])))
+    c.commit()
+    return out
+
+
+def crawl(c, kinds, full=None, max_pages=400):
+    """Bring the database up to date for these kinds: a full crawl of every category whose last full crawl is older
+    than FULL_CRAWL_H hours (or all of them with full=True), only the new ads of the others (none with full=False)."""
+    paths = list(dict.fromkeys(p for k in kinds for p in market.KINDS[k]["cats"]))
+    whole, fresh = [], []
+    for p in paths:
+        last = last_full_crawl(c, p)
+        stale = full is True or (full is None and (not last or hours_since(last) > FULL_CRAWL_H))
+        (whole if stale else fresh).append(p)
+    if whole:
+        log("full crawl of %d categor%s (once a day; about 1 s per 1000 ads):" % (len(whole), "y" if len(whole) == 1 else "ies"))
+        t = now()
+        res = run_searches(c, [(search_url(url=p), None) for p in whole], max_pages, record=False)
+        for p, r in zip(whole, res):
+            record_crawl(c, search_url(url=p), p, r["found"], r["complete"], t)
+        c.commit()
+    if fresh:
+        log("new ads in %d categor%s:" % (len(fresh), "y" if len(fresh) == 1 else "ies"))
+        crawl_new(c, fresh)
+
+
+def online_since(c, name):
+    """Ads seen at or after this time are taken as still online: the oldest of the kind's last full crawls."""
+    ts = [last_full_crawl(c, p) for p in market.KINDS[name]["cats"]]
+    return min(ts) if ts and all(ts) else None
+
+
+_ROWS = {}                                                 # kind -> annotated rows, for one run (watch run)
+SPEC_VER = ""
+
+
+def spec_sig(r):
+    """What an ad's specs depend on: its text, filters and whether it has a price, plus the extractor code itself
+    (market.py and profiles.py), so a changed extractor recomputes every ad."""
+    global SPEC_VER
+    if not SPEC_VER:
+        h = hashlib.sha1()
+        for mod in (market, profiles):
+            with open(mod.__file__, "rb") as f:
+                h.update(f.read())
+        SPEC_VER = h.hexdigest()[:12]
+    raw = json.dumps([r.get("title"), r.get("body"), r.get("descr"), r.get("info"), r.get("tattrs"), bool(r.get("price")),
+                      r.get("cats"), r.get("private"), SPEC_VER], ensure_ascii=False)
+    return hashlib.sha1(raw.encode()).hexdigest()[:16]
+
+
+def kind_rows(c, name, days=market.VALUE_DAYS, cache=False):
+    """Every ad of a kind seen in the last `days` days, annotated with its specs (market.specs). cache=True keeps
+    them for the rest of the run (several watches of one kind); copies go out, so callers may change them."""
+    if cache and name in _ROWS:
+        return [dict(r) for r in _ROWS[name]]
+    k = market.KINDS[name]
+    since = datetime.fromtimestamp(time.time() - days * 86400, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    rows = [dict(r) for r in c.execute("select * from ads where last_seen >= ? and (%s)" % " or ".join(
+        "cats like ?" for _ in k["ids"]), [since] + ["%" + i + "%" for i in k["ids"]])]
+    rows = attach_details(c, [r for r in rows if market.in_cats(r, k["ids"])])
+    known = {r["id"]: (r["sig"], r["data"]) for r in c.execute("select id, sig, data from specs where kind=?", (name,))}
+    todo = []
+    for r in rows:                                          # specs are cached per ad until the ad or the code changes
+        sig = spec_sig(r)
+        hit = known.get(r["id"])
+        if hit and hit[0] == sig:
+            r.update(json.loads(hit[1]))
+        else:
+            market.specs(r, name)
+            todo.append((r["id"], name, sig, json.dumps({k: r[k] for k in ("junk", "specs", "cond")}, ensure_ascii=False)))
+    if todo:
+        c.executemany("insert or replace into specs values (?,?,?,?)", todo)
+        c.commit()
+    if cache:
+        _ROWS[name] = [dict(r) for r in rows]
+    return rows
+
+
+def comps_for(idx, rows_by_id, name, est, exclude):
+    """Up to 5 ads behind a market value, the ones nearest the value first."""
+    if not est:
+        return []
+    lvl = market.KINDS[name]["keys"].index(est["level"])
+    ids = {i for _, _, _, i in idx.get((lvl, est["key"]), []) if i != exclude}
+    ads = sorted((rows_by_id[i] for i in ids if i in rows_by_id), key=lambda a: abs(a["price"] - est["value"]))
+    return [dict(id=a["id"], title=a["title"], price=a["price"], url=a["url"], last_seen=(a.get("last_seen") or "")[:10])
+            for a in ads[:5]]
+
+
+def seller_flags(d):
+    flags = []
+    since = d.get("seller_since") or ""
+    if re.fullmatch(r"\d{4}-\d{2}", since):
+        y, m = map(int, since.split("-"))
+        t = date.today()
+        if (t.year - y) * 12 + t.month - m <= 2:
+            flags.append("seller joined %s" % since)
+    if not d.get("images"):
+        flags.append("no photos")
+    return flags
+
+
+def find_deals(c, name, want, size=None, pmin=None, pmax=None, states=(), details_n=8, only=None, cache=False):
+    """Online ads of a kind that match `want` (market.matches), each with its market value, discount and the ads
+    behind the value, best deal first. The top `details_n` get their full ad checked (status, description, seller).
+    `only`: a set of ad ids to limit the candidates to (watch: new or cheaper since last time)."""
+    rows = kind_rows(c, name, cache=cache)
+    idx = market.build_index(rows, name)
+    by_id = {r["id"]: r for r in rows}
+    cut = online_since(c, name)
+    cands = []
+    for r in rows:
+        if r["junk"] or not r.get("price") or (cut and (r.get("last_seen") or "") < cut):
+            continue
+        if not cut and hours_since(r["last_seen"]) > 30:
+            continue
+        if (pmin is not None and r["price"] < pmin) or (pmax is not None and r["price"] > pmax):
+            continue
+        if only is not None and r["id"] not in only:
+            continue
+        if market.matches(r["specs"], want, size):
+            cands.append(r)
+
+    def rate(r):
+        est = market.value_of(idx, name, r["specs"], exclude=r["id"])
+        r.update(market.deal(r, est))
+        r["est"] = est
+    for r in cands:
+        rate(r)
+    rank = lambda r: (r["score"] is None, market.odd(r),   # noqa: E731
+                      -(r["score"] or 0), r["price"])          # unexplained "too good to be true" after the plain deals
+    cands.sort(key=rank)
+    if details_n:
+        top = [r for r in cands if r["score"] is not None][:details_n]
+        got = details_many(c, [r["id"] for r in top])
+        for r in top:
+            d = got.get(r["id"])
+            if isinstance(d, FetchError) or d is None:
+                continue
+            if d["status"] != "active":
+                r["junk"] = "ad is %s" % d["status"]
+                continue
+            r.update(descr=d["descr"], info=d.get("info") or [], seller_name=d.get("seller"),
+                     seller_since=d.get("seller_since"), seller_ads=d.get("seller_ads"),
+                     first_published=d.get("first_published"), photos=len(d.get("images") or []),
+                     price=d["price"] if d.get("price") else r["price"])
+            before = dict(r["specs"])
+            market.specs(r, name)                          # again, now with the full description
+            if not r["junk"] and not market.matches(r["specs"], want, size):
+                r["junk"] = "full ad doesn't match (%s)" % market.label(name, r["specs"])
+            if r["junk"]:
+                continue
+            if r["specs"] != before:
+                rate(r)
+            r["flags"] = r.get("flags", []) + seller_flags(d)
+            r["checked"] = True
+        cands = [r for r in cands if not r["junk"]]
+        cands.sort(key=rank)
+    mark_near(cands, set(states or ()))
+    for r in cands:
+        r["comps"] = comps_for(idx, by_id, name, r.get("est"), r["id"])
+    return cands, rows, idx
+
+
+def deal_json(r, name):
+    est = r.get("est") or {}
+    d = {k: r.get(k) for k in ("id", "title", "price", "loc", "state", "url", "published", "cond", "value", "discount",
+                               "score", "flags", "urgent", "comps")}
+    d.update(private=bool(r.get("private")), ships=market.ships(r), specs=market.label(name, r["specs"]),
+             conf=est.get("conf"), value_from=dict(n=est.get("n"), p25=est.get("p25"), p75=est.get("p75"),
+                                                   key=" · ".join(str(x) for x in est.get("key", ()) if x != "-"))
+             if est else None)
+    if r.get("near") is not None:
+        d["near"] = r["near"]
+    if r.get("checked"):
+        d.update(checked=True, seller=r.get("seller_name"), seller_since=r.get("seller_since"),
+                 seller_ads=r.get("seller_ads"), photos=r.get("photos"), online_since=r.get("first_published"),
+                 description=cell(r.get("descr"), 1500))
+    return d
+
+
+def pct(x):
+    return "" if x is None else "%+d %%" % round(-100 * x)
+
+
+def deal_table(rows, name, md=False):
+    head = ["Price", "Value", "vs value", "Conf", "Ad", "Where", "P/D", "Cond", "Specs"]
+    has_near = any(r.get("near") is not None for r in rows)
+    if has_near:
+        head.insert(6, "Near")
+    out = []
+    for r in rows:
+        cols = [euro(r["price"]), euro(r.get("value")), pct(r.get("discount")), (r.get("est") or {}).get("conf") or "",
+                ("[%s](%s)" % (link_text(r["title"], 60), r["url"])) if md else r["title"], r.get("loc") or "",
+                "P" if r.get("private") else "D", r.get("cond") or "", market.label(name, r["specs"])]
+        if has_near:
+            cols.insert(6, "✓" if r.get("near") else "")
+        if r.get("urgent"):
+            cols[4] = "⏱ " + cols[4]
+        elif r.get("flags") and any("far below" in f or "joined" in f for f in r["flags"]):
+            cols[4] = "⚠ " + cols[4]
+        out.append(cols)
+    if md:
+        return "\n".join(["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+                         + ["| " + " | ".join(cell(x) for x in r) + " |" for r in out])
+    widths = [7, 7, 8, 6, 50, 20] + ([4] if has_near else []) + [3, 9, 40]
+    fmt = lambda r: "  ".join(cell(x, w).ljust(w) for x, w in zip(r, widths)).rstrip()  # noqa: E731
+    return "\n".join([fmt(head)] + [fmt(r) + "\n    " + x["url"] for r, x in zip(out, rows)])
+
+
+def resolve(a, query):
+    """(kind, wanted specs, size range) for a query and the --kind/--size options."""
+    name = a.kind or market.guess_kind(query)
+    if not name:
+        raise WhError("can't tell what kind of item %r is; pass --kind (%s)" % (query, ", ".join(sorted(market.KINDS))))
+    want = market.query_specs(query, name)
+    size = None
+    if name in ("tv", "monitor"):                       # a size in a find is a range: 45-55, or 55 → 55-55
+        size = market.size_range(a.size or query) if (a.size or market.size_range(query)) else None
+        one = want.pop("size", None)
+        size = size or ((one, one) if one else None)
+    return name, want, size
+
+
+def cmd_find(a):
+    c = db()
+    query = " ".join(a.words)
+    name, want, size = resolve(a, query)
+    if not a.no_crawl:
+        crawl(c, [name])
+    cands, rows, idx = find_deals(c, name, want, size, a.min, a.max, area(a.area), a.details)
+    own = market.value_of(idx, name, want) if want else None
+    shown = [r for r in cands if a.all or (r["score"] is not None and r["discount"] >= a.below)][:a.limit]
+    head = dict(query=query, kind=name, wants=market.label(name, want) or "any", size=size,
+                market=dict(value=own["value"], p25=own["p25"], p75=own["p75"], n=own["n"], conf=own["conf"],
+                            key=" · ".join(str(x) for x in own["key"] if x != "-")) if own else None,
+                matching=len(cands), valued=sum(1 for r in cands if r["score"] is not None))
+    if a.json:
+        print(json.dumps(dict(head, deals=[deal_json(r, name) for r in shown]), ensure_ascii=False, indent=1))
+        return
+    print("%s → %s: %s%s" % (query or "(everything)", name, head["wants"],
+                             " · %d–%d\"" % size if size else ""))
+    if own:
+        print("Market value: %s (middle half %s–%s, %d sellers, %s confidence)" % (
+            euro(own["value"]), euro(own["p25"]), euro(own["p75"]), own["n"], own["conf"]))
+    print("%d matching ads online, %d with a market value; %d at least %d %% below it%s\n" % (
+        head["matching"], head["valued"], len(shown) if not a.all else sum(
+            1 for r in cands if r["score"] is not None and r["discount"] >= a.below), round(100 * a.below),
+        "" if not a.all else " (showing all)"))
+    plain = [r for r in shown if not market.odd(r)]
+    odd = [r for r in shown if market.odd(r)]
+    print(deal_table(plain, name, a.md) if plain else "No deals right now.")
+    if odd:
+        print("\nFar below value without a reason given (more than %d %%): a real bargain, or a part, a defect the "
+              "title doesn't say, the wrong model or a scam. Read the ad first.\n" % round(100 * market.TOO_GOOD))
+        print(deal_table(odd, name, a.md))
+    for r in shown:
+        if r.get("flags"):
+            log("  %s %s: %s" % (euro(r["price"]), cell(r["title"], 40), "; ".join(r["flags"])))
+
+
+def cmd_value(a):
+    c = db()
+    target = " ".join(a.words)
+    try:
+        i = ad_id(target) if re.search(r"willhaben|adId=|^\s*\d{6,}\s*$", target) else None
+    except WhError:
+        i = None
+    price = a.price
+    if i:
+        d = details(c, i)
+        row = c.execute("select * from ads where id=?", (i,)).fetchone()
+        ad = dict(row) if row else dict(id=i, title=d.get("title"), price=d.get("price"), cats="", body="")
+        ad.update(descr=d.get("descr"), info=d.get("info") or [], price=d.get("price") or ad.get("price"))
+        name = a.kind or market.kind_of(ad)
+        if not name:
+            raise WhError("ad %d is not in a category wh values (%s); pass --kind" % (i, ", ".join(sorted(market.KINDS))))
+        market.specs(ad, name)
+        if ad["junk"]:
+            log("note: as an item of this kind, the ad looks like junk: %s" % ad["junk"])
+        want, label, exclude = ad["specs"], ad["title"], i
+        price = price if price is not None else ad.get("price")
+    else:
+        name, want, _ = resolve(a, target)
+        label, exclude = target, None
+    if not a.no_crawl:
+        crawl(c, [name])
+    rows = kind_rows(c, name)
+    idx = market.build_index(rows, name)
+    by_id = {r["id"]: r for r in rows}
+    levels = []
+    for lvl, key in market.keys(name, want):
+        est = market.estimate(idx.get((lvl, key), []), exclude)
+        if est:
+            est.update(level=market.KINDS[name]["keys"][lvl], key=key)
+            levels.append(est)
+    best = market.value_of(idx, name, want, exclude)
+    out = dict(item=label, kind=name, specs=market.label(name, want), price=price,
+               value=best and {k: best[k] for k in ("value", "p25", "p75", "n", "conf", "spread")},
+               discount=round(1 - price / best["value"], 3) if best and price else None,
+               levels=[dict(key=" · ".join(str(x) for x in e["key"] if x != "-"), value=e["value"], p25=e["p25"],
+                            p75=e["p75"], n=e["n"], conf=e["conf"]) for e in levels],
+               comps=comps_for(idx, by_id, name, best, exclude))
+    if a.json:
+        print(json.dumps(out, ensure_ascii=False, indent=1))
+        return
+    print("%s → %s: %s" % (label, name, out["specs"] or "?"))
+    if not best:
+        print("No market value: fewer than %d sellers with the same item in the last %d days." % (
+            market.MIN_SELLERS, market.VALUE_DAYS))
+        return
+    print("Market value %s (middle half %s–%s, %d sellers, %s confidence)" % (
+        euro(best["value"]), euro(best["p25"]), euro(best["p75"]), best["n"], best["conf"]))
+    if price:
+        print("Price %s is %s against it" % (euro(price), pct(out["discount"])))
+    print("\nBy how exactly the item matches (most exact first):")
+    for e in out["levels"]:
+        print("  %-48s %8s  (%s–%s, %d sellers, %s)" % (cell(e["key"], 48), euro(e["value"]), euro(e["p25"]),
+                                                       euro(e["p75"]), e["n"], e["conf"]))
+    print("\nAds behind it:")
+    for x in out["comps"]:
+        print("  %7s  %s  (seen %s)\n           %s" % (euro(x["price"]), cell(x["title"], 60), x["last_seen"], x["url"]))
+
+
+def cmd_crawl(a):
+    c = db()
+    kinds = a.kinds or sorted(market.KINDS)
+    bad = [k for k in kinds if k not in market.KINDS]
+    if bad:
+        raise WhError("unknown kind %s; known: %s" % (", ".join(bad), ", ".join(sorted(market.KINDS))))
+    if a.list:
+        for k in kinds:
+            K = market.KINDS[k]
+            for p in K["cats"]:
+                cid = re.search(r"(\d+)$", p).group(1)
+                n = c.execute("select count(*) from ads where cats like ?", ("%" + cid + "%",)).fetchone()[0]
+                print("%-11s %-58s %7d ads  full crawl %s" % (k, p, n, last_full_crawl(c, p) or "never"))
+        return
+    t = time.time()
+    crawl(c, kinds, full=True if a.full else (False if a.new else None))
+    log("done in %.0f s" % (time.time() - t))
+
+
+# ---- watches: saved finds that report new deals once -------------------------------------------------------------
+
+WATCHES = os.path.join(os.path.dirname(CONFIG_PATH), "watches.toml")
+WATCH_KEYS = {"name", "query", "kind", "size", "min", "max", "below", "conf", "area", "for"}
+
+
+def load_watches(path=None):
+    path = path or WATCHES
+    try:
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+    except FileNotFoundError:
+        return []
+    except tomllib.TOMLDecodeError as e:
+        raise WhError("%s: %s" % (path, e))
+    out = []
+    for w in data.get("watch", []):
+        bad = set(w) - WATCH_KEYS
+        if bad or not w.get("name") or "query" not in w:
+            raise WhError("%s: each [[watch]] needs `name` and `query`%s" % (
+                path, "; unknown keys: %s" % ", ".join(sorted(bad)) if bad else ""))
+        if w.get("kind") and w["kind"] not in market.KINDS:
+            raise WhError("%s: watch %s: unknown kind %r" % (path, w["name"], w["kind"]))
+        out.append(w)
+    return out
+
+
+def toml_value(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return repr(v)
+    return json.dumps(str(v), ensure_ascii=False)
+
+
+def save_watches(ws, path=None):
+    path = path or WATCHES
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    text = "# wh watches: saved `wh find` searches; `wh watch run` reports new deals once (wh watch add/rm edit this)\n"
+    for w in ws:
+        text += "\n[[watch]]\n" + "".join("%s = %s\n" % (k, toml_value(w[k])) for k in
+                                          ("name", "query", "kind", "size", "min", "max", "below", "conf", "area", "for")
+                                          if k == "query" or w.get(k) not in (None, ""))
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".wh-", suffix=".tmp")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def first_full_crawl(c, name):
+    """When every category of a kind had been crawled in full once: ads first seen up to then are the starting
+    stock, not new ads."""
+    ts = []
+    for p in market.KINDS[name]["cats"]:
+        r = c.execute("select min(at) a from runs where key=? and complete=1", (crawl_key(p),)).fetchone()
+        ts.append(r["a"] if r else None)
+    return max(ts) if ts and all(ts) else None
+
+
+def changed_since(c, watch, name):
+    """(time, strict): a watch reports what's new or cheaper since its last run (ads seen at that second count, the
+    alerts table keeps them from coming twice); the first run looks back a day, never into the kind's first full
+    crawl."""
+    r = c.execute("select at from watch_runs where watch=?", (watch,)).fetchone()
+    since = r["at"] if r else datetime.fromtimestamp(time.time() - 86400, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    base = first_full_crawl(c, name)
+    return (base, True) if base and base >= since else (since, False)   # strict: the first crawl's own ads are stock
+
+
+def run_watch(c, w, details_n, record=True):
+    """New deals for one watch: matching ads at least `below` under value with at least `conf` confidence that
+    weren't reported yet (or are cheaper now than when they were)."""
+    q = argparse.Namespace(kind=w.get("kind"), size=w.get("size"))
+    name, want, size = resolve(q, w["query"])
+    below = float(w.get("below", 0.25))
+    order = ["low", "medium", "high"]
+    min_conf = order.index(w.get("conf", "medium"))
+    t0 = now()
+    since, strict = changed_since(c, w["name"], name)
+    rows = kind_rows(c, name, cache=True)
+    new = {r["id"] for r in rows if (r.get("first_seen") or "") > since or (not strict and r.get("first_seen") == since)}
+    before = last_prices(c, [r["id"] for r in rows if r["id"] not in new], since)
+    cheaper = {r["id"] for r in rows if r["id"] in before and before[r["id"]] and r.get("price")
+               and r["price"] < before[r["id"]]}
+    cands, rows, idx = find_deals(c, name, want, size, w.get("min"), w.get("max"), area(w.get("area")), 0,
+                                  only=new | cheaper, cache=True)
+    seen = {r["id"]: r["price"] for r in c.execute("select id, price from alerts where watch=?", (w["name"],))}
+    fresh = [r for r in cands if r["score"] is not None and r["discount"] >= below
+             and order.index(r["est"]["conf"]) >= min_conf and (r["id"] not in seen or r["price"] < seen[r["id"]])]
+    if fresh and details_n:                                 # check the full ads of only these
+        cands, rows, idx = find_deals(c, name, want, size, w.get("min"), w.get("max"), area(w.get("area")),
+                                      details_n, only={r["id"] for r in fresh}, cache=True)
+        fresh = [r for r in cands if r["score"] is not None and r["discount"] >= below
+                 and order.index(r["est"]["conf"]) >= min_conf]
+    own = market.value_of(idx, name, want) if want else None
+    if record:
+        c.executemany("insert or replace into alerts values (?,?,?,?)", [(w["name"], r["id"], r["price"], t0) for r in fresh])
+        c.execute("insert or replace into watch_runs values (?,?)", (w["name"], t0))
+        c.commit()
+    return dict(name=w["name"], query=w["query"], kind=name, wants=market.label(name, want) or "any",
+                below=below, **{"for": w.get("for") or "me"},
+                market=dict(value=own["value"], n=own["n"], conf=own["conf"]) if own else None,
+                deals=[deal_json(r, name) for r in fresh])
+
+
+def cmd_watch(a):
+    ws = load_watches()
+    if a.action == "list":
+        if not ws:
+            print("No watches yet (%s). Add one: wh watch add ram-32 \"2x16gb ddr4 3200\" --max 90" % WATCHES)
+        for w in ws:
+            print("%-16s %-32s %s" % (w["name"], w["query"], " ".join("%s=%s" % (k, w[k]) for k in
+                                                                  ("kind", "size", "min", "max", "below", "conf", "area",
+                                                                   "for") if w.get(k) not in (None, ""))))
+        return
+    if a.action == "add":
+        if not a.args or (len(a.args) < 2 and not a.kind):
+            raise WhError("usage: wh watch add NAME \"QUERY\" [--kind K] [--size 45-55] [--max N] [--below 0.25]; "
+                          "with --kind the query may be left out (every ad of that kind)")
+        w = dict(name=a.args[0], query=" ".join(a.args[1:]), kind=a.kind, size=a.size, min=a.min, max=a.max,
+                 below=a.below, conf=a.conf, area=a.area, **{"for": a.for_})
+        resolve(argparse.Namespace(kind=a.kind, size=a.size), w["query"])     # fails now rather than at run time
+        save_watches([x for x in ws if x["name"] != w["name"]] + [w])
+        print("watch %s saved in %s" % (w["name"], WATCHES))
+        return
+    if a.action == "rm":
+        names = set(a.args or [])
+        if not names & {w["name"] for w in ws}:
+            raise WhError("no watch named %s" % ", ".join(sorted(names)))
+        save_watches([w for w in ws if w["name"] not in names])
+        return
+    todo = [w for w in ws if not a.args or w["name"] in a.args]
+    if not todo:
+        raise WhError("no watches to run (%s)" % WATCHES)
+    c = db()
+    kinds = []
+    for w in todo:
+        kinds.append(resolve(argparse.Namespace(kind=w.get("kind"), size=w.get("size")), w["query"])[0])
+    if not a.no_crawl:
+        crawl(c, list(dict.fromkeys(kinds)))
+    results, errors = [], []
+    for w in todo:
+        try:
+            results.append(run_watch(c, w, a.details, record=not a.dry_run))
+        except WhError as e:
+            errors.append(dict(name=w["name"], error=str(e)))
+    if a.json:
+        print(json.dumps(dict(at=now(), dry_run=bool(a.dry_run), watches=results, errors=errors), ensure_ascii=False,
+                         indent=1))
+        return
+    for r in results:
+        mk = r["market"]
+        print("## %s: %s (%s)%s" % (r["name"], r["query"], r["wants"], " · market %s, %d sellers, %s" % (
+            euro(mk["value"]), mk["n"], mk["conf"]) if mk else ""))
+        if not r["deals"]:
+            print("No new deals.\n")
+            continue
+        for d in r["deals"]:
+            print("- %s (value %s, %s, %s) %s · %s\n  %s%s" % (euro(d["price"]), euro(d["value"]), pct(d["discount"]),
+                                                             d["conf"], d["title"], d["loc"], d["url"],
+                                                             ("\n  ⚠ " + "; ".join(d["flags"])) if d["flags"] else ""))
+        print()
+    for e in errors:
+        print("%s: %s" % (e["name"], e["error"]))
 
 
 def doctor_checks():
@@ -1470,6 +2051,59 @@ def main():
     s.add_argument("--json", action="store_true", help="print new ads, price cuts, gone ads and the shortlist per "
                                                        "note as JSON (for scripts); notes are written as usual")
     s.set_defaults(fn=cmd_sweep)
+
+    kinds = ", ".join(sorted(market.KINDS))
+    s = sub.add_parser("find", help="the best deals for an item: ads clearly below their market value, e.g. "
+                                    "wh find 2x16gb ddr4 3200, wh find tv 45-55 zoll")
+    s.add_argument("words", nargs="*", help="what you're looking for, in plain words")
+    s.add_argument("--kind", choices=sorted(market.KINDS), help="the kind of item if wh can't tell (%s)" % kinds)
+    s.add_argument("--size", help="screen size range for tv/monitor, e.g. 45-55")
+    s.add_argument("--min", type=float)
+    s.add_argument("--max", type=float)
+    s.add_argument("--below", type=float, default=0.15, help="show ads at least this far below value (default 0.15)")
+    s.add_argument("--all", action="store_true", help="every matching ad, deal or not, best first")
+    s.add_argument("--area", help="mark the ads in these states, e.g. wien,noe (nothing gets filtered out)")
+    s.add_argument("--details", type=int, default=8, help="check the full ad of the top N (default 8)")
+    s.add_argument("--limit", type=int, default=15)
+    s.add_argument("--no-crawl", action="store_true", help="use the database as it is (no request)")
+    s.add_argument("--md", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_find)
+
+    s = sub.add_parser("value", help="what an item (words) or an ad (link or id) is worth on willhaben used")
+    s.add_argument("words", nargs="+")
+    s.add_argument("--kind", choices=sorted(market.KINDS))
+    s.add_argument("--size")
+    s.add_argument("--price", type=float, help="compare this price with the value")
+    s.add_argument("--no-crawl", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_value)
+
+    s = sub.add_parser("crawl", help="read whole willhaben categories into the database (the market values come "
+                                     "from them): a full crawl once a day, then only the new ads")
+    s.add_argument("kinds", nargs="*", help="kinds to crawl (default all: %s)" % kinds)
+    s.add_argument("--full", action="store_true", help="every page, even if the last full crawl is recent")
+    s.add_argument("--new", action="store_true", help="only the new ads, even if a full crawl is due")
+    s.add_argument("--list", action="store_true", help="the categories, ads in the database and last full crawl")
+    s.set_defaults(fn=cmd_crawl)
+
+    s = sub.add_parser("watch", help="saved finds: `add NAME QUERY`, `list`, `rm NAME`, `run` (new deals once, "
+                                     "--json for a timer)")
+    s.add_argument("action", choices=("add", "list", "rm", "run"))
+    s.add_argument("args", nargs="*")
+    s.add_argument("--kind", choices=sorted(market.KINDS))
+    s.add_argument("--size")
+    s.add_argument("--min", type=float)
+    s.add_argument("--max", type=float)
+    s.add_argument("--below", type=float, default=0.25, help="report ads at least this far below value (default 0.25)")
+    s.add_argument("--conf", choices=("low", "medium", "high"), default="medium")
+    s.add_argument("--area")
+    s.add_argument("--for", dest="for_", help="who it's for (default me)")
+    s.add_argument("--details", type=int, default=5)
+    s.add_argument("--no-crawl", action="store_true")
+    s.add_argument("--dry-run", action="store_true", help="don't remember what was reported")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_watch)
 
     for name, fn, hlp in (("deal", cmd_deal, "AI: is this ad worth buying? verdict, comparables, offer, questions"),
                           ("advise", cmd_advise, "AI: should I change the price of my live ads?"),
