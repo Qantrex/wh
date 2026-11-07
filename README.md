@@ -34,6 +34,9 @@ The AI commands gather the data and ask `claude -p` (no tools, so it only reason
 
 - **Market value** = the weighted median asking price of ads with the same key over the last 90 days, at the most specific key with enough sellers. One vote per seller (dealers repost), outliers (below a third or above three times the median) dropped, ads that sat unsold for weeks or are gone count a bit less, dealers' new stock and defects not at all. The confidence (high/medium/low) comes from the number of sellers and how far apart their prices are.
 - **A deal** is an ad below that value. `find` shows the best first and checks the top ads in full (still online? does the description match? seller's account age, photos). Ads more than 55 % below value are listed separately unless the seller gives a reason ("Notverkauf", "muss weg", Umzug …): they're as often parts, defects or scams as they're bargains, so read them, but they're never hidden.
+- **Anything else** (`wh find sony a7 iii`): a keyword search, then Claude (`claude -p`, model `WH_LABEL_MODEL`, default haiku, 60 ads per call, 4 at a time) names the product in each ad and says which ones are what you asked for; their prices give the value. `--no-ai` counts every ad whose title has all the words instead (low confidence). The product names are stored per ad.
+- `wh deal` adds the ad's market value to what Claude sees when wh knows its kind and has crawled the category.
+- Ads nobody has seen for 180 days are forgotten after each full crawl (except the ones a note's sweep found).
 - Ads without a clear key (no model, size or capacity in the text) get no value instead of a wrong one. Accessories and parts in the categories (controllers, cases, TV power boards …) are recognised and left out.
 - **Watches** (`~/.config/wh/watches.toml`, edited with `wh watch add/rm`): `wh watch run` reports matching ads that are new or cheaper since the watch's last run and at least `below` (default 25 %) under value, each once. The ads of a category's first full crawl are the starting stock, not news. `--json` is made for a timer or an agent.
 - Asking prices aren't selling prices, and the value is only as good as the key: check the comparables (`wh value <ad link>` lists them).
@@ -130,5 +133,6 @@ The AI commands (`deal`, `advise`, `hunt`) are the exception: they send what the
 | `WH_RATE` | `4` requests per second, all workers together |
 | `WH_DELAY` | `1.1` seconds between requests once willhaben pushes back |
 | `WH_MODEL` | Claude Code's default model |
+| `WH_LABEL_MODEL` | `haiku`: the model `wh find` uses to name products for items outside the kinds |
 
 wh has no timer of its own; `wh sweep --json --no-write` is made for one (a systemd timer, cron, an agent).
