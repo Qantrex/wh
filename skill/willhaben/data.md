@@ -16,6 +16,14 @@ Notes live in a folder you choose (`notes` in `~/.config/wh/config.toml`, `WH_NO
 - **Check the category** with `wh facets` before saving a search: the number at the end of the URL is what counts, not the slug. `laptops-notebooks-5824` is all of Computer / Software (half the "laptop" hits were PCs and GPUs); notebooks are `computer-tablets/notebooks-5831`, PCs `computer-tablets/pcs-5833`. `wh sweep` warns when most of a search's ads fall outside the profile's category.
 - `--dry-run` (sweep, hunt) leaves no trace in the database, so it does not spoil the next real sweep's "new" and "gone".
 
+## Market values: crawl and kinds
+
+- `market.py` knows 18 *kinds* (ram, gpu, tv, phone …): each has its willhaben categories and turns an ad into specs and keys (most specific first). `wh crawl` reads those categories whole (about 180k ads, 4 minutes at the rate limit) once a day and then only the new ads; `find`, `value` and `watch run` crawl what they need by themselves.
+- Search results carry willhaben's filter values (`categorytreeattributeids`: condition `21;23` used, `21;24` defect, `21;22` new, shipping `2535;2537`, screen-size buckets …), the seller's org id and PayLivery. wh stores them; one seller's reposts count once in a value.
+- Annotations are cached per ad (`specs` table) until the ad's text or `market.py`/`profiles.py` change.
+- A new kind of item: add an extractor to `market.py` (with tests) and check its coverage on the real database first.
+- **Kleinanzeigen.de is not in `find`:** its shipping and buyer protection cover Germany only, and almost no ad says it ships to Austria (0 of 466 "ddr4 2x16gb" ads, 2026-11-07), so neither availability nor shipping cost can be known without asking.
+
 ## Getting the data (no browser needed)
 
 This is what `wh` does under the hood. Plain HTTP works (the site is behind Cloudflare, but plain requests get no challenge). Send a browser User-Agent and `Accept-Language: de-AT`. Keep it to a few workers with a rate cap, and drop to one at a time on a 403, a 429 or a Cloudflare challenge page.

@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 `wh`: willhaben.at from the terminal. One Python script (`wh`) plus `profiles.py` (built-in profiles and the TOML
-template engine), the Claude skill in `skill/willhaben/`, and `test_wh.py`. See the README for commands and install.
+template engine), `market.py` (kinds of items, spec extractors and market values for find/value/watch), the Claude skill in `skill/willhaben/`, and `test_wh.py`. See the README for commands and install.
 
 ## Commands
 
@@ -29,4 +29,7 @@ python3 test_wh.py            # all tests, offline, from any folder (CI runs the
 - Notes: wh writes only `checked`, `updated` and its own `<!-- wh:NAME -->` blocks, re-reading the note right before
   an atomic write (`update_note`). Hidden folders (`.trash`, `.obsidian`) are never read.
 - Be gentle with willhaben: the shared rate limit in `fetch()`/`wait_turn()`, drop to `WH_DELAY` on pushback.
+- Market values: an extractor change in `market.py` gets a test with real-looking titles, and its coverage is
+  checked against a real database before committing (share of ads with a key, sample of rejected titles). Ads
+  without a clear key get no value rather than a wrong one. Very cheap ads are flagged, never dropped.
 - Commit messages: `FEAT: …` / `FIX: …`, short plain English.
