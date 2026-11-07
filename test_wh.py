@@ -1351,6 +1351,11 @@ class MarketExtractTests(unittest.TestCase):
         self.assertEqual(mad("Galaxy S23 Ultra", 500, kind="phone", tattrs="[7215;7216]")["specs"]["storage"], 256)
         self.assertIsNotNone(mad("iPhone 15 Pro Hülle neu", 8, kind="phone")["junk"])
         self.assertIsNone(mad("Samsung Galaxy XCover 7", 130, kind="phone")["junk"])
+        self.assertIsNotNone(mad("IPHONE 14 PRO LCD & AUSTAUSCH ! SOFORT", 100, kind="phone")["junk"])
+        self.assertIsNotNone(mad("Nintendo Gameboy Advance Spider-Man GBA PAL", 10, kind="console")["junk"])
+        self.assertIsNone(mad("Gameboy Advance SP Konsole PAL", 60, kind="console")["junk"])
+        self.assertIsNotNone(mad("Apple Airpods 4 Ladecase", 40, kind="headphones")["junk"])
+        self.assertEqual(market.query_specs("", "laptop"), {})
 
     def test_tv_codes_sizes_and_parts(self):
         s = mad("LG OLED55C17LB", 600, kind="tv")["specs"]
