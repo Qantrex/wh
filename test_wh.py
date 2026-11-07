@@ -1550,6 +1550,67 @@ class FindWatchTests(TmpDbCase):
         self.assertIsNotNone(c.execute("select id from ads where id=950").fetchone())
 
 
+class GenericFindTests(TmpDbCase):
+    RAM, fill, market_ads, args = FindWatchTests.RAM, FindWatchTests.fill, FindWatchTests.market_ads, FindWatchTests.args
+
+    def run_find(self, c, labels=None, no_ai=False):
+        ads = [make_summary(500 + n, t, p, cats="5824;6808") for n, (t, p) in enumerate([
+            ("Sony A7 III Body", 850), ("Sony Alpha 7 III", 900), ("Sony a7iii Gehäuse", 800), ("Sony A7 III", 880),
+            ("Sony A7 III Akku", 30), ("Sony A7 III", 500)])]
+        out = io.StringIO()
+        fake = lambda q, batch, model, timeout=240: labels(batch)  # noqa: E731
+        with mock.patch.object(wh, "db", return_value=c), mock.patch("sys.stdout", out), \
+                mock.patch.object(wh, "fetch", return_value=("u", search_page(len(ads), ads))), \
+                mock.patch.object(wh, "ask_labels", side_effect=fake), \
+                mock.patch.object(wh.shutil, "which", return_value="/usr/bin/claude"):
+            wh.cmd_find(self.args(words=["sony", "a7", "iii"], pages=1, no_ai=no_ai))
+        return json.loads(out.getvalue())
+
+    def test_claude_names_the_products_and_accessories_drop_out(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        def labels(batch):
+            out = [dict(id=0, product="sony alpha 7 iii", variant="", item=True, same=True)]
+            for a in batch:
+                acc = "akku" in a["title"].lower()
+                out.append(dict(id=a["id"], product="sony np-fz100" if acc else "sony alpha 7 iii", variant="",
+                                item=True, same=not acc))
+            return out
+        r = self.run_find(c, labels)
+        self.assertEqual(r["wants"], "sony alpha 7 iii")
+        self.assertEqual(r["matching"], 5)
+        self.assertEqual(r["market"]["value"], 850)
+        self.assertEqual([d["id"] for d in r["deals"]], [505])           # €500 against €850
+        self.assertEqual(c.execute("select count(*) from products").fetchone()[0], 6)
+
+    def test_without_claude_every_title_with_the_words_counts_at_low_confidence(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        r = self.run_find(c, no_ai=True)
+        self.assertEqual(r["market"]["conf"], "low")
+        self.assertIn("all these words", r["wants"])
+
+    def test_prune_forgets_old_ads_but_keeps_note_ads(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        self.fill(c, self.market_ads(), "2026-01-01T00:00:00Z")
+        run = c.execute("insert into runs (key, url, at, found, complete) values ('note:X:u','u','2026-01-01T00:00:00Z',1,1)")
+        c.execute("insert into hits values (?, 100)", (run.lastrowid,))
+        wh.prune(c, days=30)
+        self.assertEqual([r[0] for r in c.execute("select id from ads")], [100])
+
+    def test_deal_gets_the_market_value(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        self.fill(c, self.market_ads() + [make_summary(900, "G.Skill 2x16GB DDR4 3200", 60, cats="5824;5878;5887")],
+                  wh.now())
+        d = dict(id=900, title="G.Skill 2x16GB DDR4 3200", price=60.0, descr="", info=[])
+        block = wh.market_block(c, d)
+        self.assertIn("Value €100", block)
+        self.assertIn("-40 %", block)
+        self.assertEqual(wh.market_block(c, dict(d, id=12345)), "")
+
+
 def argparse_ns(**kw):
     import argparse
     return argparse.Namespace(**kw)
