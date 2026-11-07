@@ -807,7 +807,7 @@ def keys(name, sp):
 
 def label(name, sp, fields=None):
     parts = []
-    for f in fields or KINDS[name]["fields"]:
+    for f in fields or (KINDS[name]["fields"] if name in KINDS else list(sp)):
         v = sp.get(f)
         if v in (None, "-", ""):
             continue
