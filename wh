@@ -1350,9 +1350,12 @@ def record_crawl(c, url, path, found, complete, t):
               (crawl_key(path), url, t, found, int(complete)))
 
 
-def crawl_new(c, paths, max_pages=10):
+def crawl_new(c, paths, max_pages=10, budget=None):
     """Read each category from its newest ads until a page has nothing new or changed (at most max_pages pages).
-    Categories run side by side, pages within one one after the other. Returns {path: (found, ads read)}."""
+    Categories run side by side, pages within one one after the other. Returns {path: (found, ads read)}.
+    budget: seconds after which no further page is started; what was read until then is still stored (a caller that
+    kills wh at its time limit would lose all of it)."""
+    deadline = time.monotonic() + budget if budget else None
     known = {}
     for p in paths:
         cid = re.search(r"(\d+)$", p).group(1)
@@ -1362,6 +1365,9 @@ def crawl_new(c, paths, max_pages=10):
     def one(p):
         url, got, found = search_url(url=p), [], 0
         for page in range(1, max_pages + 1):
+            if deadline and page > 1 and time.monotonic() > deadline:
+                log("  %s: time budget used up after %d page%s" % (p.rsplit("/", 1)[-1], page - 1, "" if page == 2 else "s"))
+                break
             r = read_page("%s&page=%d" % (url, page))
             if not isinstance(r, tuple):
                 break
@@ -1385,7 +1391,7 @@ def crawl_new(c, paths, max_pages=10):
     return out
 
 
-def crawl(c, kinds, full=None, max_pages=400):
+def crawl(c, kinds, full=None, max_pages=400, budget=None):
     """Bring the database up to date for these kinds: a full crawl of every category whose last full crawl is older
     than FULL_CRAWL_H hours (or all of them with full=True), only the new ads of the others (none with full=False)."""
     paths = list(dict.fromkeys(p for k in kinds for p in market.KINDS[k]["cats"]))
@@ -1403,7 +1409,7 @@ def crawl(c, kinds, full=None, max_pages=400):
         c.commit()
     if fresh:
         log("new ads in %d categor%s:" % (len(fresh), "y" if len(fresh) == 1 else "ies"))
-        crawl_new(c, fresh)
+        crawl_new(c, fresh, budget=budget)
     if whole:
         prune(c)
         for k in kinds:                                     # annotate now, so the next watch run starts warm
@@ -1915,7 +1921,7 @@ def cmd_crawl(a):
                 print("%-11s %-58s %7d ads  full crawl %s" % (k, p, n, last_full_crawl(c, p) or "never"))
         return
     t = time.time()
-    crawl(c, kinds, full=True if a.full else (False if a.new else None))
+    crawl(c, kinds, full=True if a.full else (False if a.new else None), budget=getattr(a, "budget", None))
     log("done in %.0f s" % (time.time() - t))
 
 
@@ -2319,6 +2325,8 @@ def main():
     s.add_argument("--full", action="store_true", help="every page, even if the last full crawl is recent")
     s.add_argument("--new", action="store_true", help="only the new ads, even if a full crawl is due")
     s.add_argument("--list", action="store_true", help="the categories, ads in the database and last full crawl")
+    s.add_argument("--budget", type=int, metavar="SECONDS",
+                   help="for the new-ads read: start no further page after this long, keep what was read")
     s.set_defaults(fn=cmd_crawl)
 
     s = sub.add_parser("watch", help="saved finds: `add NAME QUERY`, `list`, `rm NAME`, `run` (new deals once, "

@@ -1611,6 +1611,25 @@ class FindWatchTests(TmpDbCase):
         self.assertEqual(calls, [1, 2])
         self.assertIsNotNone(c.execute("select id from ads where id=950").fetchone())
 
+    def test_crawl_new_budget_stops_reading_but_keeps_what_it_read(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        known = self.market_ads()
+        self.fill(c, known, wh.now())
+        new = [make_summary(950 + n, "Neu 2x16GB DDR4 3200", 90 + n, cats="5824;5878;5887") for n in range(3)]
+        calls = []
+        clock = [0.0]
+
+        def fake(url, binary=False):
+            n = int(re.search(r"page=(\d+)", url).group(1))
+            calls.append(n)
+            clock[0] += 30                                                   # every page "takes" 30 s
+            return url, search_page(5000, new[n - 1:n])                      # always something new: would go on
+        with mock.patch.object(wh, "fetch", side_effect=fake), mock.patch.object(wh.time, "monotonic", lambda: clock[0]):
+            wh.crawl_new(c, [self.RAM], budget=40)
+        self.assertEqual(calls, [1, 2])                                      # page 3 was not started
+        self.assertEqual(c.execute("select count(*) from ads where id between 950 and 952").fetchone()[0], 2)
+
 
 class GenericFindTests(TmpDbCase):
     RAM, fill, market_ads, args = FindWatchTests.RAM, FindWatchTests.fill, FindWatchTests.market_ads, FindWatchTests.args
