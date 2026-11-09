@@ -1517,6 +1517,57 @@ class FindWatchTests(TmpDbCase):
                   wh.now(), full=False)
         self.assertEqual(run(), [901])                                       # cheaper again: reported again
 
+    def test_parse_time_is_the_strict_utc_format_only(self):
+        from datetime import datetime, timezone
+        self.assertEqual(market.parse_time("2026-11-09T22:20:31Z"),
+                         datetime(2026, 11, 9, 22, 20, 31, tzinfo=timezone.utc))
+        for bad in (None, "", 5, "2026-11-09 22:20:31Z", "2026-11-09T22:20:31", "2026-11-09T22:20:31+0000", "x" * 20):
+            self.assertIsNone(market.parse_time(bad), bad)
+
+    def test_watch_budget_skips_the_rest_and_runs_those_first_next_time(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        wh.save_watches([dict(name="a", query="2x16gb ddr4 3200"), dict(name="b", query="2x16gb ddr4 3200"),
+                         dict(name="c", query="2x16gb ddr4 3200")])
+        ran = []
+        clock = [0.0]
+
+        def fake_run(c_, w, details_n, record=True):
+            ran.append(w["name"])
+            clock[0] += 10                                                   # every watch "takes" 10 s
+            c_.execute("insert or replace into watch_runs values (?,?)", (w["name"], "2026-11-09T0%d:00:00Z" % len(ran)))
+            return dict(name=w["name"], deals=[], market=None, query="", wants="", kind="ram", below=0.25)
+
+        def run(budget):
+            ran.clear()
+            out = io.StringIO()
+            with mock.patch.object(wh, "db", return_value=c), mock.patch.object(wh, "run_watch", fake_run), \
+                    mock.patch.object(wh.time, "monotonic", lambda: clock[0]), mock.patch("sys.stdout", out), \
+                    mock.patch("sys.stderr", io.StringIO()):
+                wh.cmd_watch(argparse_ns(action="run", args=[], json=True, no_crawl=True, dry_run=False, details=0,
+                                         budget=budget))
+            return json.loads(out.getvalue())
+        r = run(15)                                                          # a and b start (0 s, 10 s), c is skipped
+        self.assertEqual((ran, r["skipped"]), (["a", "b"], ["c"]))
+        r = run(15)                                                          # c has never run: it goes first
+        self.assertEqual(ran[0], "c")
+        self.assertEqual(len(r["watches"]) + len(r["skipped"]), 3)
+        r = run(None)                                                        # no budget: everything runs
+        self.assertEqual((len(ran), r["skipped"]), (3, []))
+
+    def test_watch_run_builds_the_market_index_once_per_kind(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        self.fill(c, self.market_ads(), "2026-11-01T00:00:00Z")
+        wh._ROWS.clear()
+        wh._IDX.clear()
+        with mock.patch.object(market, "build_index", wraps=market.build_index) as bi:
+            wh.find_deals(c, "ram", {}, details_n=0, cache=True)
+            wh.find_deals(c, "ram", {}, details_n=0, cache=True)
+        self.assertEqual(bi.call_count, 1)
+        wh._ROWS.clear()
+        wh._IDX.clear()
+
     def test_watch_file_round_trip(self):
         out = io.StringIO()
         with mock.patch("sys.stdout", out):

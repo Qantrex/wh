@@ -1436,6 +1436,7 @@ def online_since(c, name):
 
 
 _ROWS = {}                                                 # kind -> annotated rows, for one run (watch run)
+_IDX = {}                                                  # kind -> market index of those rows (read-only)
 SPEC_VER = ""
 
 
@@ -1454,11 +1455,12 @@ def spec_sig(r):
     return hashlib.sha1(raw.encode()).hexdigest()[:16]
 
 
-def kind_rows(c, name, days=market.VALUE_DAYS, cache=False):
+def kind_rows(c, name, days=market.VALUE_DAYS, cache=False, shared=False):
     """Every ad of a kind seen in the last `days` days, annotated with its specs (market.specs). cache=True keeps
-    them for the rest of the run (several watches of one kind); copies go out, so callers may change them."""
+    them for the rest of the run (several watches of one kind); copies go out, so callers may change them.
+    shared=True (with cache) hands out the cached list itself, for callers that only read (no copy of 40k+ rows)."""
     if cache and name in _ROWS:
-        return [dict(r) for r in _ROWS[name]]
+        return _ROWS[name] if shared else [dict(r) for r in _ROWS[name]]
     k = market.KINDS[name]
     since = datetime.fromtimestamp(time.time() - days * 86400, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     rows = [dict(r) for r in c.execute("select * from ads where last_seen >= ? and (%s)" % " or ".join(
@@ -1510,8 +1512,13 @@ def find_deals(c, name, want, size=None, pmin=None, pmax=None, states=(), detail
     """Online ads of a kind that match `want` (market.matches), each with its market value, discount and the ads
     behind the value, best deal first. The top `details_n` get their full ad checked (status, description, seller).
     `only`: a set of ad ids to limit the candidates to (watch: new or cheaper since last time)."""
-    rows = kind_rows(c, name, cache=cache)
-    idx = market.build_index(rows, name)
+    rows = kind_rows(c, name, cache=cache, shared=cache)    # read-only here: only the candidates are copied below
+    if cache and name in _IDX:                              # one index per kind and run, not one per watch
+        idx = _IDX[name]
+    else:
+        idx = market.build_index(rows, name)
+        if cache:
+            _IDX[name] = idx
     by_id = {r["id"]: r for r in rows}
     cut = online_since(c, name)
     cands = []
@@ -1525,7 +1532,7 @@ def find_deals(c, name, want, size=None, pmin=None, pmax=None, states=(), detail
         if only is not None and r["id"] not in only:
             continue
         if market.matches(r["specs"], want, size):
-            cands.append(r)
+            cands.append(dict(r) if cache else r)
 
     def rate(r):
         est = market.value_of(idx, name, r["specs"], exclude=r["id"])
@@ -1991,7 +1998,7 @@ def run_watch(c, w, details_n, record=True):
     min_conf = order.index(w.get("conf", "medium"))
     t0 = now()
     since, strict = changed_since(c, w["name"], name)
-    rows = kind_rows(c, name, cache=True)
+    rows = kind_rows(c, name, cache=True, shared=True)
     new = {r["id"] for r in rows if (r.get("first_seen") or "") > since or (not strict and r.get("first_seen") == since)}
     before = last_prices(c, [r["id"] for r in rows if r["id"] not in new], since)
     cheaper = {r["id"] for r in rows if r["id"] in before and before[r["id"]] and r.get("price")
@@ -2052,15 +2059,26 @@ def cmd_watch(a):
         kinds.append(resolve(argparse.Namespace(kind=w.get("kind"), size=w.get("size")), w["query"])[0])
     if not a.no_crawl:
         crawl(c, list(dict.fromkeys(kinds)))
-    results, errors = [], []
+    results, errors, skipped = [], [], []
+    budget = getattr(a, "budget", None)
+    if budget:                                              # least recently run first, so a short budget rotates
+        last = {r["watch"]: r["at"] for r in c.execute("select watch, at from watch_runs")}
+        todo.sort(key=lambda w: last.get(w["name"]) or "")
+    t_start = time.monotonic()
     for w in todo:
+        if budget and results + errors and time.monotonic() - t_start > budget:
+            skipped.append(w["name"])                       # not started: the next run does these first
+            continue
         try:
             results.append(run_watch(c, w, a.details, record=not a.dry_run))
         except WhError as e:
             errors.append(dict(name=w["name"], error=str(e)))
+    if skipped:
+        log("time budget of %d s used up: %d watch%s not run (%s)" % (
+            budget, len(skipped), "" if len(skipped) == 1 else "es", ", ".join(skipped)))
     if a.json:
-        print(json.dumps(dict(at=now(), dry_run=bool(a.dry_run), watches=results, errors=errors), ensure_ascii=False,
-                         indent=1))
+        print(json.dumps(dict(at=now(), dry_run=bool(a.dry_run), watches=results, errors=errors, skipped=skipped),
+                         ensure_ascii=False, indent=1))
         return
     for r in results:
         mk = r["market"]
@@ -2317,6 +2335,9 @@ def main():
     s.add_argument("--for", dest="for_", help="who it's for (default me)")
     s.add_argument("--details", type=int, default=5)
     s.add_argument("--no-crawl", action="store_true")
+    s.add_argument("--budget", type=int, metavar="SECONDS",
+                   help="stop starting new watches after this long (least recently run first; the rest are listed "
+                        "as skipped and come first next time). A watch already running is finished.")
     s.add_argument("--dry-run", action="store_true", help="don't remember what was reported")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_watch)
