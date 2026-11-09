@@ -832,8 +832,12 @@ def label(name, sp, fields=None):
 
 
 def parse_time(s):
+    """UTC datetime of "YYYY-MM-DDTHH:MM:SSZ", else None. fromisoformat, not strptime: build_index parses 100k+
+    timestamps and strptime was most of a watch run on a Pi."""
     try:
-        return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        if len(s) != 20 or s[10] != "T" or s[-1] != "Z":
+            return None
+        return datetime.fromisoformat(s[:-1]).replace(tzinfo=timezone.utc)
     except (TypeError, ValueError):
         return None
 
