@@ -1297,11 +1297,18 @@ class SkillRulesTest(unittest.TestCase):
             self.assertIn("Pricing advice", wh.skill_rules("sell"))
 
     def test_shipped_skill_has_no_personal_data(self):
+        # Generic markers live here; personal words stay private: WH_LEAKWORDS may name a file with one word per
+        # line (e.g. ~/.config/wh/leakwords), so this public repo never lists them itself.
+        words = ["~/Notes", "homelab repo"]
+        leak = os.environ.get("WH_LEAKWORDS")
+        if leak:
+            with open(os.path.expanduser(leak), encoding="utf-8") as f:
+                words += [w.strip() for w in f if w.strip() and not w.startswith("#")]
         d = os.path.dirname(wh.SHIPPED_SKILL)
         for name in sorted(os.listdir(d)):
             with open(os.path.join(d, name), encoding="utf-8") as f:
                 text = f.read()
-            for word in ("Alex", "friend", "~/Notes", "user", "old-node", "homelab repo", "gloves"):
+            for word in words:
                 self.assertNotIn(word, text, name)
 
 

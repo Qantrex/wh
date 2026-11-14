@@ -7,6 +7,7 @@ template engine), `market.py` (kinds of items, spec extractors and market values
 
 ```bash
 python3 test_wh.py            # all tests, offline, from any folder (CI runs them on 3.11-3.13)
+WH_LEAKWORDS=~/.config/wh/leakwords python3 test_wh.py   # also check the skill against my private word list
 ./wh doctor                   # config, notes, skill, templates, database, tools; no network
 ./wh <cmd> --help
 ```
