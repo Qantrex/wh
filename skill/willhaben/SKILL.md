@@ -48,3 +48,4 @@ Setup: the Install section of the `wh` README (github.com/Qantrex/wh); `wh docto
 - An ad that shows "Anzeige nicht mehr verfügbar" has usually just **expired** (the seller forgot to renew it). It does not mean sold. Don't treat it as sold and never mention it to the seller.
 - Listing tables in notes only contain ads you would actually consider. Mention rejects in chat if they matter.
 - Check specs and prices online instead of writing from memory, and cite sources in the note.
+- **Before recommending a part or item to buy,** sweep willhaben (and Kleinanzeigen.de) for used offers in the same pass, and compare new prices across several shops by part number. Check listing photos for part numbers and model years: parts are often for an older model.
