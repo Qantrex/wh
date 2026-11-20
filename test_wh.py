@@ -1369,6 +1369,22 @@ class SkillRulesTest(unittest.TestCase):
             self.assertEqual(wh.skill_rules("buy"), "")
         self.assertIn("not found", log.call_args[0][0])
 
+    def test_claude_runs_in_a_throwaway_folder(self):
+        seen = []
+
+        def fake(cmd, **kw):
+            seen.append((kw.get("cwd"), os.path.isdir(kw.get("cwd") or "")))
+            return subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr="")
+        ns = mock.Mock(no_ai=False, model=None, timeout=5)
+        with mock.patch.object(wh.subprocess, "run", side_effect=fake), mock.patch.object(wh, "log"):
+            wh.ask_claude(ns, "task", "data")
+            wh.ask_labels("q", [dict(id=1, title="t", price=1.0, body="")], "haiku")
+        self.assertEqual(len(seen), 2)
+        for cwd, existed in seen:
+            self.assertTrue(existed)
+            self.assertNotEqual(os.path.realpath(cwd), os.path.realpath(os.getcwd()))
+            self.assertFalse(os.path.exists(cwd))              # removed again afterwards
+
     def test_ask_claude_puts_the_kinds_rules_in_the_system_prompt(self):
         self.write_split()
         ns = mock.Mock(no_ai=False, model=None, timeout=5)

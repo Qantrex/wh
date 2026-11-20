@@ -884,6 +884,12 @@ def skill_rules(kind):
     return "\n\n".join(s for s in (skill_section(text, "Ground rules"), extra.strip()) if s)
 
 
+def run_claude(cmd, prompt, timeout):
+    """claude -p in an empty folder of its own, so it never picks up a project's settings, hooks or CLAUDE.md."""
+    with tempfile.TemporaryDirectory(prefix="wh-claude-") as d:
+        return subprocess.run(cmd, input=prompt, text=True, capture_output=True, timeout=timeout, cwd=d)
+
+
 def ask_claude(a, task, data, rules="buy"):
     prompt = "%s\n\n%s" % (task, data)
     if a.no_ai:
@@ -895,7 +901,7 @@ def ask_claude(a, task, data, rules="buy"):
         cmd += ["--model", a.model or os.environ["WH_MODEL"]]
     log("  asking Claude …")
     try:
-        r = subprocess.run(cmd, input=prompt, text=True, capture_output=True, timeout=a.timeout)
+        r = run_claude(cmd, prompt, a.timeout)
     except FileNotFoundError:
         raise WhError("`claude` not found; use --no-ai to print the data instead")
     except subprocess.TimeoutExpired:
@@ -1811,8 +1817,7 @@ def ask_labels(query, ads, model, timeout=240):
                                                                  cell(a.get("body"), 160)) for a in ads]
     cmd = ["claude", "-p", "--tools", "", "--strict-mcp-config", "--no-session-persistence", "--output-format", "text",
            "--model", model, "--append-system-prompt", LABEL_PROMPT]
-    r = subprocess.run(cmd, input="Query: %s\n\nid | price | title | text\n%s" % (query, "\n".join(lines)),
-                       text=True, capture_output=True, timeout=timeout)
+    r = run_claude(cmd, "Query: %s\n\nid | price | title | text\n%s" % (query, "\n".join(lines)), timeout)
     if r.returncode:
         raise WhError("claude failed: %s" % (r.stderr or r.stdout)[-400:])
     out = []
