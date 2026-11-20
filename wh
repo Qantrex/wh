@@ -527,7 +527,14 @@ def last_prices(c, ids, at):
 
 
 def price_history(c, i):
-    return [(r["seen"][:10], r["price"]) for r in c.execute("select price, seen from prices where id=? order by seen", (i,))]
+    """[(from day, until day, price)]: a price row is written only when the price changes, and ads.last_seen moves on
+    every sighting, so each price ran from its row until the next one, and the current one until the ad's last
+    sighting. The same ranges a daily row per ad would give, without the growth."""
+    rows = [(r["seen"][:10], r["price"]) for r in c.execute("select price, seen from prices where id=? order by seen, rowid",
+                                                            (i,))]
+    last = c.execute("select last_seen from ads where id=?", (i,)).fetchone()
+    ends = [t for t, _ in rows[1:]] + [(last["last_seen"] or "")[:10] if last else rows[-1][0] if rows else None]
+    return [(t, max(u or t, t), p) for (t, p), u in zip(rows, ends)]
 
 
 # ---- notes ----------------------------------------------------------------------------------------------------
@@ -727,7 +734,7 @@ def fmt_details(d, c=None):
         lines.append("Price cut from %s on %s" % (euro(d["old_price"]), d.get("price_cut_on") or "?"))
     hist = price_history(c, d["id"]) if c else []
     if len(hist) > 1:
-        lines.append("Prices seen by wh: " + ", ".join("%s %s" % (t, euro(p)) for t, p in hist))
+        lines.append("Prices seen by wh: " + ", ".join("%s %s" % (t, euro(p)) for t, _, p in hist))
     lines += [d["url"], "Attributes: " + ("; ".join(d["info"]) or "none"), "Photos: %d" % len(d["images"]),
               "Description:", d["descr"] or "(none)"]
     return "\n".join(lines)
@@ -889,7 +896,7 @@ def cmd_history(a):
                first_seen=(row.get("first_seen") or "")[:10] or None, last_seen=(row.get("last_seen") or "")[:10] or None,
                status=d.get("status"), checked=det["fetched"][:10] if det else None,
                old_price=d.get("old_price"), price_cut_on=d.get("price_cut_on") or None,
-               prices=[dict(day=t, price=p) for t, p in hist])
+               prices=[dict(day=t, until=u, price=p) for t, u, p in hist])
     if a.json:
         print(json.dumps(out, ensure_ascii=False, indent=1))
         return
@@ -899,11 +906,11 @@ def cmd_history(a):
     if out["old_price"]:
         print("willhaben says: cut from %s on %s" % (euro(out["old_price"]), out["price_cut_on"] or "?"))
     prev = None
-    for t, p in hist:
+    for t, u, p in hist:
         change = ""
         if prev and p is not None:
             change = "  %s%s (%+d %%)" % ("−" if p < prev else "+", euro(abs(p - prev)), round(100 * (p - prev) / prev))
-        print("  %s  %s%s" % (t, euro(p), change))
+        print("  %s – %s  %s%s" % (t, u, euro(p), change))
         prev = p if p else prev
 
 

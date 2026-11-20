@@ -266,7 +266,8 @@ class WhTests(TmpDbCase):
     def test_history_shows_prices_over_time_without_a_request(self):
         c = wh.db()
         self.addCleanup(c.close)
-        for at, price in (("2026-10-01T10:00:00Z", 200), ("2026-10-08T10:00:00Z", 200), ("2026-10-15T10:00:00Z", 170)):
+        for at, price in (("2026-10-01T10:00:00Z", 200), ("2026-10-08T10:00:00Z", 200), ("2026-10-15T10:00:00Z", 170),
+                          ("2026-10-22T10:00:00Z", 170)):
             wh.store(c, [wh.summary(make_summary(5555555, "Fahrrad Cube", price))], at)
         c.commit()
         out = io.StringIO()
@@ -277,10 +278,13 @@ class WhTests(TmpDbCase):
         fetch.assert_not_called()
         text, js = out.getvalue().split("\n{", 1)
         self.assertIn("**Fahrrad Cube**", text)
-        self.assertIn("Seen by wh 2026-10-01 to 2026-10-15", text)
-        self.assertIn("2026-10-15  €170  −€30 (-15 %)", text)
+        self.assertIn("Seen by wh 2026-10-01 to 2026-10-22", text)
+        self.assertIn("2026-10-01 – 2026-10-15  €200\n", text)
+        self.assertIn("2026-10-15 – 2026-10-22  €170  −€30 (-15 %)", text)      # seen again at €170 on 10-22
         r = json.loads("{" + js)
-        self.assertEqual(r["prices"], [{"day": "2026-10-01", "price": 200}, {"day": "2026-10-15", "price": 170}])
+        self.assertEqual(r["prices"], [{"day": "2026-10-01", "until": "2026-10-15", "price": 200},
+                                       {"day": "2026-10-15", "until": "2026-10-22", "price": 170}])
+        self.assertEqual(c.execute("select count(*) from prices").fetchone()[0], 2)    # no row per sighting
         with mock.patch.object(wh, "db", return_value=c):
             with self.assertRaisesRegex(wh.WhError, "not in the database"):
                 wh.cmd_history(mock.Mock(ad="1234567", json=False))

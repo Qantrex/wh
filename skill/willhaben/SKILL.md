@@ -16,7 +16,7 @@ Setup: the Install section of the `wh` README (github.com/Qantrex/wh); `wh docto
 | `wh profiles` | the built-in profiles and templates a note's `wh-profile` can name, plus broken templates with the reason |
 | `wh doctor` | checks the config, notes (missing `for:`, unknown profiles or areas, bad `ad:`), the skill install, templates, the database and tools; run it first when something looks wrong |
 | `wh ad <id or link>` | the full ad: description, seller (member since, active ads), price cut, price history |
-| `wh history <id or link> [--json]` | the prices wh has seen for an ad over time, from the database only (no request) |
+| `wh history <id or link> [--json]` | each price an ad had and from when to when wh saw it, from the database only (no request) |
 | `wh photos <id> <dir>` | downloads the photos, converting WebP to JPEG |
 | `wh status [notes]` | is each open note's `ad:` still online, at what price? |
 | `wh sweep [notes] [--json] [--no-write]` | runs the `search:` URLs of open buy/wanted notes and writes new ads, price cuts, gone ads and a shortlist into the note's `<!-- wh:sweep -->` block; `--json` prints the same for scripts, `--no-write` leaves the notes alone |
