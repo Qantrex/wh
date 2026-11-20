@@ -543,6 +543,18 @@ class WhTests(TmpDbCase):
         self.assertEqual(wh.euro(100.0), "€100")
         self.assertEqual(wh.euro(9.5), "€9.50")
 
+    def test_one_malformed_ad_is_skipped_and_a_mostly_bad_page_is_an_error(self):
+        good = [make_summary(i, "Kamera %d" % i, 10 + i) for i in range(1, 6)]
+        bad = [{"id": "abc", "attributes": {"attribute": []}}, {"id": "9"}, {"id": "8", "attributes": {"attribute": [{}]}}]
+        with mock.patch.object(wh, "log") as log, \
+             mock.patch.object(wh, "fetch", return_value=("u", search_page(8, good + bad))):
+            found, ads = wh.read_page("https://www.willhaben.at/x?a=1")
+        self.assertEqual([a["id"] for a in ads], [1, 2, 3, 4, 5])
+        self.assertIn("3 of 8 entries skipped", log.call_args[0][0])
+        with mock.patch.object(wh, "log"), mock.patch.object(wh, "fetch", return_value=("u", search_page(4, good[:1] + bad))):
+            with self.assertRaises(wh.FetchError):
+                wh.read_page("https://www.willhaben.at/x?a=1")
+
     def test_summary_drops_control_characters(self):
         a = make_summary(7, "Rad \x1b[2J\x1b]0;pwn\x07 neu", 50)
         self.assertNotIn("\x1b", wh.summary(a)["title"])

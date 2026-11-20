@@ -399,7 +399,18 @@ def read_page(url):
     sr = page_props(h).get("searchResult")
     if not sr:
         return None
-    return sr.get("rowsFound") or 0, [summary(a) for a in (sr.get("advertSummaryList") or {}).get("advertSummary") or []]
+    ads, bad = [], 0
+    for a in (sr.get("advertSummaryList") or {}).get("advertSummary") or []:
+        try:
+            ads.append(summary(a))
+        except (KeyError, TypeError, ValueError, AttributeError):   # one odd entry (sponsored row, new ad type) is skipped
+            bad += 1
+    if bad:
+        if bad * 2 > bad + len(ads):
+            raise FetchError("can't read willhaben's ads (%d of %d entries are not in the expected shape); did the site "
+                             "change?" % (bad, bad + len(ads)))
+        log("  %s: %d of %d entries skipped (unexpected shape)" % (url.split("?")[0], bad, bad + len(ads)))
+    return sr.get("rowsFound") or 0, ads
 
 
 def run_searches(c, jobs, pages=5, record=True):
