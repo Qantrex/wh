@@ -63,12 +63,21 @@ def first(rx, *texts, group=1):
     return None
 
 
+HEAD_SPLIT = r"\s(?:\+|mit|inkl\.?|inklusive|samt|plus|und|&|incl\.?|sowie|zzgl\.?)\s|\s\+|\+\s|[,;|(!]|\s-\s|\s/\s"
+
+
+def tail(title):
+    """What comes after the head: ' + monitor 27 zoll' in 'ps5 + monitor 27 zoll'."""
+    return title[len(re.split(HEAD_SPLIT, title, maxsplit=1)[0]):]
+
+
 def head(title):
     """The title without what comes with the item: 'ps5 slim mit 2 controllern' → 'ps5 slim'. An accessory word in the
     head means the ad is for the accessory ('pro controller für switch'), in the tail it's an extra."""
-    t = re.split(r"\s(?:\+|mit|inkl\.?|inklusive|samt|plus|und|&|incl\.?|sowie|zzgl\.?)\s|\s\+|\+\s|[,;|(!]|\s-\s|\s/\s",
-                 title, maxsplit=1)[0]
-    return re.sub(r"\b\d+\s*(?:x\s*)?(?:spiele|games|controller\w*|joy-?cons?)\b", " ", t)   # "ps4 2 controller"
+    t = re.split(HEAD_SPLIT, title, maxsplit=1)[0]
+    # "ps4 2 controller" is a console with extras, "playstation 5 controller" a controller: keep a model number
+    return re.sub(r"(?<!playstation )(?<!xbox )(?<!switch )(?<!series )\b\d+\s*(?:x\s*)?"
+                  r"(?:spiele|games|controller\w*|joy-?cons?)\b", " ", t)
 
 
 URGENT = re.compile(r"notverkauf|muss\s+(?:schnell\s+|dringend\s+|bis\s+\S+\s+)?weg|schnell\s+weg|dringend|"
@@ -622,8 +631,26 @@ CONSOLES = [
 CONSOLE_EXTRAS = (r"controller|joy-?cons?\b|gamepad|lenkrad|wheel|\bcase\b|schale|hülle|tasche|zubehör|modchip|kabel|"
                   r"\bstick\b|ladestation|charging|\bdock\b|headset|kamera|camera|\bvr\b|spiel\b|spiele\b|\bgame\b|"
                   r"\bgames\b|amiibo|figur|skin|aufkleber|cover|faceplate|lüfter|netzteil|festplatte|ssd|speicherkarte|"
-                  r"tastatur|maus|fernbedienung|halterung|ständer|\bstand\b|\(ps[1-5]\)|\(switch\)|für\s+(?:die\s+)?"
+                  r"tastatur|maus|fernbedienung|halterung|ständer|\bstand\b|laser|lesekopf|\w*blende|front\s*-?\s*plate|standfu(?:ß|ss)|"
+                  r"seitenteile?|platine|mainboard|\(ps[1-5]\)|\(switch\)|für\s+(?:die\s+)?"
                   r"(?:ps[1-5]|playstation|xbox|switch|nintendo)")
+
+
+# Words a seller puts before the console's name ("Verkaufe Sony PS5 Disc Edition"). A title that ends in the
+# console's name after other words is a game or an accessory for it: "Madden NFL 25 PS5", "CD Minecraft PS5".
+CONSOLE_TITLE_WORDS = (r"sony|n\w{2,5}do|ps\s*one|psx|verpackt\w*|microsoft|valve|playstation|ps\s*[1-5]|xbox|series|one|switch|konsole|console|"
+                       r"spielekonsole|verkaufe|verkauf|biete|neu\w*|nagelneu\w*|brandneu\w*|original\w*|top|zustand|"
+                       r"gebraucht\w*|wie|fast|sehr|gut\w*|neuwertig\w*|super|1a|disc|disk|digital|slim|pro|lite|oled|"
+                       r"version|edition|standard|black|white|weiß\w*|weiss\w*|schwarz\w*|reserviert|\d+\s*[tg]b|"
+                       r"cfi-?\w+|mit|und|die|eine?|meine?|the|my|refurbished|gaming|\d{1,2}")
+CONSOLE_PLATFORM = r"(?:ps\s*[1-5]|playstation\s*[1-5]|xbox(?:\s*(?:series\s*[xs]|one\s*[xs]?|360))?|(?:nintendo\s*)?switch(?:\s*2|\s*oled|\s*lite)?)"
+CONSOLE_MODDED = (r"jail\s*-?\s*break|\bjb\b|exploit|goldhen|\bhen\b|alte\w*\s+firmware|low\s+firmware|softmod\w*|"
+                  r"gemoddet|gemodded|\bmodded\b|modchip|\bcfw\b|custom\s*firmware|atmosph[eè]re|hwfly|picofly|"
+                  r"\bsx\s*os\b|homebrew|custom\s*-?\s*firmware|customfirmware|custom\s*rom")
+CONSOLE_LIMITED = (r"\blimited|anniversary|jubiläum\w*|sonder(?:edition|ausgabe|modell)|special\s*edition|collector\w*|"
+                   r"\bastro\s*bot\b.*\bedition|\bspider-?\s*man\s*2\b.*\b(?:edition|limited|konsole|console)")
+CONSOLE_BIG_EXTRAS = (r"monitor|bildschirm|fernseher|\btv\b(?![\s-]*(?:kabel|dock|adapter|anschluss))|portal|\bvr\s*2?\b|psvr|lenkrad|wheel|soundbar|"
+                      r"beamer|gaming\s*stuhl|\bpc\b|laptop")
 
 
 RETRO_HANDHELD_GAMES = {"gba", "gba sp", "game boy", "game boy color", "ds lite", "3ds", "3ds xl", "2ds", "new 3ds xl",
@@ -645,19 +672,39 @@ def console(ad):
     if re.search(CONSOLE_EXTRAS, head(title)) and not re.search(r"\bkonsole|\bconsole\b|\bsystem\b|\bhandheld\b",
                                                                  head(title)):
         return "accessory or game, not a console"
+    if re.search(r"^(?:sony\s+)?(?:(?:ps\s*5|playstation\s*5)\s+)?(?:dis[ck]\s*-?\s*)?laufwerk", title):
+        return "accessory or game, not a console"
+    if re.search(r"ovp\s*(?:ohne|leer|only)|ohne\s+konsole|\bnur\s+(?:die\s+|der\s+)?(?:ovp|karton|verpackung)|"
+                 r"leer\w*\s*(?:ovp|karton|verpackung)|leerkarton", title):
+        return "box or packaging only"
+    m = re.search(r"^(.*?)[\s\W]*\b" + CONSOLE_PLATFORM + r"[\s\W]*$", title)
+    if m and m.group(1):
+        rest = re.sub(r"\b(?:%s)\b" % CONSOLE_TITLE_WORDS, " ", m.group(1))
+        if re.search(r"[a-zäöü]{2,}", rest) and not re.search(r"konsole|console|\b(?:ps\s*[1-5]|playstation|xbox)\b",
+                                                              m.group(1)):
+            return "a game or accessory for the console, not a console"
     model = next((name for rx, name in CONSOLES if re.search(rx, title)), None)
     if model in RETRO_HANDHELD_GAMES and re.search(r"\bpal\b|\bmodul\b|cartridge|\bcart\b|\bspiel|\bgame\b", title) \
             and not re.search(r"konsole|console|handheld|system|\bgerät", title):
         return "a game, not a console"
+    # edition: a jailbreak-able or modded console and a limited edition sell for other prices than the standard one;
+    # a Steam Deck's edition is its storage
     edition = None
-    if model in ("steam deck", "steam deck oled"):
+    if any(not re.search(r"\b(?:kein\w*|nicht|ohne|no|not)\W+(?:\w+\W+)?$", t[max(0, m.start() - 25):m.start()])
+           for m in re.finditer(CONSOLE_MODDED, t)):
+        edition = "jailbreak"
+    elif re.search(CONSOLE_LIMITED, title):
+        edition = "limited"
+    elif model in ("steam deck", "steam deck oled"):
         s = storage(ad, title, "-") or storage(ad, t, "-")
         edition = str(s) if s else None
-    elif model and model.startswith(("ps5", "xbox series")):
-        edition = "-"
-    bundle = bool(re.search(r"(?:\+|inkl\.?|inklusive|mit|plus|samt)\s*(?:\d+\s*|vielen\s*|einigen\s*|mehreren\s*)?"
-                            r"(?:spiele|games|spielen)\b|\b\d+\s*(?:spiele|games)\b", t))
-    return dict(model=model, edition=edition or "-", bundle="with games" if bundle else "console only")
+    elif model:
+        edition = "standard"
+    games = re.search(r"(?:\+|inkl\.?|inklusive|mit|plus|samt)\s*(?:\d+\s*|vielen\s*|einigen\s*|mehreren\s*)?"
+                      r"(?:spiele|games|spielen)\b|\b\d+\s*(?:spiele|games)\b", t)
+    extras = re.search(CONSOLE_BIG_EXTRAS, tail(title))   # a monitor or VR set comes with it
+    return dict(model=model, edition=edition, bundle="with extras" if extras else "with games" if games
+                else "console only")
 
 
 # ---- audio ---------------------------------------------------------------------------------------------------

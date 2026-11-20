@@ -1355,6 +1355,30 @@ class MarketExtractTests(unittest.TestCase):
                   "Schale Case für PS Vita", "Red Dead Redemption 2 (PS4)"):
             self.assertIsNotNone(c(t)["junk"], t)
 
+    def test_console_games_parts_and_editions(self):
+        c = lambda t: mad(t, 450, kind="console")  # noqa: E731
+        # games and parts named after the console, a controller whose model number the old code cut off
+        for t in ("Madden NFL 25 PS5", "Taxi Life: A City Driving Simulator - PS5", "CD Minecraft PS5",
+                  "Call of Duty Black Ops 6 PS5", "Playstation 5 Controller", "Xbox 360 Controller weiß",
+                  "PS5 Laser 497A", "PS5 Lesekopf KEM-497", "PS5 OVP ohne Konsole", "PS 5 Frontblende"):
+            self.assertIsNotNone(c(t)["junk"], t)
+        for t in ("Sony PS5", "Verkaufe PS5", "Playstation 5 Disk Edition", "Nagelneue PS5", "PS5",
+                  "PS4 Slim 2 Controller", "Sony Playstation 5 Konsole"):
+            self.assertIsNone(c(t)["junk"], t)
+        e = lambda t: c(t)["specs"].get("edition")  # noqa: E731
+        self.assertEqual(e("PS5 Slim Disc"), "standard")
+        self.assertEqual(e("PS5 30th Anniversary Limited Edition"), "limited")
+        self.assertEqual(e("PS5 Jailbreak fähig Firmware 4.03"), "jailbreak")
+        self.assertEqual(e("Nintendo Switch gemoddet"), "jailbreak")
+        self.assertEqual(mad("PS5 Slim", 450, body="Kein Jailbreak, nicht gemoddet.", kind="console")["specs"]["edition"],
+                         "standard")
+        self.assertEqual(e("Steam Deck OLED 1TB"), "1024")
+        b = lambda t: c(t)["specs"]["bundle"]  # noqa: E731
+        self.assertEqual(b("PS5 + Monitor 27 Zoll"), "with extras")
+        self.assertEqual(b("PS5 inkl. PS Portal"), "with extras")
+        self.assertEqual(b("PS5 mit 2 Controllern"), "console only")
+        self.assertEqual(market.query_specs("ps5", "console"), {"model": "ps5", "edition": "standard"})
+
     def test_phones_keep_battery_notes_but_drop_cases(self):
         p = mad("iPhone 16 Pro 256GB | 90% Akku", 700, kind="phone")
         self.assertIsNone(p["junk"])
