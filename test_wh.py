@@ -560,6 +560,29 @@ class WhTests(TmpDbCase):
         self.assertIn("<!-- wh:sweep -->", saved)
         self.assertEqual(props["for"], "me")
 
+    def test_hunt_writes_the_models_answer_tamed_and_says_when_there_are_warnings(self):
+        path = os.path.join(self.tmp.name, "Goggles.md")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("---\ntype: buy\nstatus: open\nfor: me\nsearch: goggles\n---\n# Goggles\n")
+        page = search_page(1, [make_summary(1, "DJI Goggles V2", 180)])
+        answer = ("## Picks\n\n1. **Goggles** https://www.willhaben.at/iad/x#top\n- [x] done <img src=x>\n"
+                  "<!-- /wh:picks --> [[Secret]] ![[embed]] ![p](https://e.example/p.png)\n#deadline 2026-12-01\n"
+                  + "long " * 3000 + "\n\n## Warnings\n\nAd 1 looks like a scam\n")
+        c = wh.db()
+        self.addCleanup(c.close)
+        ns = mock.Mock(note=path, pages=1, limit=10, details=0, dry_run=False, no_ai=False)
+        with mock.patch.object(wh, "db", return_value=c), mock.patch.object(wh, "fetch", return_value=("u", page)), \
+             mock.patch.object(wh, "ask_claude", return_value=answer), \
+             mock.patch.object(wh, "log"), mock.patch("sys.stdout", io.StringIO()):
+            wh.cmd_hunt(ns)
+        saved, _ = wh.read_note(path)
+        self.assertEqual(saved.count("<!-- /wh:picks -->"), 1)
+        for bad in ("<img", "[[", "![", "\n#deadline", "- [x]"):
+            self.assertNotIn(bad, saved)
+        self.assertIn("1. **Goggles** https://www.willhaben.at/iad/x#top", saved)       # normal Markdown stays
+        self.assertIn("flagged ads that look like scams", saved)
+        self.assertLess(len(saved), 9000)
+
     def test_cmd_hunt_formats_metadata_and_splits_warnings_resiliently(self):
         note_path = os.path.join(self.tmp.name, "Laptop.md")
         with open(note_path, "w", encoding="utf-8") as f:

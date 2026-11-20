@@ -690,6 +690,15 @@ def mdsafe(s):
     return re.sub(r"(?<!\\)#(?=\w)", r"\\#", s.replace("<", "&lt;"))
 
 
+def tame_markdown(text, cap=6000):
+    """A model's Markdown answer made safe for a note: lists, bold, headings and https links stay; wh markers and raw
+    HTML, wikilinks, embeds, images, #tags at a word start and task checkboxes are neutralised; length capped."""
+    text = plain(text).replace("<", "&lt;").replace("[[", "(").replace("]]", ")").replace("![", "[")
+    text = re.sub(r"(?m)^(\s*(?:[-*+]|\d+[.)])\s+)\[[ xX]?\]", r"\1( )", text)
+    text = re.sub(r"(?<!\S)#(?=\w)", r"\\#", text)
+    return text if len(text) <= cap else text[:cap].rsplit("\n", 1)[0].rstrip() + "\n\n*(cut: answer too long)*"
+
+
 def link_text(s, n=70):
     return mdsafe(cell(s, n)).replace("[", "(").replace("]", ")")
 
@@ -1325,7 +1334,9 @@ def cmd_hunt(a):
     parts = re.split(r"^#{2,3}\s+Warnings\b[^\n]*\n?", ans, maxsplit=1, flags=re.M | re.I)
     picks, warnings = parts[0], parts[1] if len(parts) > 1 else ""
     picks = re.sub(r"\A.*?^#{2,3}\s+Picks\b[^\n]*\n?", "", picks, count=1, flags=re.M | re.S | re.I).strip()
-    out = "## Picks\n\n*wh hunt %s (Claude)*\n\n%s" % (datetime.now().strftime("%Y-%m-%d %H:%M"), picks)
+    out = "## Picks\n\n*wh hunt %s (Claude)*\n\n%s" % (datetime.now().strftime("%Y-%m-%d %H:%M"), tame_markdown(picks))
+    if warnings.strip():
+        out += "\n\n> Claude also flagged ads that look like scams or too good to be true. Read them in the terminal output of `wh hunt`: they are not saved here."
     if not a.dry_run:
         update_note(f, lambda t: put_block(t, "picks", out))
     print(out)
