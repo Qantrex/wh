@@ -1415,6 +1415,42 @@ class MarketExtractTests(unittest.TestCase):
         self.assertIsNone(lp("ThinkPad T480 mit Docking Station")["junk"])
         self.assertEqual(market.query_specs("thinkpad t480", "laptop"), {"model": "thinkpad t480", "sku": "thinkpad t480"})
 
+    def test_audio_models_one_spelling_and_series(self):
+        a = lambda t, kind="headphones": mad(t, 100, kind=kind)["specs"]  # noqa: E731
+        for t in ("Sony WH-1000XM4", "Sony WH 1000 XM4 Kopfhörer", "WH-1000XM4 Noise Cancelling"):
+            self.assertEqual(a(t)["model"], "sony wh1000xm4", t)
+        self.assertEqual(a("Sony WH-1000XM4")["series"], "sony wh1000")
+        for t in ("Ohrstöpsel aus Silikon für Beats Flex, X oder Powerbeats Pro", "Air Pods Pro Schachtel LEER",
+                  "Ladeschale für Samsung Galaxy Buds SM-R170"):
+            self.assertIsInstance(mad(t, 10, kind="headphones")["junk"], str, t)
+        self.assertEqual(a("Bose QuietComfort 35 II")["model"], "bose qc35ii")
+        self.assertEqual(a("Bose QuietComfort 35 II")["series"], "bose qc35")
+        self.assertEqual(a("Bose QC Ultra Headphones")["model"], "bose qc ultra")
+        self.assertEqual(a("DT 990 Pro 250 Ohm")["model"], "beyerdynamic dt990pro")
+        self.assertEqual(a("Sennheiser HD 600")["model"], a("Sennheiser HD600")["model"])
+        for t, model in (("Beats Studio Pro schwarz", "beats studio pro"), ("Shokz OpenRun Pro", "shokz openrunpro"),
+                         ("Samsung Galaxy Buds 2 Pro", "samsung galaxy buds 2 pro"), ("Marshall Monitor II", "marshall monitor ii"),
+                         ("Airpod Max Gen 1", "airpods max 1"), ("Air Pods Generation 2", "airpods 2"),
+                         ("Teufel Supreme On Kopfhörer Bluetooth", "teufel supreme on")):
+            self.assertEqual(a(t)["model"], model, t)
+        self.assertIsNone(a("Bluetooth Kopfhörer in ear")["model"])
+        self.assertEqual(a("JBL Kopfhörer Tune 510 BT")["model"], a("JBL Tune 510BT On-Ear")["model"])
+        self.assertEqual(a("Anker Soundcore Q30")["model"], a("soundcore by Anker Q30")["model"])
+        self.assertIsNotNone(mad("Airpod 3 ( Recht )", 30, kind="headphones")["junk"])
+        tt = lambda t: a(t, "turntable")  # noqa: E731
+        self.assertEqual(tt("Technics SL-1210 MK2")["model"], "technics sl1210mk2")
+        self.assertEqual(tt("Technics SL-1210 MK2")["series"], "technics sl1200")
+        self.assertEqual(tt("Technics SL1200 MK7 silber")["series"], "technics sl1200")
+        self.assertEqual(tt("Technics 1210 MK2 DJ Turntable")["model"], "technics sl1210mk2")
+        self.assertEqual(tt("Technics SL-1200M7L 50th Anniversary")["series"], "technics sl1200")
+        for t in ("Technics SL-1210 Mk2 Plattenspieler (2x Stück)", "Technics SL-1210 MK2 (Paar)",
+                  "Technics SL-BD3 - Anleitung im Original", "Technics SL-1210 M5G Headshell Neu!",
+                  "Technics EPA-A501G Tonarm"):
+            self.assertIsInstance(mad(t, 500, kind="turntable")["junk"], str, t)
+        self.assertEqual(tt("TECHNICS 1210 MK2 inclusive CASE von THON")["model"], "technics sl1210mk2")
+        self.assertEqual(tt("Pro-Ject Debut Carbon EVO")["model"], "project debutcarbonevo")
+        self.assertEqual(a("Denon AVR-X1600H", "hifi")["model"], "denon avrx1600h")
+
     def test_phones_keep_battery_notes_but_drop_cases(self):
         p = mad("iPhone 16 Pro 256GB | 90% Akku", 700, kind="phone")
         self.assertIsNone(p["junk"])
@@ -1480,6 +1516,15 @@ class MarketValueTests(unittest.TestCase):
         est = market.value_of(idx, "ram", ads[0]["specs"])
         self.assertEqual(est["level"], ("gen", "form", "kit"))
         self.assertIsNone(market.value_of({}, "ram", ads[0]["specs"]))
+
+    def test_series_key_values_only_specs_without_a_generation(self):
+        ads = [mad("Technics SL-1210 MK2", p, seller="a%d" % n, i=4000 + n, kind="turntable")
+               for n, p in enumerate([500, 520, 540, 560, 580])]
+        ads += [mad("Technics SL-1200 MK7", 900, seller="b%d" % n, i=4100 + n, kind="turntable") for n in range(2)]
+        idx = market.build_index(ads, "turntable")
+        est = market.value_of(idx, "turntable", market.query_specs("technics sl1200", "turntable"))
+        self.assertEqual(est["level"], ("series",))                 # no generation named: all SL-1200s
+        self.assertIsNone(market.value_of(idx, "turntable", ads[-1]["specs"]))   # an MK7 is not valued as an MK2
 
     def test_dealer_new_stock_and_junk_dont_count(self):
         ads = self.kits([100, 100, 100])

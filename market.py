@@ -63,7 +63,7 @@ def first(rx, *texts, group=1):
     return None
 
 
-HEAD_SPLIT = r"\s(?:\+|mit|inkl\.?|inklusive|samt|plus|und|&|incl\.?|sowie|zzgl\.?)\s|\s\+|\+\s|[,;|(!]|\s-\s|\s/\s"
+HEAD_SPLIT = r"\s(?:\+|mit|inkl\.?|inklusive|inclusive|samt|plus|und|&|incl\.?|sowie|zzgl\.?)\s|\s\+|\+\s|[,;|(!]|\s-\s|\s/\s"
 
 
 def tail(title):
@@ -723,7 +723,8 @@ def console(ad):
 
 # ---- audio ---------------------------------------------------------------------------------------------------
 
-AUDIO_BRANDS = (r"sony|bose|sennheiser|apple|beats|jbl|beyerdynamic|akg|audio[- ]?technica|shure|marshall|"
+AUDIO_BRANDS = (r"sony|bose|shokz|aftershokz|skullcandy|google|oneplus|sennheiser|apple|beats|jbl|beyerdynamic|akg|"
+                r"audio[- ]?technica|shure|marshall|"
                 r"bang\s*&\s*olufsen|b\s*&\s*o|b&o|bowers\s*&\s*wilkins|b&w|teufel|sonos|yamaha|denon|marantz|pioneer|"
                 r"onkyo|technics|harman\s*kardon|canton|magnat|klipsch|kef|dali|nubert|elac|heco|jamo|polk|wharfedale|"
                 r"q\s*acoustics|nad|cambridge\s*audio|rega|pro-?ject|thorens|dual|lenco|audio\s*pro|ultimate\s*ears|"
@@ -737,48 +738,121 @@ GENERIC_AUDIO = (r"kopfhörer|headphones?|headset|in-?ear|over-?ear|on-?ear|laut
                  r"vollverstärker|av|surround|tragbar|portable|mini|white|black|sport|gaming|studio|monitor|edition")
 
 
+# Well-known models whose names have no number, checked before the generic brand + model-number rule
+AUDIO_NAMED = [
+    (r"\bbeats\s*studio\s*pro\b", "beats studio pro"), (r"\bbeats\s*solo\s*pro\b", "beats solo pro"),
+    (r"\bbeats\s*solo\s*buds\b", "beats solo buds"), (r"\bpowerbeats\s*pro\s*2\b", "beats powerbeats pro 2"),
+    (r"\bpowerbeats\s*pro\b", "beats powerbeats pro"), (r"\bbeats\s*fit\s*pro\b", "beats fit pro"),
+    (r"\bstudio\s*buds\s*(?:\+|plus)", "beats studio buds plus"), (r"\bbeats\s*studio\s*buds\b", "beats studio buds"),
+    (r"\bbeats\s*flex\b", "beats flex"),
+    (r"\b(?:after)?shokz\s*(open\s*run\s*pro\s*2|open\s*run\s*pro|open\s*run|open\s*swim\s*pro|open\s*swim|"
+     r"open\s*fit\s*air|open\s*fit|open\s*move|open\s*comm\s*2?|aeropex)", "shokz {1}"),
+    (r"\bgalaxy\s*buds\s*(\d)?\s*(pro|live|fe|plus|\+)?", "samsung galaxy buds {1} {2}"),
+    (r"(?<!samsung )\bfree\s*buds\s*(pro\s*\d?|\d[a-z]?(?:\s*pro)?|se\s*\d?)?", "huawei freebuds {1}"),
+    (r"\bpixel\s*buds\s*(pro\s*\d?|a-?series)?", "google pixel buds {1}"),
+    (r"\b(?:quiet\s*comfort|qc)\s*-?\s*(ultra\s*earbuds|ultra|earbuds\s*(?:ii|2)?|se)\b", "bose qc {1}"),
+    (r"\bmarshall\s*(major|minor|monitor|mode|motif)\s*(ii|iii|iv|v|i|\d)?\b", "marshall {1} {2}"),
+    (r"\bteufel\s*(airy|supreme|real\s*blue)\b(?:\s*(on|in|sports|pro|tws|true\s*wireless))?", "teufel {1} {2}"),
+    (r"\bfocal\s*(clear|utopia|elear|elegia|stellia|bathys|celestee|radiance|azurys|hadenys)\b", "focal {1}"),
+    (r"\bskullcandy\s*(crusher\s*(?:evo|anc\s*2|anc)?|hesh\s*(?:evo|anc|3)?|indy\s*(?:evo|anc|fuel)?)", "skullcandy {1}"),
+    (r"\bpro-?\s*ject\s*(debut\s*(?:carbon|iii|ii|iv|pro|evo)?(?:\s*evo)?|essential\s*(?:iii|ii)?|primary|"
+     r"[ext]\s*1|x2|rpm\s*\d+(?:\s*carbon)?)", "project {1}"),
+    (r"\bearpods\b", "apple earpods"),
+]
+# Model codes that name their brand: a seller often leaves the brand out ("DT 990 Pro", "HD 600", "SL-1210 MK2")
+AUDIO_CODE_BRAND = [(r"\bdt\s*-?\s*(?:770|880|990|1770|1990)\b", "beyerdynamic"),
+                    (r"\bhd\s*-?\s*(?:4[3-9]\d|5[0-9]\d|6[0-9]\d|800|820)\b", "sennheiser"),
+                    (r"\bath\s*-?\s*m\d", "audio-technica"), (r"\bw[hf]\s*-?\s*1000\s*x?m", "sony"),
+                    (r"\bquiet\s*comfort", "bose"), (r"\bsl\s*-?\s*1[12][01]0", "technics")]
+AUDIO_SUFFIX = r"mk\s*\d|mk[ivx]+|xm\d|ii|iii|iv|pro|max|plus|se|gen\d?|\d|nc|x|s|m"
+
+
 def audio_model(t):
     """'sony wh1000xm4', 'airpods pro 2', 'technics sl1210 mk2' from a title; None without brand and model."""
-    m = re.search(r"\bairpods\s*(pro|max)?\s*(?:\(?\s*(\d)\s*\.?\s*(?:gen|generation)?\)?)?", t)
+    t = re.sub(r"\bair\s*-?\s*pods?\b", "airpods", t)
+    t = re.sub(r"\banker\s+soundcore\b|\bsoundcore\s+by\s+anker\b", "soundcore", t)
+    t = re.sub(r"\btechnics\s+(?:sl\s*-?\s*)?(1[12][01]0)\s*-?\s*", r"technics sl\1", t)   # "1210 mk2" = "sl-1210mk2"
+    m = re.search(r"\bairpods\s*(pro|max)?\s*(?:\(?\s*(\d)\s*\.?\s*(?:gen\w*|generation)?\)?|gen\w*\s*(\d))?", t)
     if m:
-        return norm("airpods %s %s" % (m.group(1) or "", m.group(2) or ""))
+        return norm("airpods %s %s" % (m.group(1) or "", m.group(2) or m.group(3) or ""))
+    for rx, name in AUDIO_NAMED:
+        m = re.search(rx, t)
+        if m:
+            parts = [re.sub(r"\s+", "", g) if g else "" for g in m.groups()]
+            return norm(name.format(None, *parts)).replace(" + ", " plus ")
     m = re.search(r"\b(%s)\b" % AUDIO_BRANDS, t)
     if not m:
-        return None
+        brand = next((b for rx, b in AUDIO_CODE_BRAND if re.search(rx, t)), None)
+        if not brand:
+            return None
+        t = brand + " " + t
+        m = re.search(r"\b(%s)\b" % AUDIO_BRANDS, t)
     brand = norm(m.group(1)).replace(" ", "")
-    words = re.findall(r"[a-z0-9][a-z0-9.+/-]*", t[m.end():])[:4]
+    words = re.findall(r"[a-z0-9äöüß][a-z0-9äöüß.+/-]*", t[m.end():])[:5]
     model = []
-    for w in words:
-        if re.fullmatch(GENERIC_AUDIO, w) and not model:
-            continue
+    for i, w in enumerate(words):
         if re.fullmatch(GENERIC_AUDIO, w):
+            if not model:
+                continue
             break
         model.append(w)
         if re.search(r"\d", w):
-            nxt = words[words.index(w) + 1] if words.index(w) + 1 < len(words) else ""
-            if re.fullmatch(r"mk\s*\d|mk[ivx]+|ii|iii|iv|pro|max|plus|se|gen\d?|\d", nxt):
+            for nxt in words[i + 1:i + 3]:               # "wh 1000 xm4", "sl-1210 mk2", "qc 35 ii"
+                if not re.fullmatch(AUDIO_SUFFIX, nxt):
+                    break
                 model.append(nxt)
             break
     if not model or not any(re.search(r"\d", w) for w in model):
         if brand == "sonos" and model and model[0] in ("one", "beam", "arc", "move", "roam", "sub", "five", "ace", "era"):
             return "sonos " + model[0]
         return None
-    name = re.sub(r"[.\-/]", "", " ".join(model))
-    name = name.replace("quietcomfort", "qc")
+    name = re.sub(r"[.\-/\s]", "", "".join(model)).replace("quietcomfort", "qc")
+    name = re.sub(r"(?<=\d)(?:bt|anc|tws)$", "", name)               # "tune 510 bt" = "tune 510bt" = "tune 510"
     return "%s %s" % (brand, name)
 
 
-AUDIO_PARTS = (r"ladecase|ladebox|lade-?case|charging\s*case|\bcase\b|hülle|ersatz|\beinzeln|\blinks\b|\brechts\b|"
+def audio_series(model):
+    """(series, generation): 'sony wh1000xm4' → ('sony wh1000', 'xm4'), 'technics sl1210mk2' → ('technics sl1200',
+    'mk2') (the 1210 is the black 1200), 'airpods pro 2' → ('airpods pro', '2'). The series is a looser key behind the
+    exact model; value_of uses it only for specs that name no generation, so a gen 1 is never valued as a gen 3."""
+    if not model:
+        return None, None
+    m = re.fullmatch(r"technics sl1[12][01]0([a-z0-9]*)", model)    # every SL-1200/1210: mk2, m5g, m7l, gr, g
+    if m:
+        return "technics sl1200", m.group(1) or None
+    m = re.search(r"(?:mk\s*\d+|mk[ivx]+|xm\d|gen\s*\d|(?<=\d)(?:ii|iii|iv|v)|\s(?:ii|iii|iv|v|\d))$", model)
+    s = model[:m.start()].strip() if m else model
+    if not s:
+        return model, None
+    return re.sub(r"\bsl1[12][01]0", "sl1200", s), (m.group(0).strip() if m else None)
+
+
+AUDIO_PARTS = (r"anleitung|service\s*manual|manual\s*service|schaltpl\w*|headshell|zarge|plinth|tonarm\w*|"
+               r"abdeckhaube|abdeckung|dust\s*cover|\bmotor\b|kugelschreiber|ohrstöpsel|ear\s*-?\s*tips|aufsätze|ladeschale|schachtel|\bleere?\b|\bnur\s+(?:die\s+)?(?:ovp|verpackung|karton)|"
+               r"ladecase|ladebox|lade-?case|charging\s*case|\bcase\b|hülle|ersatz|\beinzeln|\blinks\b|\brechte?s?\b|"
                r"ohrpolster|polster|\bkabel\b|ständer|halterung|fernbedienung|netzteil|nadel|tonabnehmer|riemen")
 
 
-def audio_kind(name, about, cats, words, not_this):
-    @kind(name, about, cats, keys=[("model",)], fields=["model"], words=words)
+AUDIO_ONE_SIDE = (r"(?:\(|\bnur\s+(?:der\s+|die\s+|das\s+)?)\s*(?:linke\w*|rechte\w*|links|rechts?|left|right)\b|"
+                  r"\b(?:links|rechts?|left|right)(?:\s+(?:seite|ohr|ear|bud|hörer))?\s*\)?\s*$")
+
+
+PAIR = r"\b(?:2\s*x|zwei)\s|\bpaar\b|\b2\s*stück"
+
+
+def audio_kind(name, about, cats, words, not_this, single=False):
+    @kind(name, about, cats, keys=[("model",), ("series",)], fields=["model"], words=words)
     def fn(ad):
         title = low_title(ad)
-        if re.search(not_this, title) or re.search(AUDIO_PARTS, head(title)):
+        if re.search(not_this, title) or re.search(AUDIO_PARTS, head(title)) or re.search(AUDIO_ONE_SIDE, title):
             return "accessory or part"
-        return dict(model=audio_model(title))
+        if re.search(r"(?:^|\s-\s*)(?:original\s+)?(?:bedienungs|betriebs|service)?\s*-?anleitung", title):
+            return "accessory or part"                      # "Technics SL-BD3 - Anleitung im Original"
+        if single and re.search(PAIR, title):
+            return "a pair, priced for two"
+        model = audio_model(title)
+        series, gen = audio_series(model)
+        return dict(model=model, series=series, gen=gen)
     return fn
 
 
@@ -793,7 +867,8 @@ audio_kind("hifi", "amplifiers and receivers", ["audio-hifi/stereoanlagen-versta
            r"^(?:neue?r?s?\s+)?(?:fernbedienung|kabel|netzteil|ersatz)\b")
 audio_kind("turntable", "turntables", ["audio-hifi/plattenspieler-turntables-6829"],
            r"\b(?:plattenspieler|turntable|tonarm)\b",
-           r"^(?:neue?r?s?\s+)?(?:nadel|tonabnehmer|system|riemen|haube|plattenteller|slipmat|ersatz|headshell)\b")
+           r"^(?:neue?r?s?\s+)?(?:nadel|tonabnehmer|system|riemen|haube|plattenteller|slipmat|ersatz|headshell)\b",
+           single=True)
 
 
 # ---- computers (on top of the built-in profiles) ----------------------------------------------------------------
@@ -1028,6 +1103,8 @@ def value_of(idx, name, sp, exclude=None):
     specific one with any value. Adds `level` (the key's fields) and `key`."""
     best = None
     for lvl, key in keys(name, sp):
+        if sp.get("gen") and "series" in KINDS[name]["keys"][lvl]:
+            continue                                        # a named generation is never valued by its series
         est = estimate(idx.get((lvl, key), []), exclude)
         if not est:
             continue
