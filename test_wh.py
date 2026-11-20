@@ -1419,8 +1419,8 @@ class SkillRulesTest(unittest.TestCase):
         self.assertIn("Pricing advice", sell)
         self.assertNotIn("Pricing advice", buy)
         self.assertNotIn("Judging a deal", sell)
-        self.assertLessEqual(len(sell.encode()), 5500)    # keep the rules each call sends small
-        self.assertLessEqual(len(buy.encode()), 5500)
+        self.assertLessEqual(len(sell.encode()), 5000)    # keep the rules each call sends small
+        self.assertLessEqual(len(buy.encode()), 5000)
 
 
     def test_skill_may_name_the_folder(self):
