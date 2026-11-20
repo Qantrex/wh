@@ -21,7 +21,7 @@ Setup: the Install section of the `wh` README (github.com/Qantrex/wh); `wh docto
 | `wh status [notes]` | is each open note's `ad:` still online, at what price? |
 | `wh sweep [notes] [--json] [--no-write]` | runs the `search:` URLs of open buy/wanted notes and writes new ads, price cuts, gone ads and a shortlist into the note's `<!-- wh:sweep -->` block; `--json` prints the same for scripts, `--no-write` leaves the notes alone |
 | `wh find <what> [--kind K] [--size 45-55] [--max N] [--area wien,noe] [--all] [--json]` | **best deals for an item:** ads below their market value, best first, e.g. `wh find 2x16gb ddr4 3200`, `wh find tv 45-55 zoll`. Checks the top 8 ads in full |
-| `wh value <what or ad link> [--price N] [--json]` | what an item or ad is worth used on willhaben: value, middle half, sellers, confidence, the ads behind it |
+| `wh value <what or ad link> [--price N] [--json]` | what an item or ad is worth used on willhaben: value, middle half, sellers, confidence, the ads behind it. A bare model (`dell u2723qe`) gets its kind from the ads in the database |
 | `wh crawl [kinds] [--full\|--new\|--list]` | reads whole categories into the database (the market values come from them); `find`/`value` do it by themselves |
 | `wh watch add NAME <what> [--kind K] [--below 0.25]` / `list` / `rm` / `run [--json]` | saved finds; `run` reports deals that are new or cheaper since the last run, once each |
 | `wh deal <id or link> [--compare "words"] [--question "…"]` | **AI:** verdict, comparable ads, a suggested offer, questions for the seller |

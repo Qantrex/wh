@@ -18,6 +18,7 @@ wh doctor                               # check config, notes, skill install, te
 wh find 2x16gb ddr4 3200 --area wien,noe   # the best deals: ads below their market value, best first
 wh find tv 45-55 zoll                   # works for whole kinds too (sizes for tv/monitor)
 wh value "LG OLED55C1"                  # what an item (or an ad link) is worth used, and the ads behind it
+wh value dell u2723qe                   # a bare model gets its kind from the ads already in the database
 wh crawl --list                         # the categories behind the market values, and when they were last read
 wh watch add gpu --kind gpu --below 0.35   # a saved find; `wh watch run --json` reports new deals once (for a timer)
 

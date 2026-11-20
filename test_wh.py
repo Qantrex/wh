@@ -1658,6 +1658,29 @@ class FindWatchTests(TmpDbCase):
         self.assertEqual(r["deals"][0]["discount"], 0.4)
         self.assertTrue(r["deals"][0]["comps"])
 
+    def test_value_finds_the_kind_of_a_model_query_from_the_database(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        mon = [make_summary(700 + n, t, p, cats="5824;5849") for n, (t, p) in enumerate([
+            ("Dell U2723QE 27 Zoll 4K", 400), ("DELL U2723QE Monitor", 420), ("Dell UltraSharp U2723-QE", 380),
+            ("Dell U2723QE wie neu", 410)])]
+        cams = [make_summary(800 + n, t, 900, cats="5824;7777") for n, t in enumerate(
+            ["Sony A7 III Body", "Sony A7III mit Objektiv", "Sony a7 iii Kit"])]
+        self.fill(c, mon + cams + [make_summary(810, "Sony A7 III Kopfhörer?", 50, cats="5824;6813")], wh.now())
+        self.assertIsNone(market.guess_kind("dell u2723qe"))
+        self.assertEqual(wh.kind_from_db(c, "dell u2723qe"), "monitor")
+        self.assertIsNone(wh.kind_from_db(c, "sony a7 iii"))             # a camera: most ads with these words are no kind
+        self.assertIsNone(wh.kind_from_db(c, "sony xyz9"))
+        out = io.StringIO()
+        with mock.patch.object(wh, "db", return_value=c), mock.patch("sys.stdout", out), \
+                mock.patch.object(wh, "fetch") as fetch:
+            wh.cmd_value(self.args(words=["dell", "u2723qe"], price=None))
+        fetch.assert_not_called()
+        r = json.loads(out.getvalue())
+        self.assertEqual((r["kind"], r["value"]["value"], r["value"]["n"]), ("monitor", 400, 4))
+        with mock.patch.object(wh, "db", return_value=c), self.assertRaisesRegex(wh.WhError, "can't tell"):
+            wh.cmd_value(self.args(words=["sony", "a7", "iii"], price=None))
+
     def test_watch_reports_new_or_cheaper_ads_once_and_not_the_starting_stock(self):
         c = wh.db()
         self.addCleanup(c.close)

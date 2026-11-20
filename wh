@@ -9,6 +9,7 @@ Every ad wh sees goes into ~/.local/share/wh/wh.db (price history, "new since la
 your notes folder (WH_NOTES or `notes` in ~/.config/wh/config.toml). Only public pages are read; anything behind the login stays with Claude in Chrome.
 """
 import argparse
+import collections
 import gzip
 import hashlib
 import html
@@ -1637,6 +1638,23 @@ def deal_table(rows, name, md=False):
     return "\n".join([fmt(head)] + [fmt(r) + "\n    " + x["url"] for r, x in zip(out, rows)])
 
 
+def kind_from_db(c, query):
+    """The kind of a brand/model query that no kind word names, from the ads already in the database: the kind that
+    most ads with all the query's words in their title are in ('dell u2723qe' → monitor). None unless at least two
+    such ads, 60 % of them in one kind, and that kind reads a model from the query ('sony a7 iii' stays None)."""
+    words = re.findall(r"[a-z0-9äöüß]+", re.sub(r"(?<=\w)[-\s](?=\d)", "", query.lower()))
+    if not words or len("".join(words)) < 3:
+        return None
+    sql = "select cats from ads where " + " and ".join(["replace(replace(lower(title), ' ', ''), '-', '') like ?"] * len(words))
+    rows = c.execute(sql, ["%" + w + "%" for w in words]).fetchall()
+    n = collections.Counter(market.kind_of(dict(cats=r[0])) for r in rows)
+    name, top = (n.most_common(1) or [(None, 0)])[0]
+    if not name or top < 2 or top < 0.6 * len(rows) or not market.keys(name, market.query_specs(query, name)):
+        return None
+    log("%s: %d of the %d ads with these words are %s ads, valuing it as one" % (query, top, len(rows), name))
+    return name
+
+
 def resolve(a, query):
     """(kind, wanted specs, size range) for a query and the --kind/--size options."""
     name = a.kind or market.guess_kind(query)
@@ -1875,6 +1893,8 @@ def cmd_value(a):
         want, label, exclude = ad["specs"], ad["title"], i
         price = price if price is not None else ad.get("price")
     else:
+        if not a.kind and not market.guess_kind(target):
+            a.kind = kind_from_db(c, target)
         name, want, _ = resolve(a, target)
         label, exclude = target, None
     if not a.no_crawl:
