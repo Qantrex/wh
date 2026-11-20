@@ -1405,20 +1405,44 @@ class SkillRulesTest(unittest.TestCase):
             self.assertEqual(wh.skill_path(), wh.SHIPPED_SKILL)
             self.assertIn("Pricing advice", wh.skill_rules("sell"))
 
-    def test_shipped_skill_has_no_personal_data(self):
-        # Generic markers live here; personal words stay private: WH_LEAKWORDS may name a file with one word per
-        # line (e.g. ~/.config/wh/leakwords), so this public repo never lists them itself.
-        words = ["~/Notes", "homelab repo"]
+    def test_public_tree_has_no_personal_data(self):
+        # Generic markers live here (split so this file does not hold them); personal words stay private:
+        # WH_LEAKWORDS may name a file with one word per line (e.g. ~/.config/wh/leakwords), so this public repo
+        # never lists them itself. Every tracked file is checked, not only the skill.
+        words = ["~/" + "Notes", "homelab" + " repo"]
         leak = os.environ.get("WH_LEAKWORDS")
         if leak:
             with open(os.path.expanduser(leak), encoding="utf-8") as f:
                 words += [w.strip() for w in f if w.strip() and not w.startswith("#")]
-        d = os.path.dirname(wh.SHIPPED_SKILL)
-        for name in sorted(os.listdir(d)):
-            with open(os.path.join(d, name), encoding="utf-8") as f:
-                text = f.read()
+        try:
+            names = subprocess.run(["git", "ls-files", "-z"], cwd=HERE, capture_output=True, text=True,
+                                   check=True).stdout.split("\0")
+        except (OSError, subprocess.CalledProcessError):
+            names = []
+        names = [n for n in names if n]
+        if not names:                                       # not a git checkout (a copy of the files): walk it
+            names = [os.path.relpath(os.path.join(d, f), HERE) for d, ds, fs in os.walk(HERE)
+                     if ".git" not in d.split(os.sep) and "__pycache__" not in d for f in fs]
+        self.assertIn("wh", names)
+        for name in sorted(names):
+            try:
+                with open(os.path.join(HERE, name), encoding="utf-8") as f:
+                    text = f.read()
+            except (OSError, UnicodeDecodeError):
+                continue                                    # a binary file
             for word in words:
                 self.assertNotIn(word, text, name)
+
+    def test_leak_check_catches_a_word_in_any_tracked_file(self):
+        with open(os.path.join(HERE, "README.md"), encoding="utf-8") as f:
+            readme = f.read()
+        tmp = os.path.join(self.tmp.name, "leak")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("wh\n")                                 # a word every file holds: the test must fail on it
+        with mock.patch.dict(os.environ, {"WH_LEAKWORDS": tmp}):
+            with self.assertRaises(AssertionError):
+                self.test_public_tree_has_no_personal_data()
+        self.assertTrue(readme)
 
 
 import market  # noqa: E402
