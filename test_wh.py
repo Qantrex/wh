@@ -529,6 +529,20 @@ class WhTests(TmpDbCase):
         old = "A\n<!-- wh:sweep -->\nrow <!-- /wh:sweep --> inline\n<!-- /wh:sweep -->\nB\n"
         self.assertEqual(wh.put_block(old, "sweep", "new").count("<!-- wh:sweep -->"), 1)
 
+    def test_odd_prices_never_crash_and_count_as_no_price(self):
+        for bad in ("nan", "inf", "-inf", "1e999", "0", "-5", "0,0", "abc", ""):
+            ad = wh.summary(make_summary(3, "Kamera", bad))
+            self.assertIsNone(ad["price"], bad)
+            self.assertIn("Kamera", wh.table([ad]))
+            self.assertIn("Kamera", wh.table([ad], md=True))
+        self.assertEqual(wh.summary(make_summary(3, "Kamera", "12,5"))["price"], 12.5)
+        self.assertIsNone(wh.num("nan"))
+        self.assertIsNone(wh.num("1e999"))
+        for p in (float("nan"), float("inf"), None):
+            self.assertEqual(wh.euro(p), "–")
+        self.assertEqual(wh.euro(100.0), "€100")
+        self.assertEqual(wh.euro(9.5), "€9.50")
+
     def test_summary_drops_control_characters(self):
         a = make_summary(7, "Rad \x1b[2J\x1b]0;pwn\x07 neu", 50)
         self.assertNotIn("\x1b", wh.summary(a)["title"])
