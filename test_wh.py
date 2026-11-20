@@ -1437,7 +1437,19 @@ class MarketExtractTests(unittest.TestCase):
         self.assertEqual((s["series"], s["panel"]), ("q80t", "qled"))
         self.assertEqual(mad("Fernseher 139 cm", 100, kind="tv")["specs"]["size"], 55)
         self.assertEqual(mad("Fernseher", 100, kind="tv", tattrs="[5807;7316]")["specs"]["size"], 55)
-        for t in ("Samsung Netzteil für Smart TV", "Rückwand eines QE50Q60T", "LG 55UK Komplettchassis da Displaybruch"):
+        s = mad("Samsung Fernseher UE55U7020FU", 350, kind="tv")["specs"]
+        self.assertEqual((s["series"], s["size"], s["res"]), ("u7020", 55, "4k"))
+        s = mad("Samsung UE46F6640SS", 150, kind="tv")["specs"]
+        self.assertEqual((s["series"], s["year"], s["res"]), ("f6640", 2012, None))      # 2013, in two-year steps
+        self.assertEqual(mad("Samsung UE55NU7400", 300, kind="tv")["specs"]["year"], 2018)
+        self.assertEqual(mad("Samsung Fernseher LE32D551", 30, kind="tv")["specs"]["series"], "d551")
+        self.assertEqual(mad("Philips 55OLED808 55\" Ambilight", 700, kind="tv")["specs"]["series"], "oled808")
+        for t, series in (("LG49UH6109 Fernseher TV", "uh6109"), ("LG Fernseher 42LE4500", "le4500"),
+                          ("LG Smart TV 43 Zoll - Modell 43LH590V-ZD - webOS", "lh590"),
+                          ("Philips 32PFL5007K Fernseher", "pfl5007")):
+            self.assertEqual(mad(t, 50, kind="tv")["specs"]["series"], series, t)
+        for t in ("Samsung Netzteil für Smart TV", "Rückwand eines QE50Q60T", "LG 55UK Komplettchassis da Displaybruch",
+                  "Bedienungsanleitung User Guide Samsung TV UE46F6640SS"):
             self.assertIsNotNone(mad(t, 20, kind="tv")["junk"], t)
 
     def test_defect_condition_is_junk(self):

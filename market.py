@@ -412,6 +412,8 @@ def monitor(ad):
 
 TV_YEAR_SAMSUNG = {"h": 2014, "j": 2015, "k": 2016, "m": 2017, "n": 2018, "r": 2019, "t": 2020, "a": 2021,
                    "b": 2022, "c": 2023, "d": 2024, "f": 2025}
+TV_YEAR_SAMSUNG_OLD = {"a": 2008, "b": 2009, "c": 2010, "d": 2011, "e": 2012, "f": 2013, "h": 2014, "j": 2015,
+                       "k": 2016, "m": 2017, "n": 2018}
 TV_YEAR_SONY = {"c": 2015, "d": 2016, "e": 2017, "f": 2018, "g": 2019, "h": 2020, "j": 2021, "k": 2022, "l": 2023,
                 "m": 2024}
 TV_YEAR_LG_OLED = {"6": 2016, "7": 2017, "8": 2018, "9": 2019, "x": 2020, "1": 2021, "2": 2022, "3": 2023,
@@ -423,17 +425,26 @@ TV_YEAR_LG_LED = {"uh": 2016, "uj": 2017, "uk": 2018, "um": 2019, "un": 2020, "u
 def tv_code(t):
     """(brand, series, size, year, panel, res) from a TV model number, as far as it tells; None if none found."""
     m = re.search(r"\b(?:ue|gu|qe|gq|qn|un)\s*-?\s*(\d{2})\s*(q\d{2,3}[a-z]|qn\d{2,3}[a-z]|s9\d[a-z]|s8\d[a-z]|"
-                  r"ls\d{2}[a-z]|[a-z]{2}\d{4})", t)
+                  r"ls\d{2}[a-z]|[a-z]{1,2}\d{4})", t)
     if m:
         s = m.group(2)
-        y = TV_YEAR_SAMSUNG.get(s[-1] if s[0] in "qs" or s.startswith("ls") else s[0])
+        if s.startswith(("q", "s8", "s9", "ls")):
+            y, res = TV_YEAR_SAMSUNG.get(s[-1]), "4k"
+        elif s[1] == "u":                                    # "ru7100", "nu7400", "hu7500": UHD, the year letter first
+            y, res = TV_YEAR_SAMSUNG.get(s[0]), "4k"
+        else:                                                # older full-HD naming: "f6400", "es6300", "j5200"
+            y, res = TV_YEAR_SAMSUNG_OLD.get(s[0]), "4k" if s[0] == "u" else None
         panel = "oled" if re.match(r"s9|s8", s) else "qled" if s[0] == "q" or s.startswith("ls") else "led"
-        return "samsung", s, int(m.group(1)), y, panel, "4k"
+        return "samsung", s, int(m.group(1)), y, panel, res
+    m = re.search(r"\b(le|ps)\s*-?\s*(\d{2})\s*([a-f]\d{3})", t)         # Samsung LCD and plasma, 2008-2011
+    if m:
+        return ("samsung", m.group(3), int(m.group(2)), TV_YEAR_SAMSUNG_OLD.get(m.group(3)[0]),
+                "plasma" if m.group(1) == "ps" else "led", None)
     m = re.search(r"\boled\s*-?(\d{2})\s*([abcegwzr])([6-9x1-5])", t)
     if m:
         return "lg", "oled " + m.group(2) + m.group(3), int(m.group(1)), TV_YEAR_LG_OLED.get(m.group(3)), "oled", "4k"
-    m = re.search(r"\b(\d{2})\s*(nano\d{2,3}|qned\d{2,3}|u[hjkmnpqrta]\d{3,4}|l[hjkm]\d{3,4})\b", t)
-    if m and re.search(r"\blg\b", t):
+    m = re.search(r"(?:\b|(?<=lg))(\d{2})\s*(nano\d{2,3}|qned\d{2,3}|u[hjkmnpqrta]\d{3,4}|l[a-z]\d{2,4})(?:[a-z]{0,2})\b", t)
+    if m and re.search(r"\blg", t):
         s = m.group(2)
         panel = "qled" if s.startswith(("nano", "qned")) else "led"
         return "lg", s, int(m.group(1)), TV_YEAR_LG_LED.get(s[:2]), panel, "4k" if not s.startswith("l") else None
@@ -443,11 +454,13 @@ def tv_code(t):
         y = TV_YEAR_SONY.get(s[-1]) if s[-1].isalpha() else TV_YEAR_SONY.get(s[1]) if s[0] in "xa" else None
         panel = "oled" if s.startswith("a") else "led"
         return "sony", s, int(m.group(1)), y, panel, None if t.find("kdl") >= 0 else "4k"
-    m = re.search(r"\b(\d{2})\s*(pus|pud|pml|oled|pfs|pfk|pht|pug|pfh|phs)\s*(\d{4})", t)
+    m = re.search(r"\b(\d{2})\s*(pus|pud|pml|oled|pfs|pfk|pht|pug|pfh|phs|pfl|pf)\s*(\d{3,4})", t)
     if m:
         panel = "oled" if m.group(2) == "oled" else "led"
         res = {"pus": "4k", "pud": "4k", "pml": "4k", "oled": "4k", "pug": "4k"}.get(m.group(2), "1080p")
-        return "philips", m.group(2) + m.group(3), int(m.group(1)), 2015 + int(m.group(3)[-1]), panel, res
+        old = m.group(2) in ("pfl", "pf")            # 2006-2014: the year digit isn't the last one
+        return ("philips", m.group(2) + m.group(3), int(m.group(1)), None if old else 2015 + int(m.group(3)[-1]), panel,
+                None if old else res)
     m = re.search(r"\btx\s*-?\s*(\d{2})\s*([a-z]{2,3}\d{3,4})", t)
     if m:
         return "panasonic", m.group(2), int(m.group(1)), None, "oled" if "z" in m.group(2)[:3] else None, None
@@ -461,7 +474,8 @@ def tv_code(t):
 def tv(ad):
     title, t = low_title(ad), full_text(ad)
     if re.search(r"^(?:neue?r?s?\s+)?(?:wandhalterung|halterung|fernbedienung|standfuß|füße|kabel|netzteil|"
-                 r"mainboard|board|panel|t-?con|backlight|led[- ]?streifen|ersatz)", title):
+                 r"mainboard|board|panel|t-?con|backlight|led[- ]?streifen|ersatz|bedienungsanleitung|anleitung|"
+                 r"user\s*guide|manual)", title):
         return "part or accessory, not a TV"
     if re.search(r"\b(?:\d)\s*(?:x|stk\.?|stück)\s*(?:tv|fernseher)", title):
         return "several TVs"
