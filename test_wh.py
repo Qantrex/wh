@@ -574,6 +574,18 @@ class WhTests(TmpDbCase):
                 with self.assertRaises(wh.FetchError):
                     wh.fetch("https://www.willhaben.at/x")
 
+    def test_template_value_with_a_bad_group_reference_fails_at_load(self):
+        def tpl(value, match="foo"):
+            return {"field": [{"name": "f", "values": [{"match": match, "value": value}]}]}
+        for bad in (r"\1", r"\g<nope>", r"\q"):
+            with self.assertRaises(ValueError) as e:
+                profiles.parse_template("t", tpl(bad))
+            self.assertIn("bad value", str(e.exception))
+        ok = profiles.parse_template("t", tpl(r"\1 GB", r"(\d+) ?gb"))
+        ad = {"title": "ram 16 GB", "price": 10}
+        profiles.template_annotate(ok, ad)
+        self.assertEqual(ad["f"], "16 GB")
+
     def test_summary_drops_control_characters(self):
         a = make_summary(7, "Rad \x1b[2J\x1b]0;pwn\x07 neu", 50)
         self.assertNotIn("\x1b", wh.summary(a)["title"])
