@@ -221,11 +221,11 @@ class TmpDbCase(unittest.TestCase):
         self.db_path = os.path.join(self.tmp.name, "wh.db")
         self.orig = (wh.DB, wh.DELAY, wh.RATE, wh.WORKERS)
         wh.DB, wh.DELAY, wh.RATE, wh.WORKERS = self.db_path, 0.0, 0, 1   # in order, no waiting
-        wh._slow[0], wh._next[0] = False, 0.0
+        wh._slow[0], wh._next[0], wh._slow_at[0] = False, 0.0, None
 
     def tearDown(self):
         wh.DB, wh.DELAY, wh.RATE, wh.WORKERS = self.orig
-        wh._slow[0], wh._next[0] = False, 0.0
+        wh._slow[0], wh._next[0], wh._slow_at[0] = False, 0.0, None
         self.tmp.cleanup()
 
 
@@ -1717,6 +1717,29 @@ class FindWatchTests(TmpDbCase):
         self.fill(c, [make_summary(100, "Kingston 2x8GB DDR4 3200", 50, cats="5824;5878;5887")], wh.now(), full=False)
         rows = {r["id"]: r for r in wh.kind_rows(c, "ram")}
         self.assertEqual(rows[100]["specs"]["kit"], "2x8")
+
+    def test_full_crawl_stores_one_category_before_reading_the_next(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        seen = []                                         # ads in the database when each category's page 1 is read
+        cats = {"laptops-5824": make_summary(700, "ThinkPad T480", 300, cats="5824"),
+                "pc-komponenten/arbeitsspeicher-5878": make_summary(701, "Kingston 2x16GB DDR4 3200", 90, cats="5824;5878")}
+
+        def fake(url, binary=False):
+            seen.append(c.execute("select count(*) from ads").fetchone()[0])
+            p = next(k for k in cats if k in url)
+            return url, search_page(1, [cats[p]])
+        with mock.patch.object(wh, "fetch", side_effect=fake), mock.patch.object(wh, "log"), \
+             mock.patch.object(wh, "kind_rows"), mock.patch.object(wh, "prune"), \
+             mock.patch.dict(market.KINDS, {"x": dict(market.KINDS["ram"], cats=["marktplatz/" + p for p in cats])}):
+            wh.crawl(c, ["x"], full=True)
+        self.assertEqual(seen, [0, 1])
+
+    def test_crawl_summary_says_when_willhaben_pushed_back(self):
+        self.assertEqual(wh.pushback_note(1000.0), "")
+        with mock.patch.object(wh, "log"), mock.patch.object(wh.time, "time", return_value=1120.0):
+            wh.slow_down("HTTP 429")
+        self.assertIn("pushed back after 120 s", wh.pushback_note(1000.0))
 
     def test_crawl_new_stops_at_a_page_with_nothing_new(self):
         c = wh.db()

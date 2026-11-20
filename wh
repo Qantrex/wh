@@ -73,6 +73,7 @@ OPEN = {"open", "active", "waiting", "live", "reserved"}
 _lock = threading.Lock()
 _next = [0.0]                                              # monotonic time the next request may start
 _slow = [False]                                            # set when willhaben pushes back
+_slow_at = [None]                                          # time.time() of the first pushback, for the run summary
 
 
 class WhError(Exception):
@@ -112,6 +113,7 @@ def slow_down(why):
         if not _slow[0]:
             log("  willhaben pushed back (%s): one request every %.1f s from now on" % (why, DELAY))
         _slow[0] = True
+        _slow_at[0] = _slow_at[0] or time.time()
         _next[0] = max(_next[0], time.monotonic() + 5)
 
 
@@ -1402,11 +1404,12 @@ def crawl(c, kinds, full=None, max_pages=400, budget=None):
         (whole if stale else fresh).append(p)
     if whole:
         log("full crawl of %d categor%s (once a day; about 1 s per 1000 ads):" % (len(whole), "y" if len(whole) == 1 else "ies"))
-        t = now()
-        res = run_searches(c, [(search_url(url=p), None) for p in whole], max_pages, record=False)
-        for p, r in zip(whole, res):
+        for p in whole:                     # one category at a time and stored right away: memory stays at the biggest one
+            t = now()
+            r = run_searches(c, [(search_url(url=p), None)], max_pages, record=False)[0]
             record_crawl(c, search_url(url=p), p, r["found"], r["complete"], t)
-        c.commit()
+            c.commit()
+            del r
     if fresh:
         log("new ads in %d categor%s:" % (len(fresh), "y" if len(fresh) == 1 else "ies"))
         crawl_new(c, fresh, budget=budget)
@@ -1922,7 +1925,15 @@ def cmd_crawl(a):
         return
     t = time.time()
     crawl(c, kinds, full=True if a.full else (False if a.new else None), budget=getattr(a, "budget", None))
-    log("done in %.0f s" % (time.time() - t))
+    log("done in %.0f s%s" % (time.time() - t, pushback_note(t)))
+
+
+def pushback_note(t):
+    """'; willhaben pushed back after 120 s, …' when it did during a run that started at t (else ''): a slow crawl is
+    then willhaben's limit, not wh."""
+    if not _slow_at[0]:
+        return ""
+    return "; willhaben pushed back after %.0f s, the rest ran at one request per %.1f s" % (max(_slow_at[0] - t, 0), DELAY)
 
 
 # ---- watches: saved finds that report new deals once -------------------------------------------------------------
