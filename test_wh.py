@@ -1893,6 +1893,61 @@ class FindWatchTests(TmpDbCase):
         self.assertEqual(calls, [1, 2])
         self.assertIsNotNone(c.execute("select id from ads where id=950").fetchone())
 
+    def crawl_args(self, **kw):
+        return mock.Mock(**dict(dict(kinds=["ram"], list=False, full=False, new=True, budget=None), **kw))
+
+    def test_a_crawl_that_read_nothing_is_not_recorded_and_fails(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        cats = market.KINDS["ram"]["cats"]
+        for broken in (wh.FetchError("boom"), "<html>no data</html>"):
+            def fake(url, binary=False):
+                if isinstance(broken, Exception):
+                    raise broken
+                return url, broken
+            for new in (True, False):
+                with mock.patch.object(wh, "db", return_value=c), mock.patch.object(wh, "fetch", side_effect=fake), \
+                     mock.patch.object(wh, "log"), mock.patch.object(wh, "kind_rows"), mock.patch.object(wh, "prune"):
+                    with self.assertRaises(wh.WhError) as e:
+                        wh.cmd_crawl(self.crawl_args(new=new, full=not new))
+                self.assertIn("read nothing", str(e.exception))
+        self.assertEqual(c.execute("select count(*) from runs").fetchone()[0], 0)
+        self.assertEqual(len(cats), len(set(cats)))
+
+    def test_a_crawl_with_one_failed_category_warns_and_succeeds(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        cats = ["marktplatz/a-1", "marktplatz/b-2"]
+        ok = search_page(1, [make_summary(900, "Kamera", 10, cats="1")])
+
+        def fake(url, binary=False):
+            if "b-2" in url:
+                raise wh.FetchError("boom")
+            return url, ok
+        with mock.patch.object(wh, "db", return_value=c), mock.patch.object(wh, "fetch", side_effect=fake), \
+             mock.patch.object(wh, "log") as log, mock.patch.object(wh, "kind_rows"), mock.patch.object(wh, "prune"), \
+             mock.patch.dict(market.KINDS, {"x": dict(market.KINDS["ram"], cats=cats)}):
+            wh.cmd_crawl(self.crawl_args(kinds=["x"], new=True))
+        self.assertTrue(any("1 of 2 categories could not be read" in str(x) for x in log.call_args_list))
+        self.assertEqual(c.execute("select count(*) from runs").fetchone()[0], 1)
+
+    def test_crawl_new_keeps_the_pages_read_before_a_failing_page(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        new = [make_summary(950 + n, "Neu 2x16GB DDR4 3200", 90 + n, cats="5824;5878;5887") for n in range(3)]
+
+        def fake(url, binary=False):
+            n = int(re.search(r"page=(\d+)", url).group(1))
+            if n == 2:
+                raise wh.FetchError("boom")
+            return url, search_page(5000, new[:1])
+        partial = []
+        with mock.patch.object(wh, "fetch", side_effect=fake), mock.patch.object(wh, "log"):
+            out = wh.crawl_new(c, [self.RAM], partial=partial)
+        self.assertEqual(partial, [self.RAM])
+        self.assertEqual(len(out[self.RAM][1]), 1)
+        self.assertIsNotNone(c.execute("select id from ads where id=950").fetchone())
+
     def test_crawl_new_budget_stops_reading_but_keeps_what_it_read(self):
         c = wh.db()
         self.addCleanup(c.close)

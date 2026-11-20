@@ -1410,12 +1410,14 @@ def record_crawl(c, url, path, found, complete, t):
               (crawl_key(path), url, t, found, int(complete)))
 
 
-def crawl_new(c, paths, max_pages=10, budget=None):
+def crawl_new(c, paths, max_pages=10, budget=None, partial=None):
     """Read each category from its newest ads until a page has nothing new or changed (at most max_pages pages).
     Categories run side by side, pages within one one after the other. Returns {path: (found, ads read)}.
     budget: seconds after which no further page is started; what was read until then is still stored (a caller that
-    kills wh at its time limit would lose all of it)."""
+    kills wh at its time limit would lose all of it). A category whose first page can't be read is not in the result and
+    is not recorded; one that fails after its first page keeps what it read and is added to the list `partial`."""
     deadline = time.monotonic() + budget if budget else None
+    partial = [] if partial is None else partial
     known = {}
     for p in paths:
         cid = re.search(r"(\d+)$", p).group(1)
@@ -1428,8 +1430,17 @@ def crawl_new(c, paths, max_pages=10, budget=None):
             if deadline and page > 1 and time.monotonic() > deadline:
                 log("  %s: time budget used up after %d page%s" % (p.rsplit("/", 1)[-1], page - 1, "" if page == 2 else "s"))
                 break
-            r = read_page("%s&page=%d" % (url, page))
+            try:
+                r = read_page("%s&page=%d" % (url, page))
+            except FetchError as e:
+                if page == 1:
+                    raise
+                log("  %s: page %d failed, keeping the %d ads read before it (%s)" % (p.rsplit("/", 1)[-1], page, len(got), e))
+                partial.append(p)
+                break
             if not isinstance(r, tuple):
+                if page == 1:
+                    raise FetchError("page 1 has no search result")
                 break
             found, ads = r
             got += ads
@@ -1453,7 +1464,9 @@ def crawl_new(c, paths, max_pages=10, budget=None):
 
 def crawl(c, kinds, full=None, max_pages=400, budget=None):
     """Bring the database up to date for these kinds: a full crawl of every category whose last full crawl is older
-    than FULL_CRAWL_H hours (or all of them with full=True), only the new ads of the others (none with full=False)."""
+    than FULL_CRAWL_H hours (or all of them with full=True), only the new ads of the others (none with full=False).
+    Returns (paths where nothing could be read, paths where only part could be read, number of categories)."""
+    failed, partial = [], []
     paths = list(dict.fromkeys(p for k in kinds for p in market.KINDS[k]["cats"]))
     whole, fresh = [], []
     for p in paths:
@@ -1465,16 +1478,23 @@ def crawl(c, kinds, full=None, max_pages=400, budget=None):
         for p in whole:                     # one category at a time and stored right away: memory stays at the biggest one
             t = now()
             r = run_searches(c, [(search_url(url=p), None)], max_pages, record=False)[0]
-            record_crawl(c, search_url(url=p), p, r["found"], r["complete"], t)
+            if r["error"] and not r["ads"]:                 # nothing read: not a crawl, so nothing is recorded
+                failed.append(p)
+            else:
+                if r["error"]:
+                    partial.append(p)
+                record_crawl(c, search_url(url=p), p, r["found"], r["complete"], t)
             c.commit()
             del r
     if fresh:
         log("new ads in %d categor%s:" % (len(fresh), "y" if len(fresh) == 1 else "ies"))
-        crawl_new(c, fresh, budget=budget)
+        got = crawl_new(c, fresh, budget=budget, partial=partial)
+        failed += [p for p in fresh if p not in got]
     if whole:
         prune(c)
         for k in kinds:                                     # annotate now, so the next watch run starts warm
             kind_rows(c, k)
+    return failed, partial, len(paths)
 
 
 PRUNE_DAYS = 180
@@ -2002,8 +2022,14 @@ def cmd_crawl(a):
                 print("%-11s %-58s %7d ads  full crawl %s" % (k, p, n, last_full_crawl(c, p) or "never"))
         return
     t = time.time()
-    crawl(c, kinds, full=True if a.full else (False if a.new else None), budget=getattr(a, "budget", None))
+    failed, partial, total = crawl(c, kinds, full=True if a.full else (False if a.new else None),
+                                   budget=getattr(a, "budget", None))
     log("done in %.0f s%s" % (time.time() - t, pushback_note(t)))
+    if total and len(failed) == total:
+        raise WhError("crawl read nothing: all %d categories failed (is willhaben reachable, or did the site change?)" % total)
+    if failed or partial:
+        log("wh: warning: %d of %d categories could not be read%s; the database is only partly up to date"
+            % (len(failed), total, " and %d only in part" % len(partial) if partial else ""))
 
 
 def pushback_note(t):
