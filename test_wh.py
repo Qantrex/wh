@@ -586,6 +586,18 @@ class WhTests(TmpDbCase):
         profiles.template_annotate(ok, ad)
         self.assertEqual(ad["f"], "16 GB")
 
+    def test_database_file_is_private_and_an_old_one_is_tightened(self):
+        path = os.path.join(self.tmp.name, "new", "wh.db")
+        with mock.patch.object(wh, "DB", path):
+            wh.db().close()
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            os.chmod(path, 0o644)
+            wh.db().close()
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            os.chmod(path, 0o644)
+            with mock.patch("os.chmod", side_effect=PermissionError):
+                wh.db().close()                             # never fails when the mode can't be changed
+
     def test_summary_drops_control_characters(self):
         a = make_summary(7, "Rad \x1b[2J\x1b]0;pwn\x07 neu", 50)
         self.assertNotIn("\x1b", wh.summary(a)["title"])

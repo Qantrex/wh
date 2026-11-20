@@ -385,7 +385,14 @@ AD_FIELDS = ("id", "title", "price", "loc", "state", "postcode", "private", "pub
 
 
 def db():
-    os.makedirs(os.path.dirname(DB), exist_ok=True)
+    os.makedirs(os.path.dirname(DB), mode=0o700, exist_ok=True)
+    try:                                                    # the database names what the owner shops for: owner only
+        if not os.path.exists(DB):
+            os.close(os.open(DB, os.O_CREAT | os.O_WRONLY, 0o600))
+        elif os.stat(DB).st_mode & 0o077:
+            os.chmod(DB, 0o600)
+    except OSError:                                         # not ours, read-only or a filesystem without modes: carry on
+        pass
     c = sqlite3.connect(DB, timeout=30)
     c.row_factory = sqlite3.Row
     c.execute("pragma journal_mode=wal")
