@@ -187,10 +187,18 @@ def attrs(obj):
     return {x["name"]: x.get("values") or [""] for x in obj["attributes"]["attribute"]}
 
 
+CONTROL = re.compile(r"[\x00-\x09\x0b-\x1f\x7f-\x9f\u2028\u2029]")   # all but \n: ESC, CR, NEL, line separators
+
+
+def plain(s):
+    """Seller text without control characters (terminal escapes, carriage returns, Unicode line breaks)."""
+    return CONTROL.sub(" ", s or "")
+
+
 def clean(s):
     s = re.sub(r"<br\s*/?>|</p>|</li>", "\n", s or "")
     s = html.unescape(re.sub(r"<[^>]+>", "", s))
-    return re.sub(r"\n\s*\n+", "\n", re.sub(r"[ \t]+", " ", s)).strip()
+    return plain(re.sub(r"\n\s*\n+", "\n", re.sub(r"[ \t]+", " ", s)).strip())
 
 
 def num(s):
@@ -352,8 +360,8 @@ def summary(a):
     at = attrs(a)
     g = lambda n: (at.get(n) or [""])[0]  # noqa: E731
     seo = g("SEO_URL")
-    return dict(id=int(a["id"]), title=g("HEADING") or a.get("description", ""), price=num(g("PRICE")),
-                loc=g("LOCATION"), state=g("STATE"), postcode=g("POSTCODE"), private=int(g("ISPRIVATE") == "1"),
+    return dict(id=int(a["id"]), title=plain(g("HEADING") or a.get("description", "")), price=num(g("PRICE")),
+                loc=plain(g("LOCATION")), state=g("STATE"), postcode=g("POSTCODE"), private=int(g("ISPRIVATE") == "1"),
                 published=g("PUBLISHED_String")[:10],
                 url=(BASE + "/iad/" + seo.lstrip("/")) if seo else "%s/iad/object?adId=%s" % (BASE, a["id"]),
                 body=clean(g("BODY_DYN")), cats=",".join(at.get("categorytreeids") or []),
@@ -449,7 +457,7 @@ def fetch_detail(i, prev):
             if label and vals:
                 info.append("%s: %s" % (label, vals))
         imgs = (ad.get("advertImageList") or {}).get("advertImage") or []
-        d = dict(id=i, status=(ad.get("advertStatus") or {}).get("id", "?"), title=ad.get("description", ""),
+        d = dict(id=i, status=(ad.get("advertStatus") or {}).get("id", "?"), title=plain(ad.get("description", "")),
                  price=num(g("PRICE")), old_price=num(g("OLD_PRICE")), price_cut_on=day(g("PRICE_REDUCTION_SET_DATE")),
                  loc=" ".join(x for x in (addr.get("postCode"), addr.get("postalName"), addr.get("province")) if x),
                  private=bool(seller.get("private", g("ISPRIVATE") == "1")), seller=seller.get("name"),
@@ -586,9 +594,13 @@ def set_prop(text, key, value):
 def put_block(text, name, content):
     """Replace (or append) the generated block <!-- wh:name --> … <!-- /wh:name --> in a note."""
     start, end = "<!-- wh:%s -->" % name, "<!-- /wh:%s -->" % name
+    content = content.replace("<!--", "&lt;!--")             # text inside the block can never end it (or start another)
     block = "%s\n%s\n%s" % (start, content.strip(), end)
-    i = text.find(start)
-    j = text.find(end, i) if i >= 0 else -1                  # the end marker after the start, not a stray one before
+    own = lambda marker, pos: re.compile(r"^%s[ \t]*$" % re.escape(marker), re.M).search(text, pos)   # noqa: E731
+    m = own(start, 0)
+    i = m.start() if m else text.find(start)
+    m = own(end, i) if i >= 0 else None                      # the end marker on its own line after the start
+    j = m.start() if m else text.find(end, i) if i >= 0 else -1
     if j >= 0:
         return text[:i] + block + text[j + len(end):]
     return text.rstrip() + "\n\n" + block + "\n"
@@ -669,12 +681,17 @@ def euro(p):
 
 
 def cell(s, n=None):
-    s = str("" if s is None else s).replace("|", "/").replace("\n", " ")
+    s = plain(str("" if s is None else s)).replace("|", "/").replace("\n", " ")
     return s if n is None or len(s) <= n else s[:n - 1] + "…"
 
 
+def mdsafe(s):
+    """Seller text made harmless in a Markdown note: no raw HTML or comments, no tags (#word)."""
+    return re.sub(r"(?<!\\)#(?=\w)", r"\\#", s.replace("<", "&lt;"))
+
+
 def link_text(s, n=70):
-    return cell(s, n).replace("[", "(").replace("]", ")")
+    return mdsafe(cell(s, n)).replace("[", "(").replace("]", ")")
 
 
 def specs(a, profile):
@@ -693,10 +710,10 @@ def table(ads, profile=None, md=False, extra=None):
         lines = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
         for a in ads:
             cols = ([euro(a.get("price"))] + ([extra(a)] if extra else [])
-                    + ["[%s](%s)" % (link_text(a.get("title", ""), 70), a.get("url", "")), cell(a.get("loc", ""), 30)]
+                    + ["[%s](%s)" % (link_text(a.get("title", ""), 70), a.get("url", "")), mdsafe(cell(a.get("loc", ""), 30))]
                     + near(a) + ["P" if a.get("private") else "D"]
-                    + ([cell(specs(a, profile))] if has_specs else [])
-                    + [cell(a.get("published", ""))])
+                    + ([mdsafe(cell(specs(a, profile)))] if has_specs else [])
+                    + [mdsafe(cell(a.get("published", "")))])
             lines.append("| " + " | ".join(cols) + " |")
         return "\n".join(lines)
     widths = ([7] + ([7] if extra else []) + [52, 26] + ([4] if has_near else []) + [3] + ([38] if has_specs else [])
@@ -1619,10 +1636,11 @@ def deal_table(rows, name, md=False):
     if has_near:
         head.insert(6, "Near")
     out = []
+    safe = mdsafe if md else str
     for r in rows:
         cols = [euro(r["price"]), euro(r.get("value")), pct(r.get("discount")), (r.get("est") or {}).get("conf") or "",
-                ("[%s](%s)" % (link_text(r["title"], 60), r["url"])) if md else r["title"], r.get("loc") or "",
-                "P" if r.get("private") else "D", r.get("cond") or "", market.label(name, r["specs"])]
+                ("[%s](%s)" % (link_text(r["title"], 60), r["url"])) if md else r["title"], safe(r.get("loc") or ""),
+                "P" if r.get("private") else "D", safe(r.get("cond") or ""), safe(market.label(name, r["specs"]))]
         if has_near:
             cols.insert(6, "✓" if r.get("near") else "")
         if r.get("urgent"):

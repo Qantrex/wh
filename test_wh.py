@@ -509,6 +509,31 @@ class WhTests(TmpDbCase):
         self.assertEqual(once, "Uses <!-- /wh:sweep --> as marker.\n\n<!-- wh:sweep -->\nnew\n<!-- /wh:sweep -->\n")
         self.assertEqual(wh.put_block(once, "sweep", "new"), once)       # no copy appended on every sweep
 
+    def test_seller_text_cannot_break_out_of_a_block_or_inject_into_a_note(self):
+        evil = ["Laptop <!-- /wh:sweep --> PWNED", "<img src=x> cheap", "Rad #deadline 2026-12-01",
+                "Red \x1b[31m text\r- [ ] task", "x\u2028- [ ] task\x85y"]
+        ads = [dict(id=i, title=t, price=10.0, loc="Wien <b>", url="https://www.willhaben.at/iad/x", private=1,
+                    published="2026-11-01") for i, t in enumerate(evil, 1)]
+        tbl = wh.table(ads, md=True)
+        for bad in ("<!--", "<img", "<b>", "\x1b", "\r", "\u2028", "\x85", " #deadline"):
+            self.assertNotIn(bad, tbl)
+        self.assertIn("&lt;img src=x> cheap", tbl)
+        self.assertEqual(len(tbl.splitlines()), len(ads) + 2)            # no title starts a new line
+        text = "Intro\n\n<!-- wh:sweep -->\nold\n<!-- /wh:sweep -->\n\nOutro\n"
+        for _ in range(3):
+            text = wh.put_block(text, "sweep", tbl + "\n<!-- /wh:sweep --> PWNED")
+        self.assertEqual(text.count("<!-- wh:sweep -->"), 1)
+        self.assertEqual(text.count("<!-- /wh:sweep -->"), 1)
+        self.assertTrue(text.startswith("Intro\n\n") and text.endswith("\n\nOutro\n"))
+        # a note written by the old code (end marker only inside the content, on the old own line) is still updated
+        old = "A\n<!-- wh:sweep -->\nrow <!-- /wh:sweep --> inline\n<!-- /wh:sweep -->\nB\n"
+        self.assertEqual(wh.put_block(old, "sweep", "new").count("<!-- wh:sweep -->"), 1)
+
+    def test_summary_drops_control_characters(self):
+        a = make_summary(7, "Rad \x1b[2J\x1b]0;pwn\x07 neu", 50)
+        self.assertNotIn("\x1b", wh.summary(a)["title"])
+        self.assertNotIn("\x07", wh.table([wh.summary(a)]))
+
     def test_hunt_keeps_edits_made_while_claude_thinks_and_symlinks_stay(self):
         real = os.path.join(self.tmp.name, "real.md")
         link = os.path.join(self.tmp.name, "Goggles.md")
