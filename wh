@@ -119,9 +119,41 @@ def slow_down(why):
         _next[0] = max(_next[0], time.monotonic() + 5)
 
 
+MAX_BYTES = 40 * 1024 * 1024                                # no page or photo is bigger; a bomb or a stuck stream is
+
+
+def allowed_url(url):
+    """Only https on willhaben.at and its subdomains (pages, and cache.willhaben.at for photos)."""
+    u = urllib.parse.urlsplit(url)
+    host = (u.hostname or "").lower()
+    return u.scheme == "https" and (host == "willhaben.at" or host.endswith(".willhaben.at"))
+
+
+class _SameHostsRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not allowed_url(newurl):
+            raise urllib.error.URLError("redirect to %s refused" % newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+urllib.request.install_opener(urllib.request.build_opener(_SameHostsRedirect))
+
+
+def unzip(body):
+    d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    out = d.decompress(body, MAX_BYTES + 1)
+    if len(out) > MAX_BYTES:
+        raise FetchError("answer too big")
+    if not d.eof:
+        raise EOFError("cut-off gzip body")
+    return out
+
+
 def fetch(url, binary=False):
     """GET with a browser UA within the shared rate limit, 3 tries. Returns (final_url, body); body is empty on a 404.
-    Raises FetchError when every try fails."""
+    Raises FetchError when every try fails, at once for a URL that is not https on willhaben.at."""
+    if not allowed_url(url):
+        raise FetchError("won't fetch %s: only https on willhaben.at" % url)
     err = None
     for attempt in range(3):
         if attempt:
@@ -132,9 +164,11 @@ def fetch(url, binary=False):
                 "User-Agent": UA, "Accept-Language": "de-AT,de;q=0.9", "Accept-Encoding": "gzip",
             })
             with urllib.request.urlopen(req, timeout=30) as r:
-                body = r.read()
+                body = r.read(MAX_BYTES + 1)
+                if len(body) > MAX_BYTES:
+                    raise FetchError("answer too big")
                 if body and r.headers.get("Content-Encoding", "").lower() == "gzip":
-                    body = gzip.decompress(body)
+                    body = unzip(body)
                 if binary:
                     return r.geturl(), body
                 text = body.decode("utf-8", "replace")

@@ -555,6 +555,25 @@ class WhTests(TmpDbCase):
             with self.assertRaises(wh.FetchError):
                 wh.read_page("https://www.willhaben.at/x?a=1")
 
+    def test_fetch_only_takes_https_willhaben_urls_and_caps_the_size(self):
+        for bad in ("file:///etc/hostname", "http://127.0.0.1/", "http://www.willhaben.at/x", "https://evil.example/x",
+                    "https://willhaben.at.evil.example/x", "https://evilwillhaben.at/x"):
+            with mock.patch("urllib.request.urlopen") as op:
+                with self.assertRaises(wh.FetchError):
+                    wh.fetch(bad)
+            op.assert_not_called()
+        for good in ("https://www.willhaben.at/x", "https://cache.willhaben.at/p.jpg", "https://willhaben.at/"):
+            self.assertTrue(wh.allowed_url(good), good)
+        with mock.patch.object(wh, "MAX_BYTES", 10), mock.patch.object(wh, "wait_turn"), mock.patch.object(wh, "log"), \
+             mock.patch("time.sleep"):
+            with mock.patch("urllib.request.urlopen", return_value=FakeResp(b"x" * 11)):
+                with self.assertRaises(wh.FetchError):
+                    wh.fetch("https://www.willhaben.at/x")
+            bomb = wh.gzip.compress(b"x" * 1000)
+            with mock.patch("urllib.request.urlopen", return_value=FakeResp(bomb, {"Content-Encoding": "gzip"})):
+                with self.assertRaises(wh.FetchError):
+                    wh.fetch("https://www.willhaben.at/x")
+
     def test_summary_drops_control_characters(self):
         a = make_summary(7, "Rad \x1b[2J\x1b]0;pwn\x07 neu", 50)
         self.assertNotIn("\x1b", wh.summary(a)["title"])
