@@ -784,29 +784,91 @@ audio_kind("turntable", "turntables", ["audio-hifi/plattenspieler-turntables-682
 
 # ---- computers (on top of the built-in profiles) ----------------------------------------------------------------
 
+LAPTOP_SERIES = (r"thinkpad|latitude|elitebook|probook|xps|zenbook|vivobook|ideapad|yoga|thinkbook|legion|"
+                 r"surface\s*(?:laptop|pro|book)|precision|zbook|swift|aspire|spectre|envy|pavilion|omen|victus|rog|tuf|"
+                 r"predator|nitro|galaxy\s*book|matebook|framework")
+
+
 def laptop_model(t):
-    m = re.search(r"\bmac\s?book\s*(air|pro)?\s*(?:(1[3-6])\s*(?:zoll|\"|''|”|-inch|inch)?)?.*?\b(m[1-5])\s*(pro|max)?\b", t)
+    """'thinkpad t480', 'elitebook 840 g5', 'macbook air m1', 'macbook pro 15 2014' (Intel Macs by size and year)."""
+    m = re.search(r"\bmac\s?book\s*(air|pro)?\s*(?:(1[1-7])\s*(?:zoll|\"|''|”|-inch|inch)?)?.*?\b(m[1-5])\s*(pro|max)?\b", t)
     if m:
-        return norm("macbook %s %s %s %s" % (m.group(1) or "", m.group(2) or "", m.group(3), m.group(4) or ""))
-    m = re.search(r"\b(thinkpad|latitude|elitebook|probook|xps|zenbook|vivobook|ideapad|yoga|thinkbook|legion|"
-                  r"surface\s*(?:laptop|pro)|precision|zbook|swift|aspire|spectre|envy|pavilion|omen|victus|rog|tuf|"
-                  r"predator|nitro|galaxy\s*book|matebook|framework)\s*([a-z]{0,3}\s?\d{1,4}[a-z]{0,2}"
-                  r"(?:\s*(?:gen|g)\s*\d{1,2})?|carbon(?:\s*gen\s*\d{1,2})?)?", t)
+        size = m.group(2) if m.group(1) != "air" or m.group(2) == "15" else ""    # an M-chip Air is 13" unless 15"
+        return norm("macbook %s %s %s %s" % (m.group(1) or "", size or "", m.group(3), m.group(4) or ""))
+    m = re.search(r"\bmac\s?book\s*(air|pro)?\b(.*)", t)
     if m:
-        return norm("%s %s" % (m.group(1), m.group(2) or ""))
+        rest = m.group(2)[:60]
+        size = first(r"(?<![\d,.])(1[1-7])(?:[.,]\d)?\s*(?:zoll|\"|''|”|-?inch|\b)", rest)
+        year = first(r"\b(20(?:0[89]|1\d|20))\b", rest)
+        return norm("macbook %s %s %s" % (m.group(1) or "", size or "", year or ""))
+    t = re.sub(r"\b(\d{1,2})\s*(?:th|rd|nd|st|\.)\s*gen\w*", r"gen \1", t)                 # "6th gen" → "gen 6"
+    m = re.search(r"\b(%s)\s*([a-z]{0,3}\s?\d{1,4}[a-z]{0,2}(?:\s*(?:carbon|yoga|nano|extreme|titanium|flip|fold))?"
+                  r"(?:\s*(?:gen|g)\s*\d{1,2})?|carbon(?:\s*gen\s*\d{1,2})?)?" % LAPTOP_SERIES, t)
+    if m:
+        series, model = m.group(1), m.group(2) or ""
+    else:                       # the business lines' model codes are clear without the series word
+        m = (re.search(r"\blenovo\s+([txlep]\d{2,3}[sp]?(?:\s*(?:gen|g)\s*\d{1,2})?)\b", t)
+             or re.search(r"\bhp\s+((?:[4-8][2-9]0|1040)\s*g\s*\d{1,2})\b", t)
+             or re.search(r"\bdell\s+(e\d{4})\b", t))
+        if not m:
+            return None
+        model = m.group(1)
+        series = {"lenovo": "thinkpad", "dell": "latitude"}.get(m.group(0).split()[0]) or \
+            ("probook" if model[0] in "46" else "elitebook")
+    model = re.sub(r"\bg\s*(\d)", r"gen \1", model) if series == "thinkpad" else \
+        re.sub(r"\bgen\s*(\d)", r"g\1", model) if series in ("elitebook", "probook", "zbook") else model
+    model = re.sub(r"\b(g)\s+(\d)", r"\1\2", model)
+    return norm("%s %s" % (series, model))
+
+
+def laptop_sku(model):
+    """The model when it pins down one machine (a value for it alone makes sense), else None: 'thinkpad t480',
+    'latitude 7490', 'elitebook 840 g5', 'macbook air m1', 'macbook pro 13 2019'; not 'ideapad 5' or 'thinkpad t14'."""
+    if not model:
+        return None
+    if model.startswith("macbook"):
+        return model if re.search(r"\bm[1-5]\b|\b(?:1[1-7]\s+)20\d\d$|^macbook air 20\d\d$", model) else None
+    if re.search(r"\bgen \d|\bg\d{1,2}$", model) and not re.match(r"(?:ideapad|vivobook|aspire|pavilion|legion)", model):
+        return model
+    if re.match(r"thinkpad [a-z]{1,2}\d{3}[a-z]?$|thinkpad p[57]\d[sm]?$|(?:latitude|precision) e?\d{4}$|"
+                r"surface (?:pro|laptop|book) \d{1,2}$", model):
+        return model
     return None
 
 
+# CPUs the laptop profile has no score for (older or low-end), as a generation; the profile's table comes first
+OLD_LAPTOP_CPU = [
+    (r"\bi[357]\s?-?\s?[23]\d{3}[a-z]{0,2}\b", "Intel 2/3rd"),
+    (r"\bi[357]\s?-?\s?[45]\d{3}[a-z]{0,2}\b", "Intel 4/5th"),
+    (r"\bi[357]\s?-?\s?[67]\d{3}[a-z]{0,2}\b", "Intel 6/7th"),
+    (r"\bi[357]\s?-?\s?\d{3}[mu]\b", "Intel 1st"),
+    (r"celeron|pentium|\batom\b", "Intel Celeron/Pentium"),
+    (r"core\s*2\s*duo|core2", "Core 2"),
+    (r"\ba(?:4|6|8|9|10|12)\s?-?\s?\d{4}", "AMD A-series"),
+    (r"ryzen\s*[357]\s*(?:pro\s*)?[23]\d00u", "Ryzen 2000/3000U"),
+]
+LAPTOP_ACCESSORY = (r"\b(?:dock\w*|aufkleber|sticker|adapter|netzteil|ladegerät|charger|modem|modul|module|wwan|"
+                    r"touchpad|tasche|hülle|sleeve|rucksack|scharnier)$")
+
+
 @kind("laptop", "laptops", ["computer-tablets/notebooks-5831"],
-      keys=[("model", "cpu", "ram"), ("cpu", "gpu", "ram"), ("cpu", "gpu")], fields=["model", "cpu", "gpu", "ram"],
+      keys=[("model", "cpu", "ram"), ("sku", "ram"), ("sku",), ("cpu", "gpu", "ram"), ("cpu", "gpu")],
+      fields=["model", "cpu", "gpu", "ram"],
       words=r"\b(?:laptop|notebook|macbook|thinkpad|elitebook|latitude|ultrabook)\b")
 def laptop(ad):
     a = dict(ad)
     reason = profiles.laptop(a)
     if reason:
         return reason
-    gpu = a.get("gpu") or ("igpu" if a.get("cpu") else None)   # no dGPU named: integrated, if we know the CPU
-    return dict(model=laptop_model(low_title(ad)), cpu=a.get("cpu"), gpu=gpu, ram=a.get("ram"))
+    title = low_title(ad)
+    h = head(title).strip(" -.")
+    if re.search(LAPTOP_ACCESSORY, h) and not re.search(r"\bi[3579]\b|ryzen|\d+\s*gb", h):
+        return "accessory, not a laptop"
+    cpu = a.get("cpu") or next((name for rx, name in OLD_LAPTOP_CPU if re.search(rx, full_text(ad))), None)
+    gpu = a.get("gpu") or ("igpu" if cpu else None)   # no dGPU named: integrated, if we know the CPU
+    model = laptop_model(title)
+    ram = a.get("ram") if (a.get("ram") or 0) <= 64 else None   # "256" is the SSD in a laptop ad
+    return dict(model=model, sku=laptop_sku(model), cpu=cpu, gpu=gpu, ram=ram)
 
 
 @kind("pc", "desktop PCs", ["computer-tablets/pcs-5833"], keys=[("gpu", "cpu", "ram"), ("gpu", "cpu")],

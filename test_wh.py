@@ -1379,6 +1379,42 @@ class MarketExtractTests(unittest.TestCase):
         self.assertEqual(b("PS5 mit 2 Controllern"), "console only")
         self.assertEqual(market.query_specs("ps5", "console"), {"model": "ps5", "edition": "standard"})
 
+    def test_laptop_models_cpus_and_accessories(self):
+        lp = lambda t, **kw: mad(t, 300, kind="laptop", **kw)  # noqa: E731
+        m = lambda t: lp(t)["specs"].get("model")  # noqa: E731
+        self.assertEqual(m("Lenovo T430 i5 8GB"), "thinkpad t430")
+        self.assertEqual(m("Lenovo ThinkPad X1 Carbon 6th Gen i7"), "thinkpad x1 carbon gen 6")
+        self.assertEqual(m("ThinkPad T14s G2 Ryzen 5"), "thinkpad t14s gen 2")
+        self.assertEqual(m("HP 840 G5 i5 16GB"), "elitebook 840 g5")
+        self.assertEqual(m("Dell E7470 Notebook"), "latitude e7470")
+        self.assertEqual(m("HP 450 G6 / i5-8265U / 8GB Ram"), "probook 450 g6")
+        self.assertIsNone(m("Dell 5570 i5"))                       # Inspiron or Latitude: can't tell
+        self.assertIsNone(lp("Apple MacBook Air 2020", body="256 GB SSD")["specs"]["ram"])
+        self.assertEqual(m("Apple MacBook Air 13\" (2017) | i5 | 8GB RAM"), "macbook air 13 2017")
+        self.assertEqual(m("Apple MacBook Pro 15,4\" Retina (Mid 2014) - 2,2 GHz i7"), "macbook pro 15 2014")
+        self.assertEqual(m("MacBook Pro 13\" 2019 512gb"), "macbook pro 13 2019")
+        self.assertEqual(m("Apple MacBook Air 13\" M1 8GB"), "macbook air m1")
+        self.assertEqual(m("MacBook Air 15 Zoll M2"), "macbook air 15 m2")
+        # a model-only key just for models that pin down one machine, not a line like "ideapad 5" or "thinkpad x1"
+        sku = lambda t: lp(t)["specs"].get("sku")  # noqa: E731
+        self.assertEqual(sku("Lenovo ThinkPad T480 i5-8350U 16GB"), "thinkpad t480")
+        self.assertEqual(sku("Dell Latitude 7490"), "latitude 7490")
+        self.assertEqual(sku("MacBook Air M1 8GB 256GB"), "macbook air m1")
+        for t in ("Lenovo ThinkPad X1", "Lenovo IdeaPad 5 15\"", "Acer Aspire 3", "ThinkPad T14", "HP Elitebook 840",
+                  "MacBook Pro 2019"):
+            self.assertIsNone(sku(t), t)
+        # older CPUs the laptop profile has no score for still get a generation
+        c = lambda t: lp(t)["specs"].get("cpu")  # noqa: E731
+        self.assertEqual(c("Lenovo ThinkPad T430 i5-3320M 8GB"), "Intel 2/3rd")
+        self.assertEqual(c("HP 840 G2 Core i5-5300U"), "Intel 4/5th")
+        self.assertEqual(c("Acer Aspire Celeron N4020 4GB"), "Intel Celeron/Pentium")
+        for t in ("ThinkPad OneLink Pro Dock (4X10E52935)", "Lenovo ThinkPad X13 Aufkleber",
+                  "Apple 85W MagSafe Power Adapter - Original", "LTE 4G Modem Module - WWAN",
+                  "ASUS Zenbook 14 Flip Original Touchpad"):
+            self.assertIsNotNone(lp(t)["junk"], t)
+        self.assertIsNone(lp("ThinkPad T480 mit Docking Station")["junk"])
+        self.assertEqual(market.query_specs("thinkpad t480", "laptop"), {"model": "thinkpad t480", "sku": "thinkpad t480"})
+
     def test_phones_keep_battery_notes_but_drop_cases(self):
         p = mad("iPhone 16 Pro 256GB | 90% Akku", 700, kind="phone")
         self.assertIsNone(p["junk"])
