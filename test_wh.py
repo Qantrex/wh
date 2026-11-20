@@ -1419,6 +1419,40 @@ class MarketExtractTests(unittest.TestCase):
         self.assertIsNone(lp("ThinkPad T480 mit Docking Station")["junk"])
         self.assertEqual(market.query_specs("thinkpad t480", "laptop"), {"model": "thinkpad t480", "sku": "thinkpad t480"})
 
+    def test_cpu_models_xeon_old_intel_amd_and_not_cpus(self):
+        cpu = lambda t, body="": mad(t, 50, body=body, kind="cpu")  # noqa: E731
+        for t, model in (("CPU Intel Xeon X5675", "xeon x5675"), ("Intel xeon E3 1220 v3", "xeon e3-1220v3"),
+                         ("XEION E5-2667V4 CPU", "xeon e5-2667v4"), ("Intel Xeon E5-1630v3", "xeon e5-1630v3"),
+                         ("Epyc 7401p", "epyc 7401p"), ("CPU Intel i3-380", "i3-380"), ("i7 920 2,66 GHz", "i7-920"),
+                         ("Intel Pentium Gold G5400T CPU 3.10GHz", "pentium g5400t"),
+                         ("Intel Core i5 CPU 10500T (LGA1200)", "i5-10500t"),
+                         ("INTEL Core 2 Duo E 6750 boxed", "core2 e6750"), ("CPU AMD A8-6600 inkl. Kühler", "amd a8-6600"),
+                         ("AMD Rysen5 3600 + passenden Kühler", "ryzen 5 3600"), ("Ryzen 3600", "ryzen 5 3600"),
+                         ("AMD 5800X3D", "ryzen 7 5800x3d"), ("Threadripper 1950X", "threadripper 1950x"),
+                         ("Intel Core i7-7820X, 8 Kerne", "i7-7820x"), ("I7 7820x Prozessor", "i7-7820x"),
+                         ("Intel Xeon W3550 | 3.06GHz | LGA 1366 | wie ein i7 950", "xeon w3550")):
+            self.assertEqual(cpu(t)["specs"].get("model"), model, t)
+        self.assertIsNone(cpu("AMD Ryzen 9", "Dazu passt RAM mit 3200 MHz")["specs"]["model"])
+        self.assertEqual(cpu("AMD Ryzen 7 3700x inkl. CPU-Kühler - Alpenföhn")["specs"]["model"], "ryzen 7 3700x")
+        self.assertEqual(cpu("AMD Ryzen 5 5600 boxed mit Wraith Stealth Cooler")["specs"]["model"], "ryzen 5 5600")
+        self.assertEqual(cpu("AMD Phenom II X4 955 Black Edition + Scythe CPU-Kühler")["specs"]["model"], "phenom ii x4 955")
+        for t in ("2x Intel Xeon E5-2603 v2 - 1.60GHz", "Siemens Simatic S7 SM 1223 DC/ DC I/ O Modul",
+                  "Supermicro SNK-P0048AP4 - 2U Xeon CPU-Kühler", "AMD EPYC Genoa 9334 32 Core Engineering Sample",
+                  "Arduino ESP32 Microcontroller Starter Set"):
+            self.assertIsInstance(cpu(t)["junk"], str, t)
+
+    def test_mainboard_chipsets_from_board_names_and_not_boards(self):
+        mb = lambda t: mad(t, 50, kind="mainboard")  # noqa: E731
+        for t, chip in (("ASUS M5A97 R2.0", "970"), ("ASUS M5A78L-M/ USB3", "760g"), ("Gigabyte Z 390 LGA 1151", "z390"),
+                        ("ASUS Z-790 P Mainboard Neu", "z790"), ("Gigabyte GA-F2A88XM-HD3P - Micro ATX", "a88x"),
+                        ("Neu Asus Mainboard F2 A85-V PRO", "a85x"), ("ASRock 870 Extreme 3, Socket AM3", "870"),
+                        ("MSI X399 Gaming Pro Carbon", "x399"), ("Gigabyte B450M DS3H", "b450")):
+            self.assertEqual(mb(t)["specs"].get("chipset"), chip, t)
+        for t in ("Asus M4A89GTD PRO + AMD Phenom II X6 1090T", "Asrock A88M itx/ ac 8gb ram und amd A10",
+                  "Apple Logic Board MacBook Pro 15\" Early 2013", "HP EliteOne 800 G3 AIO Hauptplatine",
+                  "Arduino Portenta Max Carrier", "Retro Set Intel E8600 + Intel Board + 4GB Ram"):
+            self.assertIsInstance(mb(t)["junk"], str, t)
+
     def test_audio_models_one_spelling_and_series(self):
         a = lambda t, kind="headphones": mad(t, 100, kind=kind)["specs"]  # noqa: E731
         for t in ("Sony WH-1000XM4", "Sony WH 1000 XM4 Kopfhörer", "WH-1000XM4 Noise Cancelling"):

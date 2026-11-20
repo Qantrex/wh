@@ -237,29 +237,64 @@ def gpu(ad):
     return dict(model=model, vram=vram if model in VRAM_SPLIT else "-")
 
 
+def ryzen_tier(num):
+    """The Ryzen tier from the model number's second digit: 3600 → 5, 5800 → 7, 7950 → 9, 3200 → 3."""
+    d = int(num[1])
+    return 3 if d <= 3 else 5 if d <= 6 else 7 if d <= 8 else 9
+
+
 def cpu_model(t):
-    m = re.search(r"\bryzen\s*([3579])\s*[/-]?\s*(?:pro\s*)?(\d{4})\s*(x3d|xt|x|ge|g|f)?\b", t)
+    t = re.sub(r"\bry[sz]en", "ryzen", t)
+    t = re.sub(r"\bxe[io]{2}n\b", "xeon", t)
+    m = re.search(r"\bryzen\s*([3579])\s*[/-]?\s*(?:pro\s*)?(\d{4})\s*(x3d|xt|x|ge|g|f)?\b(?!\s*(?:mhz|mt/?s))", t)
     if m:
         return "ryzen %s %s%s" % (m.group(1), m.group(2), m.group(3) or "")
+    m = re.search(r"\bthreadripper\s*(?:pro\s*)?(\d{4})\s*(wx|x)?\b", t)
+    if m:
+        return "threadripper %s%s" % (m.group(1), m.group(2) or "")
+    m = re.search(r"\b(?:xeon\s*(?:silver|gold|bronze|platinum|w)?\s*)?\b([ew][357])\s*-?\s*(\d{4})\s*(l)?\s*-?\s*(v\d)?\b", t)
+    if m:
+        return "xeon %s-%s%s%s" % (m.group(1), m.group(2), m.group(3) or "", m.group(4) or "")
+    m = re.search(r"\bxeon\s*(?:silver|gold|bronze|platinum)?\s*([wxle]?)\s*-?\s*(\d{4,5})([a-z]?)(?:\s*-?\s*(v\d))?\b", t)
+    if m:
+        return "xeon %s%s%s%s" % (m.group(1), m.group(2), m.group(3), m.group(4) or "")
     m = re.search(r"\b(?:core\s*)?ultra\s*([579])\s*-?\s*(\d{3})([a-z]{0,2})\b", t)
     if m:
         return "core ultra %s %s%s" % m.groups()
-    m = re.search(r"\b(?:core\s*)?i([3579])\s*-?\s*(\d{4,5})([a-z]{0,2})\b", t)
+    m = re.search(r"\b(?:core\s*)?i([3579])\s*(?:cpu\s*|prozessor\s*)?-?\s*(\d{4,5})([a-z]{0,2})\b", t)
     if m:
         return "i%s-%s%s" % m.groups()
-    m = re.search(r"\bxeon\s*(?:silver|gold|bronze|platinum)?\s*([ew]?-?\d{4,5}[a-z]?(?:\s*v\d)?)\b", t)
+    m = re.search(r"\b(?:core\s*)?i([357])\s*-?\s*([3-9]\d{2})(m|k|s|t|qm|lm|um)?\b(?!\s*(?:gb|mhz|w\b|€|euro))", t)
+    if m:                                                   # first-generation Core: i3-550, i5-750, i7-920
+        return "i%s-%s%s" % (m.group(1), m.group(2), m.group(3) or "")
+    m = None if re.search(r"\bintel\b|\bcore\s*i\d|\bi[3579]\b", t) else re.search(r"\bryzen\s*(\d{4})\s*(x3d|xt|x|ge|g|f)?\b(?!\s*(?:mhz|mt/?s))|\b([1-9]\d{3})(x3d|xt|x|ge|g)\b", t)
+    if m and not m.group(1):
+        m = re.match(r"(\d{4})(\w*)", m.group(3) + m.group(4))
+    if m and m.group(1)[0] != "0" and m.group(1)[1] != "0":                # "Ryzen 3600", "5800X3D"
+        return "ryzen %d %s%s" % (ryzen_tier(m.group(1)), m.group(1), m.group(2) or "")
+    m = re.search(r"\bepyc\s*(\d{4}[a-z]?)\b", t)
     if m:
-        return "xeon " + m.group(1).replace(" ", "")
-    m = re.search(r"\b([3-9]\d{3})(x3d|x)\b", t)
+        return "epyc " + m.group(1)
+    m = re.search(r"\bopteron\s*(\d{3,4}[a-z]{0,2})\b", t)
     if m:
-        return "ryzen ? %s%s" % m.groups()
-    m = re.search(r"\bcore\s*2\s*(?:duo|quad|extreme)?\s*([qetx]\d{4})\b", t)
+        return "opteron " + m.group(1)
+    m = re.search(r"\b(pentium|celeron)\s*(?:gold|silver|dual[- ]?core)?\s*([gjnte]\d{3,4}[a-z]?|\d{4}[a-z]?)\b", t)
     if m:
-        return "core2 " + m.group(1)
+        return "%s %s" % m.groups()
+    m = re.search(r"\bcore\s*2\s*(duo|quad|extreme)?\s*([qetx])?\s*-?\s*(\d{4})\b", t)
+    if m:
+        return "core2 %s%s" % (m.group(2) or ("q" if m.group(1) == "quad" else "e"), m.group(3))
+    m = re.search(r"\b(?:amd\s*)?a(4|6|8|10|12)\s*-\s*(\d{4})(k?)\b", t)
+    if m:
+        return "amd a%s-%s%s" % m.groups()
     m = re.search(r"\b(fx)\s*-?\s*(\d{4})\b|\b(phenom\s*ii\s*x\d|athlon\s*(?:ii\s*)?(?:x\d|64\s*x2)?)\s*(\d{3,4}e?)\b", t)
     if m:
         return ("amd fx-%s" % m.group(2)) if m.group(1) else norm("%s %s" % (m.group(3), m.group(4)))
     return None
+
+
+NOT_PC = (r"\b(?:sps|simatic|siemens|beckhoff|saia|6es7|et\s*200\w*|arduino|esp32|esp8266|raspberry|mikrocontroller|"
+          r"microcontroller|jetson|entwickl\w*board|dev(?:elopment)?\s*board|steuerung|platine\s+für|pcb)\b")
 
 
 @kind("cpu", "processors", ["pc-komponenten/cpus-prozessoren-5880"], keys=[("model",)], fields=["model"],
@@ -268,24 +303,49 @@ def cpu(ad):
     title, t = low_title(ad), full_text(ad)
     if re.search(r"\b(?:mainboard|motherboard|board|bundle|aufrüst\w*|kombi|laptop|notebook|gaming[- ]?pc)\b", title):
         return "bundle or not a CPU"
-    if re.search(r"^(?:neue?r?s?\s+)?(?:kühler|cooler|lüfter|wärmeleitpaste|halterung)\b", title):
+    if re.search(r"^(?:neue?r?s?\s+)?(?:kühler|cooler|lüfter|wärmeleitpaste|halterung)\b", title) or \
+            re.search(r"\bcpu-?kühler\b|\bkühler\s+(?:für|for)\b", title) and not cpu_model(head(title)):
         return "part, not a CPU"
+    if re.search(NOT_PC, title):
+        return "industrial or hobby electronics, not a PC CPU"
+    if re.search(r"^\s*(?:[2-9]|\d{2})\s*(?:x|stk\.?|stück)\s", title):
+        return "several CPUs"
+    if re.search(r"engineering\s*sample|\b(?:es|qs)\s*(?:version|cpu|sample)?\s*$|\bes\b.*\bsample", title):
+        return "engineering sample"
     return dict(model=cpu_model(title) or cpu_model(t))
 
 
 CHIPSETS = (r"970|990fx|990x|a75|a88x|a68h|h67|h77|q87|h55|p55|x58|p45|p43|g41|g31|x38|x48|a320|a520|a620|b350|b450|b550|b650e?|b850|x370|x470|x570|x670e?|x870e?|b760|b660|h610|h510|h470|h410|"
             r"z390|z370|b360|b365|h370|h310|z490|z590|z690|z790|z890|b460|b560|h570|h670|h770|b860|x99|x299|z97|z87|"
-            r"h81|b85|h97|h87|b75|z77|z68|p67|h61|z170|z270|b150|b250|h110|h170|h270")
+            r"h81|b85|h97|h87|b75|z77|z68|p67|h61|z170|z270|b150|b250|h110|h170|h270|x79|x399|trx40|"
+            r"a85x|a78|a58|a55|870|880g|890gx|890fx|760g|770|780g|785g|790gx|790fx")
+# Board names that say their chipset without naming it (ASUS AM3/AM3+ and FM2 boards)
+BOARD_CHIPSET = [(r"\bm5a97\b|\bm5a97(?=[\s-])", "970"), (r"\bm5a99x", "990x"), (r"\bm5a99fx", "990fx"),
+                 (r"\bm5a78l", "760g"), (r"\bm5a87", "870"), (r"\bm4a88t", "880g"), (r"\bm4a89gt", "890gx"),
+                 (r"\bm4a89td", "890fx"), (r"\bm4a785", "785g"), (r"\bm4a77t", "770"),
+                 (r"\b(?:ga-)?f2\s*a\s*(85|88|78|75|55)x?", "a{0}"), (r"\bfm2\s*a(75|85|88)", "a{0}")]
+BOARD_NOT_DESKTOP = (r"\b(?:thinkpad|elitebook|probook|latitude|macbook|imac|logic\s*board|alienware|aio|all[- ]in[- ]one|"
+                     r"eliteone|surface|laptop|notebook|systemboard|hauptplatine\s+für\s+(?:laptop|notebook))\b")
 
 
 @kind("mainboard", "mainboards", ["pc-komponenten/mainboards-5885"], keys=[("chipset", "form"), ("chipset",)],
       fields=["chipset", "form"], words=r"\b(?:mainboard|motherboard)\b")
 def mainboard(ad):
     title, t = low_title(ad), full_text(ad)
-    if re.search(r"\b(?:ryzen|core\s*i[3579]|i[3579]-\d{4}|prozessor|cpu|bundle|aufrüst\w*|kombi|gaming[- ]?pc)\b",
-                 title):
-        return "bundle with a CPU"
-    chip = first(r"(?:^|[^a-z0-9]|\bp\d|\bga-|\bma)(%s)(?![0-9])" % CHIPSETS, title, t)
+    if re.search(r"\b(?:ryzen|core\s*i[3579]|i[3579]-?\s*\d{4}|prozessor|cpu|bundle|aufrüst\w*|kombi|gaming[- ]?pc|"
+                 r"phenom|athlon|fx-?\s*\d{4}|a(?:4|6|8|10|12)-?\d{4}|amd\s+a(?:4|6|8|10|12)|pentium|celeron|"
+                 r"[eq][5-9]\d{3}|\d+\s*gb(?:\s*ddr\d)?\s*ram|\d+\s*gb\s*ddr\d|upgrade\s*kit)\b", title):
+        return "bundle with a CPU or RAM"
+    if re.search(BOARD_NOT_DESKTOP, title):
+        return "laptop or all-in-one board, not a desktop mainboard"
+    if re.search(NOT_PC, title) or re.search(r"^(?:neue?r?s?\s+)?(?:kabel|blende|i/?o[- ]?shield|halterung|"
+                                              r"antenne|lüfter|ventilator|kühler)\b|q-connector|anschlussmodul", title):
+        return "part or other electronics, not a mainboard"
+    title = re.sub(r"\b([abhqxz])\s*-?\s+(\d{3})\b|\b([abhqxz])-(\d{3})\b",
+                   lambda m: (m.group(1) or m.group(3)) + (m.group(2) or m.group(4)), title)       # "Z 390", "Z-790"
+    chip = next((c.format(*m.groups()) for rx, c in BOARD_CHIPSET for m in [re.search(rx, title)] if m), None)
+    chip = {"a85": "a85x", "a88": "a88x"}.get(chip, chip) or \
+        first(r"(?:^|[^a-z0-9]|\bp\d|\bga-|\bma)(%s)(?![0-9])" % CHIPSETS, title, t)
     form = ("itx" if re.search(r"\bmini[- ]?itx|\bitx\b|-i\b", t) else
             "matx" if re.search(r"micro[- ]?atx|\bm-?atx|\bmatx|\bμatx|(?:%s)m\b|-m\b" % CHIPSETS, t) else
             "atx" if re.search(r"\b(?:e-?)?atx\b", t) else None)
