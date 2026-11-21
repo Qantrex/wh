@@ -24,6 +24,7 @@ Setup: the Install section of the `wh` README (github.com/Qantrex/wh); `wh docto
 | `wh value <what or ad link> [--price N] [--json]` | what an item or ad is worth used on willhaben: value, middle half, sellers, confidence, the ads behind it. A bare model (`dell u2723qe`) gets its kind from the ads in the database |
 | `wh crawl [kinds] [--full\|--new\|--list]` | reads whole categories into the database (the market values come from them); `find`/`value` do it by themselves |
 | `wh watch add NAME <what> [--kind K] [--below 0.25]` / `list` / `rm` / `run [--json]` | saved finds; `run` reports deals that are new or cheaper since the last run, once each |
+| `wh offer <id or link> [--compare "words"] [--json]` | the lowest price the seller will probably still accept, with rough odds, a walk-away price, the reasons and a reply draft with the offer. `wh offer --backtest [kinds]`: what ads did between two full crawls |
 | `wh deal <id or link> [--compare "words"] [--question "…"]` | **AI:** verdict, comparable ads, a suggested offer, questions for the seller |
 | `wh advise [notes]` | **AI:** should your live ads (sell notes) get a lower price? |
 | `wh hunt <note>` | **AI:** sweep, then Claude writes the best picks into the note's `<!-- wh:picks -->` block |
@@ -41,11 +42,12 @@ Setup: the Install section of the `wh` README (github.com/Qantrex/wh); `wh docto
 
 ## Ground rules
 
-- **Who it's for comes first.** Every buy/wanted note says it in `for:` (`me`, `homelab`, or a name such as `<name> (friend)`). Read it before judging anything; if it is missing or vague, ask the user one question instead of guessing. Judge only by that person's or purpose's stated needs, never link or compare notes with a different `for:`, and name the person in answers instead of saying "your pick". Use `wh deal <ad> --for <who>` for single ads.
+- **Who it's for comes first.** Every buy/wanted note names it in `for:` (`me`, `homelab`, `<name> (friend)`). Read it first; if it is missing or vague, ask the user one question. Judge only by that person's or purpose's needs, never mix in notes with a different `for:`, and name the person instead of saying "your pick". Single ads: `wh deal <ad> --for <who>`.
 - **Never send a message, make an offer, buy, publish or change an ad without the user's OK.** Draft it, show it, wait. Opening and reading seller chats is fine.
-- **Sending needs Claude in Chrome.** `wh` only reads public pages; messages go through the user's logged-in willhaben chat in Chrome. Before offering to send, check that the extension is connected. If it is not, give the drafts as copy-ready text instead.
-- Write messages in German, in the user's own tone, with their name. Lowball first offers are fine.
-- An ad that shows "Anzeige nicht mehr verfügbar" has usually just **expired** (the seller forgot to renew it). It does not mean sold. Don't treat it as sold and never mention it to the seller.
-- Listing tables in notes only contain ads you would actually consider. Mention rejects in chat if they matter.
+- **Sending needs Claude in Chrome.** `wh` only reads public pages; messages go through the user's logged-in willhaben chat in Chrome. Check that the extension is connected before offering to send; if not, give copy-ready drafts.
+- Write messages in German, in the user's own tone, with their name. Lowball offers are fine.
+- For every ad on a buy note's shortlist, draft an opening message right away and show it to the owner for a yes. The opener asks one or two questions and makes no offer. The offer from wh offer goes in the reply after the seller answers.
+- "Anzeige nicht mehr verfügbar" usually means the ad just **expired** (not renewed), not sold. Never treat it as sold or mention it to the seller.
+- Listing tables in notes hold only ads you would consider; mention rejects in chat if they matter.
 - Check specs and prices online instead of writing from memory, and cite sources in the note.
-- **Before recommending a part or item to buy,** sweep willhaben (and Kleinanzeigen.de) for used offers in the same pass, and compare new prices across several shops by part number. Check listing photos for part numbers and model years: parts are often for an older model.
+- **Before recommending something to buy,** check used offers on willhaben (and Kleinanzeigen.de) in the same pass, and new prices across several shops by part number. Check photos for part numbers and model years: parts are often for an older model.
