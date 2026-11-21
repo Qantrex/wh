@@ -100,7 +100,7 @@ def cuts_of(history, old_price=None, cut_on=None, price=None):
 
 def estimate(f, today=None):
     """f: the facts about one ad (see wh's offer_facts()). Returns a dict: ask; floor (the lowest price the seller will
-    probably still accept) and floor_odds; ladder [(price, rough odds)]; low, high (one in five sellers go down to low,
+    probably still accept) and floor_odds; over (that floor is above the walk-away price: don't offer); ladder [(price, rough odds)]; low, high (one in five sellers go down to low,
     four in five take high); conf; open (a lowball to try first); walk (walk-away price); reasons [(sign, text,
     source)], cuts, flags, days_online, at_least (days_online is only a lower bound), days_left, warnings."""
     today = today or date.today()
@@ -274,15 +274,15 @@ def estimate(f, today=None):
     floor = nice(p * (1 - (lo + hi) / 200), down=False)    # the lowest price with about even odds
     while floor > nice(low, down=False) and odds(nice(floor - 0.01)) >= 0.5:
         floor = nice(floor - 0.01)
-    floor = min(floor, walk) if walk >= nice(low, down=False) else floor
+    over = trusted and floor > walk                        # the seller's likely floor is more than it's worth
     opening = nice(low * (0.97 if "fix" in keys else 0.9))
     opening = max(opening, nice(p * (0.85 if "fix" in keys else 0.55), down=False))
-    opening = min(opening, floor)
+    opening = min(opening, floor, walk)
     ladder = sorted({opening, nice(low, down=False), floor, nice(high) if high < p else p})
     conf = "low"
     if trusted and b and b.get("n", 0) >= 30 and online is not None and not at_least:
         conf = "medium"
-    return dict(ask=p, floor=floor, floor_odds=round(odds(floor), 2), ladder=[(x, round(odds(x), 2)) for x in ladder],
+    return dict(ask=p, floor=floor, floor_odds=round(odds(floor), 2), over=over, ladder=[(x, round(odds(x), 2)) for x in ladder],
                 low=nice(low, down=False), high=nice(high, down=True) if high < p else p, conf=conf,
                 open=opening, walk=walk, reasons=reasons, cuts=cuts, flags=flags, days_online=online, at_least=at_least,
                 days_left=left, warnings=warnings, relisted=relisted)

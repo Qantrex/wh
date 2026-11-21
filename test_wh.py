@@ -1930,19 +1930,19 @@ class OfferLogicTests(unittest.TestCase):
         self.assertIn("fix", keys("Der Preis ist nicht verhandelbar."))
         self.assertNotIn("vb", keys("Der Preis ist nicht verhandelbar."))
         self.assertIn("fix", keys("100€ Fix"))
-        self.assertEqual(keys("Preis 300 Fix", 250) & {"fix", "stale_fix"}, {"stale_fix"})   # cut below its own Fix
+        self.assertEqual(keys("Preis 280 Fix", 240) & {"fix", "stale_fix"}, {"stale_fix"})   # cut below its own Fix
         self.assertIn("pickup_only", keys("Ausschließlich Selbstabholung in Graz"))
         self.assertIn("urgent", keys("Muss schnell weg wegen Umzug"))
         self.assertEqual(keys("Top Zustand, wenig benutzt"), set())
 
     def test_stale_fix_names_the_number_once(self):
-        note = dict((k, n) for k, _, n in offer.text_flags("Preis 300 Fix", 250))["stale_fix"]
-        self.assertNotIn("300 300", note)
-        self.assertNotIn("at €300", note)
+        note = dict((k, n) for k, _, n in offer.text_flags("Preis 280 Fix", 240))["stale_fix"]
+        self.assertNotIn("280 280", note)
+        self.assertNotIn("at €280", note)
 
     def test_cuts_of_uses_willhabens_day_and_splits_hidden_steps(self):
-        same = offer.cuts_of([("2026-11-01", "2026-11-20", 300), ("2026-11-21", "2026-11-21", 250)], 300, "2026-11-20", 250)
-        self.assertEqual(same, [("2026-11-20", 300, 250)])
+        same = offer.cuts_of([("2026-11-01", "2026-11-12", 280), ("2026-11-13", "2026-11-13", 240)], 280, "2026-11-12", 240)
+        self.assertEqual(same, [("2026-11-12", 280, 240)])
         two = offer.cuts_of([("2026-11-01", "2026-11-10", 335), ("2026-11-12", "2026-11-21", 310)], 325, "2026-11-11", 310)
         self.assertEqual(two, [("before 2026-11-11", 335, 325), ("2026-11-11", 325, 310)])
         unseen = offer.cuts_of([("2026-11-18", "2026-11-21", 250)], 300, "2026-11-15", 250)
@@ -1993,11 +1993,17 @@ class OfferLogicTests(unittest.TestCase):
 
     def test_walk_away_never_above_a_trusted_value(self):
         v = dict(value=600, conf="high", n=36, close=True)
-        e = offer.estimate(facts(price=980.0, value=v, first_published="2026-11-01", published="2026-11-01",
-                                 first_seen="2026-11-01"), TODAY)
-        self.assertLessEqual(e["walk"], 600)
-        self.assertLessEqual(e["open"], e["walk"])
-        self.assertTrue(any(("(%s)" % e["low"]) in w for w in e["warnings"]))   # the same low as in the range
+        for start in ("2026-11-01", "2026-11-14", "2026-09-01"):
+            e = offer.estimate(facts(price=980.0, value=v, first_published=start, published=start, first_seen=start),
+                               TODAY)
+            self.assertLessEqual(e["walk"], 600)
+            self.assertLessEqual(e["open"], e["walk"])
+            self.assertTrue(e["over"])                                     # no offer above what it's worth
+            self.assertTrue(any(("(%s)" % e["low"]) in w for w in e["warnings"]))   # the same low as in the range
+        fair = offer.estimate(facts(price=650.0, value=v), TODAY)
+        self.assertFalse(fair["over"])
+        self.assertLessEqual(fair["floor"], fair["walk"])
+        self.assertGreaterEqual(fair["floor_odds"], 0.5)
 
     def test_a_loose_value_counts_only_as_rough(self):
         v = dict(value=600, conf="high", n=36, close=False, match="brand · panel · size")
@@ -2019,17 +2025,17 @@ class OfferLogicTests(unittest.TestCase):
 
     def test_message(self):
         e = dict(open=20, floor=26)
-        near = offer.message(e, facts(), "Alex", "1230 Wien")
+        near = offer.message(e, facts(), "Alex", "1010 Wien")
         self.assertTrue(near.startswith("Danke für die Antwort!"))        # the reply after the seller answered
         self.assertIn("Wären 26 € ok?", near)
         self.assertIn("diese Woche abholen", near)
         self.assertTrue(near.endswith("Lg Alex"))
-        far = offer.message(e, facts(state="Oberösterreich", town="Linz", p2p=0), None, "1230 Wien")
-        self.assertIn("nach Linz", far)
+        far = offer.message(e, facts(state="Kärnten", town="Villach", p2p=0), None, "1010 Wien")
+        self.assertIn("nach Villach", far)
         self.assertNotIn("Lg", far)
-        ship = offer.message(e, facts(state="Tirol", town="Imst", p2p=1), None, "1230 Wien")
+        ship = offer.message(e, facts(state="Tirol", town="Imst", p2p=1), None, "1010 Wien")
         self.assertIn("PayLivery", ship)
-        own = offer.message(e, facts(), "Alex", "1230 Wien", "Servus! {pickup} {offer}?\nLG {name}")
+        own = offer.message(e, facts(), "Alex", "1010 Wien", "Servus! {pickup} {offer}?\nLG {name}")
         self.assertEqual(own, "Servus! Ich könnte diese Woche abholen. 26 €?\nLG Alex")
         broken = offer.message(e, facts(), None, None, "Hi {preis}")
         self.assertIn("Wären 26 € ok?", broken)
@@ -2084,7 +2090,7 @@ class OfferDbTests(TmpDbCase):
         self.addCleanup(c.close)
         t0 = wh.shift(wh.now(), -24 * 5)
         t1 = wh.now()
-        far = "2027-03-01T00:00:00Z"
+        far = wh.shift(wh.now(), 24 * 90)
         ads = [self.summary_with(100 + n, p, [("ENDDATE_String", far)]) for n, p in enumerate([95, 100, 100, 105, 110, 98])]
         self.crawl(c, ads, t0)
         later = [self.summary_with(100, 95, [("ENDDATE_String", far)]),
@@ -2115,6 +2121,7 @@ class OfferDbTests(TmpDbCase):
         with mock.patch("sys.stdout", out):
             wh.print_backtest(c, argparse_ns(kinds=["ram"], json=False))
         self.assertIn("No backtest window", out.getvalue())
+        self.assertIsNone(wh.base_rate(c, "ram", 1.0, True))                # a kind without a window: no base rate
 
     def test_cmd_offer_on_a_made_up_ad(self):
         c = wh.db()
@@ -2125,7 +2132,7 @@ class OfferDbTests(TmpDbCase):
         with mock.patch.object(wh, "db", return_value=c), \
              mock.patch.object(wh, "fetch", side_effect=lambda url, binary=False: (url, det if "942424242" in url
                                                                                    else search_page(0, []))), \
-             mock.patch.object(wh, "CONFIG", {"name": "Alex", "location": "1230 Wien"}), \
+             mock.patch.object(wh, "CONFIG", {"name": "Alex", "location": "1010 Wien"}), \
              mock.patch("sys.stdout", out):
             wh.cmd_offer(argparse_ns(ad="942424242", kinds=None, compare=None, pages=1, no_search=False, json=False))
         text = out.getvalue()
