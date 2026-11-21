@@ -1900,6 +1900,265 @@ class GenericFindTests(TmpDbCase):
         self.assertEqual(wh.market_block(c, dict(d, id=12345)), "")
 
 
+import offer  # noqa: E402
+from datetime import date  # noqa: E402
+
+TODAY = date(2026, 11, 21)
+
+
+def facts(**kw):
+    """Facts for offer.estimate(), for a made-up private ad online for a week."""
+    f = dict(id=1, title="Kopfhörer Modell X", descr="", price=100.0, private=True, seller_ads=3,
+             first_published="2026-11-14", published="2026-11-14", first_seen="2026-11-14", first_crawl="2026-11-01",
+             history=[], value=None, base=None, state="Wien", town="Wien", p2p=1)
+    f.update(kw)
+    return f
+
+
+class OfferLogicTests(unittest.TestCase):
+    def test_nice_rounds_to_prices_people_type(self):
+        self.assertEqual(offer.nice(33.7), 33)                 # whole euros under 50 (not €30–€30 for a €35 ad)
+        self.assertEqual(offer.nice(33.2, down=False), 34)
+        self.assertEqual(offer.nice(173), 170)
+        self.assertEqual(offer.nice(447), 440)
+        self.assertEqual(offer.nice(689, down=False), 700)
+        self.assertEqual(offer.nice(1234), 1200)
+
+    def test_text_flags(self):
+        keys = lambda t, p=100: {k for k, _, _ in offer.text_flags(t, p)}
+        self.assertEqual(keys("Preis VB, gerne Angebote"), {"vb"})
+        self.assertIn("fix", keys("Der Preis ist nicht verhandelbar."))
+        self.assertNotIn("vb", keys("Der Preis ist nicht verhandelbar."))
+        self.assertIn("fix", keys("100€ Fix"))
+        self.assertEqual(keys("Preis 300 Fix", 250) & {"fix", "stale_fix"}, {"stale_fix"})   # cut below its own Fix
+        self.assertIn("pickup_only", keys("Ausschließlich Selbstabholung in Graz"))
+        self.assertIn("urgent", keys("Muss schnell weg wegen Umzug"))
+        self.assertEqual(keys("Top Zustand, wenig benutzt"), set())
+
+    def test_stale_fix_names_the_number_once(self):
+        note = dict((k, n) for k, _, n in offer.text_flags("Preis 300 Fix", 250))["stale_fix"]
+        self.assertNotIn("300 300", note)
+        self.assertNotIn("at €300", note)
+
+    def test_cuts_of_uses_willhabens_day_and_splits_hidden_steps(self):
+        same = offer.cuts_of([("2026-11-01", "2026-11-20", 300), ("2026-11-21", "2026-11-21", 250)], 300, "2026-11-20", 250)
+        self.assertEqual(same, [("2026-11-20", 300, 250)])
+        two = offer.cuts_of([("2026-11-01", "2026-11-10", 335), ("2026-11-12", "2026-11-21", 310)], 325, "2026-11-11", 310)
+        self.assertEqual(two, [("before 2026-11-11", 335, 325), ("2026-11-11", 325, 310)])
+        unseen = offer.cuts_of([("2026-11-18", "2026-11-21", 250)], 300, "2026-11-15", 250)
+        self.assertEqual(unseen, [("2026-11-15", 300, 250)])
+
+    def test_signals_widen_the_room(self):
+        plain = offer.estimate(facts(), TODAY)
+        stale = offer.estimate(facts(first_published="2026-10-10", published="2026-10-10", first_seen="2026-10-10",
+                                     ends="2026-11-24", old_price=130, cut_on="2026-11-18",
+                                     descr="VB, muss weg wegen Umzug"), TODAY)
+        self.assertLess(stale["low"], plain["low"])
+        self.assertLess(stale["open"], plain["open"])
+        self.assertEqual(stale["days_left"], 3)
+        self.assertEqual(stale["cuts"], [("2026-11-18", 130, 100.0)])
+        self.assertLessEqual(plain["low"], plain["high"])
+        self.assertLessEqual(plain["open"], plain["walk"])
+        self.assertLessEqual(plain["high"], 100)
+
+    def test_floor_is_the_lowest_price_with_even_odds(self):
+        e = offer.estimate(facts(), TODAY)
+        self.assertGreaterEqual(e["floor_odds"], 0.5)
+        self.assertLess(e["low"], e["floor"])
+        self.assertLessEqual(e["floor"], e["high"])
+        below = [o for x, o in e["ladder"] if x < e["floor"]]
+        self.assertTrue(below and all(o < 0.5 for o in below))
+        self.assertEqual([x for x, _ in e["ladder"]], sorted(x for x, _ in e["ladder"]))
+        self.assertLessEqual(e["open"], e["floor"])
+
+    def test_sellers_past_cuts_lower_the_floor(self):
+        plain = offer.estimate(facts(price=300.0), TODAY)
+        cutter = offer.estimate(facts(price=300.0, seller_record=dict(n=6, n_cut=3, median=0.2)), TODAY)
+        holder = offer.estimate(facts(price=300.0, seller_record=dict(n=6, n_cut=0, median=None)), TODAY)
+        self.assertLess(cutter["floor"], plain["floor"])
+        self.assertGreater(holder["floor"], plain["floor"])
+        few = offer.estimate(facts(price=300.0, seller_record=dict(n=2, n_cut=2, median=0.3)), TODAY)
+        self.assertEqual(few["floor"], plain["floor"])                    # two ads say nothing
+
+    def test_fixed_price_keeps_the_range_tight(self):
+        e = offer.estimate(facts(descr="Festpreis. Muss weg."), TODAY)
+        self.assertGreaterEqual(e["low"], 95)
+        self.assertGreaterEqual(e["open"], 85)
+
+    def test_cheap_against_a_trusted_value_walks_at_the_ask(self):
+        v = dict(value=150, conf="high", n=20, close=True)
+        e = offer.estimate(facts(value=v), TODAY)
+        self.assertEqual(e["walk"], 100)
+        self.assertGreaterEqual(e["low"], 90)
+
+    def test_walk_away_never_above_a_trusted_value(self):
+        v = dict(value=600, conf="high", n=36, close=True)
+        e = offer.estimate(facts(price=980.0, value=v, first_published="2026-11-01", published="2026-11-01",
+                                 first_seen="2026-11-01"), TODAY)
+        self.assertLessEqual(e["walk"], 600)
+        self.assertLessEqual(e["open"], e["walk"])
+        self.assertTrue(any(("(%s)" % e["low"]) in w for w in e["warnings"]))   # the same low as in the range
+
+    def test_a_loose_value_counts_only_as_rough(self):
+        v = dict(value=600, conf="high", n=36, close=False, match="brand · panel · size")
+        e = offer.estimate(facts(price=980.0, value=v), TODAY)
+        self.assertGreater(e["walk"], 600)
+        self.assertEqual(e["conf"], "low")
+        self.assertTrue(any("loose match" in t for _, t, _ in e["reasons"]))
+
+    def test_confidence_is_never_high_and_needs_measured_data(self):
+        base = dict(n=100, label="x", days="13", cut_share=0.08, cut_median=0.12, early_share=0.1, n_cut=8)
+        v = dict(value=100, conf="high", n=20, close=True)
+        self.assertEqual(offer.estimate(facts(), TODAY)["conf"], "low")
+        self.assertEqual(offer.estimate(facts(value=v, base=base), TODAY)["conf"], "medium")
+        self.assertEqual(offer.estimate(facts(value=v, base=base, first_seen="2026-10-20", first_published=None,
+                                              published=None, first_crawl="2026-10-25"), TODAY)["conf"], "low")
+
+    def test_no_price_is_an_error(self):
+        self.assertIn("error", offer.estimate(facts(price=0), TODAY))
+
+    def test_message(self):
+        e = dict(open=20, floor=26)
+        near = offer.message(e, facts(), "Alex", "1230 Wien")
+        self.assertTrue(near.startswith("Danke für die Antwort!"))        # the reply after the seller answered
+        self.assertIn("Wären 26 € ok?", near)
+        self.assertIn("diese Woche abholen", near)
+        self.assertTrue(near.endswith("Lg Alex"))
+        far = offer.message(e, facts(state="Oberösterreich", town="Linz", p2p=0), None, "1230 Wien")
+        self.assertIn("nach Linz", far)
+        self.assertNotIn("Lg", far)
+        ship = offer.message(e, facts(state="Tirol", town="Imst", p2p=1), None, "1230 Wien")
+        self.assertIn("PayLivery", ship)
+        own = offer.message(e, facts(), "Alex", "1230 Wien", "Servus! {pickup} {offer}?\nLG {name}")
+        self.assertEqual(own, "Servus! Ich könnte diese Woche abholen. 26 €?\nLG Alex")
+        broken = offer.message(e, facts(), None, None, "Hi {preis}")
+        self.assertIn("Wären 26 € ok?", broken)
+
+
+class OfferDbTests(TmpDbCase):
+    RAM = "pc-komponenten/ram-speicher-arbeitsspeicher-5887"
+
+    def setUp(self):
+        super().setUp()
+        wh._ROWS.clear()
+        wh._BT.clear()
+        wh._IDX.clear() if hasattr(wh, "_IDX") and hasattr(wh._IDX, "clear") else None
+        self.addCleanup(wh._BT.clear)
+        self.addCleanup(wh._ROWS.clear)
+
+    def summary_with(self, ad_id, price, extra=(), status=None, **kw):
+        s = make_summary(ad_id, kw.pop("heading", "Kingston 2x16GB DDR4 3200"), price, cats="5824;5878;5887", **kw)
+        s["attributes"]["attribute"] += [{"name": k, "values": [v]} for k, v in extra]
+        if status:
+            s["advertStatus"] = {"id": status}
+        return s
+
+    def test_summary_reads_cut_end_status_and_bump(self):
+        s = wh.summary(self.summary_with(1, 80, [("OLD_PRICE", "100"), ("PRICE_REDUCTION_SET_DATE_String",
+                                                                         "2026-11-18T09:00:00Z"),
+                                                 ("ENDDATE_String", "2026-12-01T09:00:00Z"), ("IS_BUMPED", "1")],
+                                         status="reserved"))
+        self.assertEqual((s["old_price"], s["cut_on"], s["ends"], s["status"], s["bumped"]),
+                         (100.0, "2026-11-18", "2026-12-01", "reserved", 1))
+        plain = wh.summary(self.summary_with(2, 80))
+        self.assertEqual((plain["old_price"], plain["cut_on"], plain["ends"], plain["bumped"]), (None, None, None, 0))
+
+    def test_store_keeps_the_earliest_published_date(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        wh.store(c, [wh.summary(self.summary_with(1, 80))], wh.now())
+        bumped = self.summary_with(1, 80)
+        for at in bumped["attributes"]["attribute"]:
+            if at["name"] == "PUBLISHED_String":
+                at["values"] = ["2026-11-19T10:00:00Z"]
+        wh.store(c, [wh.summary(bumped)], wh.now())
+        self.assertEqual(c.execute("select published from ads where id=1").fetchone()[0][:10], "2026-10-20")
+
+    def crawl(self, c, ads, at):
+        wh.store(c, [wh.summary(a) for a in ads], at)
+        wh.record_crawl(c, wh.search_url(url=self.RAM), self.RAM, len(ads), True, at)
+        c.commit()
+
+    def test_backtest_counts_gone_early_and_cut(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        t0 = wh.shift(wh.now(), -24 * 5)
+        t1 = wh.now()
+        far = "2027-03-01T00:00:00Z"
+        ads = [self.summary_with(100 + n, p, [("ENDDATE_String", far)]) for n, p in enumerate([95, 100, 100, 105, 110, 98])]
+        self.crawl(c, ads, t0)
+        later = [self.summary_with(100, 95, [("ENDDATE_String", far)]),
+                 self.summary_with(101, 80, [("ENDDATE_String", far)]),          # cut 100 -> 80
+                 self.summary_with(103, 105, [("ENDDATE_String", far)]),
+                 self.summary_with(105, 98, [("ENDDATE_String", far)])]          # 102 and 104 gone before their end
+        self.crawl(c, later, t1)
+        items = wh.backtest_kind(c, "ram")
+        self.assertEqual(len(items), 6)
+        s = wh.summarize(items, "ram")
+        self.assertAlmostEqual(s["gone_share"], 2 / 6)
+        self.assertAlmostEqual(s["early_share"], 2 / 6)
+        self.assertEqual(s["n_cut"], 1)
+        self.assertAlmostEqual(s["cut_median"], 0.2)
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            wh.print_backtest(c, argparse_ns(kinds=["ram"], json=False))
+        self.assertIn("ram, private", out.getvalue())
+        self.assertIn("−20 %", out.getvalue())
+
+    def test_backtest_needs_two_crawls_two_days_apart(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        self.crawl(c, [self.summary_with(100, 95)], wh.shift(wh.now(), -24))
+        self.crawl(c, [self.summary_with(100, 95)], wh.now())
+        self.assertEqual(wh.backtest_kind(c, "ram"), [])
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            wh.print_backtest(c, argparse_ns(kinds=["ram"], json=False))
+        self.assertIn("No backtest window", out.getvalue())
+
+    def test_cmd_offer_on_a_made_up_ad(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        det = make_detail_html(942424242, "Studiomonitor Paar, kaum benutzt", 120, descr="Preis VB. Nur Selbstabholung.",
+                               old_price=150)
+        out = io.StringIO()
+        with mock.patch.object(wh, "db", return_value=c), \
+             mock.patch.object(wh, "fetch", side_effect=lambda url, binary=False: (url, det if "942424242" in url
+                                                                                   else search_page(0, []))), \
+             mock.patch.object(wh, "CONFIG", {"name": "Alex", "location": "1230 Wien"}), \
+             mock.patch("sys.stdout", out):
+            wh.cmd_offer(argparse_ns(ad="942424242", kinds=None, compare=None, pages=1, no_search=False, json=False))
+        text = out.getvalue()
+        self.assertIn("the lowest price the seller will probably still accept", text)
+        self.assertIn("150 → 120", text)
+        self.assertIn("Reply with the offer", text)
+        self.assertIn("Lg Alex", text)
+
+    def test_seller_record_counts_cuts_on_other_ads(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        sellers = [self.summary_with(500 + n, p, [("ORGID", "777")]) for n, p in enumerate([50, 60, 70, 80])]
+        sellers[0]["attributes"]["attribute"].append({"name": "OLD_PRICE", "values": ["75"]})   # willhaben's record
+        wh.store(c, [wh.summary(a) for a in sellers], wh.shift(wh.now(), -48))
+        later = self.summary_with(501, 45, [("ORGID", "777")])                                 # wh saw 60 -> 45
+        wh.store(c, [wh.summary(later)], wh.now())
+        r = wh.seller_record(c, "777", 503)
+        self.assertEqual((r["n"], r["n_cut"]), (3, 2))
+        self.assertAlmostEqual(r["median"], (1 / 3 + 0.25) / 2)
+        self.assertIsNone(wh.seller_record(c, None, 1))
+
+    def test_deal_data_gets_the_price_room(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        d = dict(id=77, title="Studiomonitor Paar", price=120.0, descr="VB", info=[], private=True, status="active")
+        block = wh.offer_block(c, d)
+        self.assertIn("## Price room (wh offer, no AI)", block)
+        self.assertNotIn("Reply with the offer", block)
+        self.assertIn("Offer €", block)
+        self.assertEqual(wh.offer_block(c, dict(d, price=0)), "")
+
+
+
 def argparse_ns(**kw):
     import argparse
     return argparse.Namespace(**kw)

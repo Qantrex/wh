@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 `wh`: willhaben.at from the terminal. One Python script (`wh`) plus `profiles.py` (built-in profiles and the TOML
-template engine), `market.py` (kinds of items, spec extractors and market values for find/value/watch), the Claude skill in `skill/willhaben/`, and `test_wh.py`. See the README for commands and install.
+template engine), `market.py` (kinds of items, spec extractors and market values for find/value/watch), `offer.py` (wh offer's floor, odds and reply draft), the Claude skill in `skill/willhaben/`, and `test_wh.py`. See the README for commands and install.
 
 ## Commands
 

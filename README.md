@@ -22,6 +22,9 @@ wh value dell u2723qe                   # a bare model gets its kind from the ad
 wh crawl --list                         # the categories behind the market values, and when they were last read
 wh watch add gpu --kind gpu --below 0.35   # a saved find; `wh watch run --json` reports new deals once (for a timer)
 
+wh offer <link>                         # the lowest price the seller will probably still accept, rough odds, a reply draft
+wh offer --backtest tv speakers         # what happened to ads between two full crawls: gone, early, cut
+
 wh deal <link> --for "a friend"         # AI: worth buying (for whom)? verdict, comparables, offer, questions
 wh advise                               # AI: should my live ads get a lower price? (one Claude call per ad, in parallel)
 wh hunt Laptop                          # AI: sweep a buy note, Claude writes the best picks into it
@@ -41,6 +44,20 @@ The AI commands gather the data and ask `claude -p` (no tools, so it only reason
 - Ads without a clear key (no model, size or capacity in the text) get no value instead of a wrong one. Accessories and parts in the categories (controllers, cases, TV power boards …) are recognised and left out.
 - **Watches** (`~/.config/wh/watches.toml`, edited with `wh watch add/rm`): `wh watch run` reports matching ads that are new or cheaper since the watch's last run and at least `below` (default 25 %) under value, each once. The ads of a category's first full crawl are the starting stock, not news. `--json` is made for a timer or an agent. `--budget SECONDS` stops starting new watches after that long (least recently run first; the JSON lists the `skipped` ones), so a timer with a hard time limit still gets partial results. Watch runs are CPU-bound on a big database (100k+ ads): the market index is built once per kind and run. `wh crawl --new --budget SECONDS` likewise starts no further page after that long and keeps what it read.
 - Asking prices aren't selling prices, and the value is only as good as the key: check the comparables (`wh value <ad link>` lists them).
+
+## Price room (wh offer)
+
+`wh offer <ad>` estimates the lowest price the seller will probably still accept, without AI. It starts from a rule of thumb (private sellers usually come down 5–15 %, dealers 0–5 %) and shifts it by the ad's signals, each labelled as coming from the ad, from measurements in the database, or from a rule of thumb:
+
+- **Time online:** the earliest of willhaben's online-since date and wh's first sighting (bumps reset willhaben's date), and the days until a private ad expires (45 days after publishing).
+- **Price cuts:** the ad's own history plus willhaben's record of the last cut (old price and date), which wh stores from the search pages.
+- **The text:** VB, Fixpreis or "nicht verhandelbar", a stale "300 Fix" above the current price, muss weg or Umzug, pickup only.
+- **The seller:** private or dealer, how many ads they have online (15–40 is a clear-out; more is a trader in practice), a brand-new account, and how often they cut the price on their other ads wh has seen.
+- **The market:** the ask against the market value when wh knows the kind (a loose match, such as a TV valued by brand and size only, counts as rough), otherwise a keyword search for similar ads; and what comparable ads did between the first and the last full crawl of their category.
+
+The result is the floor with its odds, a short ladder of prices with rough odds, a walk-away price, the reasons, and a short German reply with the offer for after the seller answered your first questions (`name`, `location` and an optional `message` template in the config). `wh deal` gets the same numbers.
+
+**How strong the evidence is:** nobody ever sees the price a used item finally sells for, so the odds are a guess. The band is read as "four in five sellers take the high end, one in five go down to the low end". What is measured is what asking prices did: `wh offer --backtest [kinds]` takes every ad online at a category's first complete crawl and checks it at the last one (at least two days later). In a database with 3–14-day windows (November 2026, about 48k private ads), 25 % were gone, 7 % went before their end date (sold or taken down), and 6 % had cut their price (median −12 %). Cheap ads (at or below 90 % of value) went early more often, and overpriced ones were cut more often. Cuts made just before an ad vanished are invisible with crawls days apart, so "gone after a cut" is a floor. Treat the numbers as direction, not precision.
 
 ## Install
 
@@ -69,6 +86,7 @@ If willhaben pushes back (HTTP 403/429/503 or a Cloudflare challenge page), ever
 ## Files
 
 - `wh`: the command (Python 3.11+, standard library only). Linked as `~/.local/bin/wh`.
+- `offer.py`: `wh offer`'s estimate (signals, floor, odds, reply draft), pure Python without network or database.
 - `market.py`: the kinds of items (categories, spec extractors, keys) and the market value maths, pure Python without network or database.
 - `profiles.py`: per-category knowledge that turns ads into comparable specs and filters junk: the built-in profiles (`laptop`, `pc`, `server`, `hue`) and the template engine. A buy note picks one with `wh-profile: laptop`.
 - `templates/example.toml`: a sample template. Your own live in `~/.config/wh/templates/` (see [Templates](#templates)).
@@ -108,7 +126,7 @@ Nothing personal belongs in this repo, and `.gitignore` blocks the usual suspect
 
 | What | Where |
 |---|---|
-| Settings (`notes`, `skill`, `location`) | `~/.config/wh/config.toml` |
+| Settings (`notes`, `skill`, `location`, `name`, `message`) | `~/.config/wh/config.toml` |
 | Your templates | `~/.config/wh/templates/` |
 | Ads, price history, old exports | `~/.local/share/wh/` |
 | Notes | your notes folder |
@@ -116,7 +134,9 @@ Nothing personal belongs in this repo, and `.gitignore` blocks the usual suspect
 ```toml
 # ~/.config/wh/config.toml
 notes = "~/path/to/marketplace-notes"
-location = "1010 Wien"        # optional: lets Claude weigh pickup distance
+location = "1010 Wien"        # optional: lets Claude weigh pickup distance, and wh offer say pickup or PayLivery
+name = "Alex"                 # optional: signs wh offer's reply draft
+# message = "Hallo! {pickup} Wären {offer} ok?\nLG {name}"   # optional: your own wording for that reply
 ```
 
 The AI commands (`deal`, `advise`, `hunt`) are the exception: they send what they gather to Claude, including the note, the `location` and the skill's rules. `--no-ai` prints it instead of sending it.

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """wh: willhaben.at from the terminal. Fast public data with a local cache; Claude does the judging.
 
-Data commands (no AI):  search, facets, ad, history, photos, status, sweep, profiles, doctor
+Data commands (no AI):  search, facets, ad, history, photos, status, sweep, find, value, offer, crawl, watch,
+                        profiles, doctor
 AI commands:            deal, advise, hunt   (gather the data, then ask `claude -p` with the willhaben skill's rules;
                                               --no-ai prints the gathered data instead, for use inside a Claude session)
 
@@ -36,6 +37,7 @@ from datetime import date, datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import profiles  # noqa: E402
 import market  # noqa: E402
+import offer  # noqa: E402
 
 BASE = "https://www.willhaben.at"
 try:
@@ -48,7 +50,7 @@ UA = "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0"
 
 
 CONFIG_PATH = os.path.join(os.path.expanduser(os.environ.get("WH_CONFIG", "~/.config/wh")), "config.toml")
-CONFIG_KEYS = {"notes", "skill", "location"}
+CONFIG_KEYS = {"notes", "skill", "location", "name", "message"}
 
 
 def load_config(path=CONFIG_PATH):
@@ -327,8 +329,11 @@ create table if not exists specs (id integer, kind text, sig text, data text, pr
 # Columns added after the first release: a database from an older wh gets them on open (ALTER TABLE, no data lost).
 # tattrs: willhaben's filter values of the ad ("[21;23, 2535;2537]": condition, handover, size bucket, brand …),
 # seller: the seller's org id (one seller's reposts count once in a market value), p2p: PayLivery (shipping with
-# buyer protection), coords: "lat,lon".
-AD_COLUMNS = (("tattrs", "text"), ("seller", "text"), ("p2p", "integer"), ("coords", "text"))
+# buyer protection), coords: "lat,lon". old_price/cut_on: willhaben's own record of the last price cut (the price
+# before it and its day), ends: the day the ad expires (private ads run 45 days from their last publishing), status:
+# willhaben's ad status ("active", "reserved" …), bumped: a paid push to the top (resets willhaben's publishing date).
+AD_COLUMNS = (("tattrs", "text"), ("seller", "text"), ("p2p", "integer"), ("coords", "text"), ("old_price", "real"),
+              ("cut_on", "text"), ("ends", "text"), ("status", "text"), ("bumped", "integer"))
 AD_FIELDS = ("id", "title", "price", "loc", "state", "postcode", "private", "published", "url", "body", "cats") + tuple(
     n for n, _ in AD_COLUMNS)
 
@@ -358,14 +363,19 @@ def summary(a):
                 url=(BASE + "/iad/" + seo.lstrip("/")) if seo else "%s/iad/object?adId=%s" % (BASE, a["id"]),
                 body=clean(g("BODY_DYN")), cats=",".join(at.get("categorytreeids") or []),
                 tattrs=g("categorytreeattributeids"), seller=g("ORGID") or None,
-                p2p=int(g("p2penabled") == "true"), coords=g("COORDINATES") or None)
+                p2p=int(g("p2penabled") == "true"), coords=g("COORDINATES") or None,
+                old_price=num(g("OLD_PRICE")), cut_on=day(g("PRICE_REDUCTION_SET_DATE_String")) or None,
+                ends=day(g("ENDDATE_String")) or None, status=(a.get("advertStatus") or {}).get("id") or None,
+                bumped=int(g("IS_BUMPED") == "1"))
 
 
 def store(c, ads, t):
     cols = ",".join(AD_FIELDS)
     for a in ads:
         a = dict({k: None for k in AD_FIELDS}, **a)
-        old = c.execute("select price from ads where id=?", (a["id"],)).fetchone()
+        old = c.execute("select price, published from ads where id=?", (a["id"],)).fetchone()
+        if old is not None and old["published"] and a["published"]:   # a bump or relist moves willhaben's date on:
+            a["published"] = min(old["published"], a["published"])      # keep the first one wh saw
         if old is None:
             c.execute("insert into ads (%s, first_seen, last_seen) values (%s, :t, :t)"
                       % (cols, ",".join(":" + k for k in AD_FIELDS)), dict(a, t=t))
@@ -1169,28 +1179,362 @@ def cmd_sweep(a):
         print(json.dumps(dict(at=now(), dry_run=bool(a.dry_run), notes=report), ensure_ascii=False, indent=1))
 
 
-def market_block(c, d):
-    """The ad's market value as a prompt section, when wh knows its kind and has crawled its categories; else ''."""
+def ad_market(c, d):
+    """(kind, the ad annotated, market value or None, the ads behind it, the kind's rows, its index) when wh knows the
+    ad's kind and has crawled its categories; else None."""
     row = c.execute("select * from ads where id=?", (d["id"],)).fetchone()
     if not row:
-        return ""
+        return None
     ad = dict(row, descr=d.get("descr"), info=d.get("info") or [], price=d.get("price"))
     name = market.kind_of(ad)
     if not name or not online_since(c, name):
-        return ""
+        return None
     market.specs(ad, name)
-    rows = kind_rows(c, name)
-    idx = market.build_index(rows, name)
+    rows = kind_rows(c, name, cache=True)
+    idx = _IDX.get(name) or _IDX.setdefault(name, market.build_index(rows, name))
     est = market.value_of(idx, name, ad["specs"], exclude=ad["id"])
-    if not est:
+    comps = comps_for(idx, {r["id"]: r for r in rows}, name, est, ad["id"]) if est else []
+    return name, ad, est, comps, rows, idx
+
+
+def market_block(c, d):
+    """The ad's market value as a prompt section, when wh knows its kind and has crawled its categories; else ''."""
+    m = ad_market(c, d)
+    if not m or not m[2]:
         return ""
-    comps = comps_for(idx, {r["id"]: r for r in rows}, name, est, ad["id"])
+    name, ad, est, comps, _, _ = m
     return ("\n\n## Market value (wh, last %d days)\n\nAs %s: %s. Value %s (middle half %s–%s, %d sellers, %s "
             "confidence); this ad is %s against it.%s Ads behind the value:\n%s" % (
                 market.VALUE_DAYS, name, market.label(name, ad["specs"]), euro(est["value"]), euro(est["p25"]),
                 euro(est["p75"]), est["n"], est["conf"], pct(1 - d["price"] / est["value"]) if d.get("price") else "?",
                 " As an item of this kind it looks like: %s." % ad["junk"] if ad["junk"] else "",
                 "\n".join("- %s %s %s" % (euro(x["price"]), x["title"], x["url"]) for x in comps)))
+
+
+# ---- offer: how far the price can probably drop ---------------------------------------------------------------
+
+BUCKETS = ((0.9, "≤90 % of value"), (1.1, "90–110 %"), (1.3, "110–130 %"), (float("inf"), ">130 %"))
+
+
+def bucket(ratio):
+    if ratio is None:
+        return "no value"
+    return next(label for top, label in BUCKETS if ratio <= top)
+
+
+def crawl_pairs(c, cats):
+    """{category path: (first complete crawl, last complete crawl)} for categories crawled whole at least twice, two or
+    more days apart: the windows the backtest can look through."""
+    out = {}
+    for p in cats:
+        ts = [r["at"] for r in c.execute("select at from runs where key=? and complete=1 order by at", (crawl_key(p),))]
+        if len(ts) >= 2 and (hours_since(ts[0]) - hours_since(ts[-1])) >= 48:
+            out[p] = (ts[0], ts[-1])
+    return out
+
+
+def shift(ts, hours):
+    return datetime.fromtimestamp(datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp() + hours * 3600,
+                                  timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def backtest_kind(c, name):
+    """Every ad of a kind that was online at a category's first complete crawl, and what had happened to it by the
+    last one: [dict(private, bucket, flag, days, gone, early, cut)]. early: gone before its end date (sold or taken
+    down; gone after it may just have expired). cut: the share the price fell, 0 for none."""
+    pairs = crawl_pairs(c, market.KINDS[name]["cats"])
+    if not pairs:
+        return []
+    rows = kind_rows(c, name, days=400, cache=False)
+    idx = market.build_index(rows, name)
+    out = []
+    for path, (ta, tb) in pairs.items():
+        cid = re.search(r"(\d+)$", path).group(1)
+        end_a = shift(ta, 12)
+        cohort = [r for r in rows if not r["junk"] and r.get("price") and cid in (r.get("cats") or "").split(";")
+                  + (r.get("cats") or "").split(",") and (r.get("first_seen") or "") <= end_a
+                  and (r.get("last_seen") or "") >= ta]
+        before = last_prices(c, [r["id"] for r in cohort], end_a)
+        span = max(1, round((hours_since(ta) - hours_since(tb)) / 24))
+        for r in cohort:
+            pa = before.get(r["id"]) or r["price"]
+            if not pa:
+                continue
+            gone = (r.get("last_seen") or "") < tb
+            ends = r.get("ends") or (str(date.fromordinal(date.fromisoformat(r["published"][:10]).toordinal()
+                                                          + offer.RUN_DAYS)) if r.get("published") and r.get("private")
+                                     else None)
+            est = market.value_of(idx, name, r["specs"], exclude=r["id"])
+            text = " ".join(x for x in (r.get("title"), r.get("body")) if x)
+            keys = {k for k, _, _ in offer.text_flags(text, pa)}
+            out.append(dict(private=bool(r.get("private")), bucket=bucket(pa / est["value"] if est else None),
+                            flag="fix" if "fix" in keys else "vb" if "vb" in keys else "",
+                            days=span, gone=gone, early=bool(gone and ends and ends > tb[:10]),
+                            cut=max(0.0, 1 - (r["price"] or pa) / pa)))
+    return out
+
+
+def summarize(items, label):
+    """The numbers the backtest prints and wh offer uses, for one group of ads."""
+    n = len(items)
+    if not n:
+        return None
+    cuts = sorted(x["cut"] for x in items if x["cut"] > 0.005)
+    gone = [x for x in items if x["gone"]]
+    ds = [x["days"] for x in items]
+    return dict(label=label, n=n, days=("%d" % min(ds)) if min(ds) == max(ds) else "%d–%d" % (min(ds), max(ds)),
+                n_cut=len(cuts),
+                gone_share=len(gone) / n, early_share=sum(x["early"] for x in items) / n,
+                cut_share=len(cuts) / n, cut_median=statistics.median(cuts) if cuts else None,
+                cut_p75=cuts[int(len(cuts) * 0.75)] if cuts else None,
+                gone_cut_share=sum(1 for x in gone if x["cut"] > 0.005) / len(gone) if gone else None)
+
+
+_BT = {}
+
+
+def backtest(c, kinds=None):
+    """{kind: [ad outcomes]} for the kinds with a backtest window (cached for the run)."""
+    for k in kinds or sorted(market.KINDS):
+        if k not in _BT:
+            _BT[k] = backtest_kind(c, k)
+    return {k: _BT[k] for k in kinds or sorted(market.KINDS) if _BT[k]}
+
+
+def base_rate(c, name, ratio, private):
+    """What happened to comparable ads: the kind, seller type and price-vs-value bucket when there are 30 or more,
+    else ever looser groups. None when the database has no backtest window."""
+    items = backtest(c, [name])[name] if name else [x for v in backtest(c).values() for x in v]
+    who = "private" if private else "dealer"
+    mine = [x for x in items if x["private"] == bool(private)]
+    b = bucket(ratio)
+    pre = name + ", " if name else ""
+    for group, label in (([x for x in mine if x["bucket"] == b], "%s%s, %s" % (pre, who, b)),
+                         (mine, "%s%s" % (pre, who))):
+        if len(group) >= 30:
+            return dict(summarize(group, label), noun="comparable ads" if name else
+                        "other ads in wh's crawled categories (not this kind of item)")
+    return None
+
+
+def similar_value(d, comps, chosen=False):
+    """A rough value from a keyword search when the ad's kind has no market value: the median of the ads sharing most
+    of the title's words (all of them when the user chose the search words). Low confidence by nature, and none when
+    the prices are too far apart to say anything (the middle half spans more than 2.5×)."""
+    mine = set(title_words(d["title"]))
+    need = 0 if chosen else max(1, min(3, len(mine) // 2))
+    same = [x for x in comps if x.get("price") and len(mine & set(title_words(x["title"]))) >= need]
+    if len(same) < 3:
+        return None, same
+    ps = sorted(x["price"] for x in same)
+    if ps[(len(ps) * 3) // 4] > 2.5 * ps[len(ps) // 4]:
+        return None, same
+    return dict(value=statistics.median(ps), p25=ps[len(ps) // 4], p75=ps[(len(ps) * 3) // 4], n=len(ps), conf="low",
+                unit="similar ads from a keyword search"), same
+
+
+# Key fields that name the item itself; a value at a level without one of them (a TV by brand, panel and size) is a
+# loose match, not this model, and counts only as a rough value.
+CLOSE = {"model", "series", "sku", "year", "chipset", "watt", "speed", "kit", "capacity", "storage", "edition"}
+
+
+def seller_record(c, seller, exclude):
+    """How the seller priced their other ads wh saw (by willhaben's seller id): n, n_cut (ads whose price fell, from
+    wh's own price rows or willhaben's old price), median (median size of those cuts). None without a seller id."""
+    if not seller:
+        return None
+    cuts, n = [], 0
+    for r in c.execute("select a.id, a.price, a.old_price, (select price from prices p where p.id=a.id order by seen, "
+                       "rowid limit 1) first, (select max(price) from prices p where p.id=a.id) top from ads a "
+                       "where a.seller=? and a.id!=?", (str(seller), exclude)):
+        if not r["price"]:
+            continue
+        n += 1
+        top = max(x for x in (r["top"], r["old_price"], r["price"]) if x)
+        if r["price"] < top * 0.995:
+            cuts.append(1 - r["price"] / top)
+    return dict(n=n, n_cut=len(cuts), median=statistics.median(cuts) if cuts else None)
+
+
+def offer_facts(c, d, words=None, pages=1, search=True):
+    """Everything offer.estimate() weighs, for one ad (a details() dict). Runs one keyword search for comparables
+    when the ad's kind has no market value (unless search=False)."""
+    chosen = bool(words)
+    row = c.execute("select * from ads where id=?", (d["id"],)).fetchone()
+    comps, words, searched = [], words or comp_words(d["title"]), False
+    m = ad_market(c, d) if row else None
+    if search and not m:                         # a kind wh values gets no keyword value: sizes and models would mix
+        comps, _ = comparables(c, d, words, pages, None)
+        searched = True
+        row = c.execute("select * from ads where id=?", (d["id"],)).fetchone()
+        m = ad_market(c, d) if row else None
+        if m:
+            comps, searched = [], False
+    row = dict(row) if row else {}
+    name, value, vcomps = None, None, []
+    if m and m[2]:
+        name, _, est, vcomps, _, _ = m
+        lvl = market.KINDS[name]["keys"].index(est["level"])
+        value = dict(est, unit="sellers", match=" · ".join(str(x) for x in est["key"] if x != "-"),
+                     close=lvl == 0 or bool(CLOSE & set(est["level"])))
+    elif comps:
+        value, vcomps = similar_value(d, comps, chosen)
+        name = m[0] if m else None
+    elif m:
+        name = m[0]
+    ratio = d["price"] / value["value"] if value and d.get("price") else None
+    first_crawl = None
+    if name:
+        ts = [r["a"] for r in c.execute("select min(at) a from runs where complete=1 and key in (%s)" % ",".join(
+            "?" * len(market.KINDS[name]["cats"])), [crawl_key(p) for p in market.KINDS[name]["cats"]])]
+        first_crawl = ts[0] if ts else None
+    loc = d.get("loc") or ""
+    town = row.get("loc") or re.sub(r"^\d{4}\s+", "", loc).split(",")[0].split(" ")[0]
+    return dict(id=d["id"], title=d["title"], descr=d.get("descr"), price=d.get("price"), private=d.get("private", True),
+                seller_since=d.get("seller_since"), seller_ads=d.get("seller_ads"),
+                first_published=d.get("first_published"), published=row.get("published"),
+                first_seen=(row.get("first_seen") or "")[:10] or None, first_crawl=first_crawl,
+                ends=d.get("ends") or row.get("ends"), bumped=row.get("bumped"),
+                history=price_history(c, d["id"]), old_price=d.get("old_price"), cut_on=d.get("price_cut_on"),
+                state=row.get("state") or (loc.split()[-1] if loc else None), town=town, p2p=row.get("p2p"),
+                kind=name, value=value, value_comps=vcomps[:5], compare=words if searched else None,
+                pickup_only=bool(offer.PICKUP_ONLY.search(d.get("descr") or "")),
+                junk=m[1]["junk"] if m else None, base=base_rate(c, name, ratio, d.get("private", True)),
+                seller_record=seller_record(c, row.get("seller"), d["id"]))
+
+
+def offer_result(c, d, words=None, pages=1, search=True):
+    f = offer_facts(c, d, words, pages, search)
+    est = offer.estimate(f)
+    if not est.get("error"):
+        est["message"] = offer.message(est, f, CONFIG.get("name"), CONFIG.get("location"), CONFIG.get("message"))
+    return f, est
+
+
+SOURCE = {"ad": "the ad", "db": "measured", "rule": "rule of thumb"}
+
+
+def odds_pct(o):
+    return int(round(o * 20)) * 5                                    # steps of 5 %: anything finer would be pretend
+
+
+def fmt_offer(f, e, md=False):
+    if e.get("error"):
+        return "wh offer: %s" % e["error"]
+    lines = ["Offer %s: the lowest price the seller will probably still accept (asking %s; about %d %% odds, %s "
+             "confidence)" % (euro(e["floor"]), euro(e["ask"]), odds_pct(e["floor_odds"]), e["conf"]),
+             "Rough odds the seller says yes: %s" % " · ".join(
+                 "%s ~%d %%" % (euro(x), odds_pct(o)) for x, o in e["ladder"]),
+             "Walk away above %s" % euro(e["walk"]), "", "Why:"]
+    for sign, text, src in e["reasons"]:
+        lines.append("  %s %s (%s)" % (sign or "·", text, SOURCE[src]))
+    for w in e["warnings"]:
+        lines.append("  ! %s" % w)
+    v = f.get("value")
+    if v:
+        lines += ["", "Comparables behind the value (%s):" % (f.get("kind") or "keyword search \"%s\"" % f.get("compare"))]
+        lines += ["  %7s  %s" % (euro(x["price"]), cell(x["title"], 70)) for x in f.get("value_comps") or []]
+    else:
+        if f.get("kind") and f.get("junk"):
+            why = "as a %s it reads as \"%s\" to wh's rules (check the ad: it may be a false alarm)" % (f["kind"], f["junk"])
+        elif f.get("kind"):
+            why = "as a %s it names no model and size wh can value" % f["kind"]
+        elif f.get("compare"):
+            why = ("wh values no such kind, and the search \"%s\" found fewer than 3 similar ads or their prices were "
+                   "too far apart (try --compare with other words)" % f["compare"])
+        else:
+            why = "wh values no such kind and searched no similar ads"
+        lines += ["", "No market value: %s. The range rests on the rule of thumb and the ad's own signals." % why]
+    lines += ["", "Evidence: no negotiated price is ever seen, so the odds are a guess: a private seller's usual 5–15 %% "
+              "off, shifted by the signals above, read as four in five sellers taking the high end and one in five "
+              "going down to the low end. Measured: %s." % ", ".join(x for x in (
+                  "the market value" if v and v.get("unit") == "sellers" else "a rough value from similar ads" if v else "",
+                  "what comparable ads did between two full crawls" if f.get("base") else "",
+                  "the ad's own price history" if e["cuts"] else "",
+                  "the seller's other ads" if (f.get("seller_record") or {}).get("n", 0) >= 3 else "") if x) or "nothing",
+              "", "Reply with the offer, after the seller answered your opening questions (draft, not sent):",
+              e["message"]]
+    return "\n".join(lines)
+
+
+def offer_block(c, d):
+    """wh offer's numbers as a prompt section for `wh deal`."""
+    try:
+        f, e = offer_result(c, d, search=False)
+    except WhError as ex:
+        return "\n\n## Price room (wh offer)\n\nwh offer failed: %s" % ex
+    if e.get("error"):
+        return ""
+    return ("\n\n## Price room (wh offer, no AI)\n\n%s\n\nUse this floor for the suggested offer unless the data above "
+            "clearly says otherwise, and say where you differ." % fmt_offer(f, e).split("\n\nReply with the offer")[0])
+
+
+def cmd_offer(a):
+    c = db()
+    if a.kinds is not None:
+        return print_backtest(c, a)
+    if not a.ad:
+        raise WhError("give an ad id or link, or --backtest")
+    d = details(c, ad_id(a.ad), refresh=True)
+    if d["status"] == "offline":
+        sys.exit(fmt_details(d))
+    f, e = offer_result(c, d, a.compare, a.pages, not a.no_search)
+    if a.json:
+        print(json.dumps(dict(facts={k: v for k, v in f.items() if k != "descr"}, offer=e), ensure_ascii=False,
+                         indent=1, default=str))
+        return
+    days_txt = ("%s%d days online" % ("at least " if e.get("at_least") else "", e["days_online"])
+                if e.get("days_online") is not None else "online since ?")
+    print("**%s**\n%s · %s · %s seller · %s%s\n%s\n" % (
+        d["title"], euro(d["price"]), d.get("loc") or "?", "private" if d.get("private") else "dealer", days_txt,
+        " · expires %s" % d["ends"] if d.get("ends") else "", d["url"]))
+    if d["status"] != "active":
+        print("! The ad is %s.\n" % d["status"])
+    print(fmt_offer(f, e))
+
+
+def print_backtest(c, a):
+    kinds = a.kinds or sorted(market.KINDS)
+    bad = [k for k in kinds if k not in market.KINDS]
+    if bad:
+        raise WhError("unknown kind %s (known: %s)" % (", ".join(bad), ", ".join(sorted(market.KINDS))))
+    res = backtest(c, kinds)
+    rows = []
+    for k in kinds:
+        items = res.get(k) or []
+        priv = [x for x in items if x["private"]]
+        if not priv:
+            continue
+        rows.append(summarize(priv, "%s, private" % k))
+        for _, b in BUCKETS + ((None, "no value"),):
+            rows.append(summarize([x for x in priv if x["bucket"] == b], "  %s" % b))
+        for flag, label in (("vb", "  says VB"), ("fix", "  says Fixpreis")):
+            rows.append(summarize([x for x in priv if x["flag"] == flag], label))
+        rows.append(summarize([x for x in items if not x["private"]], "%s, dealers" % k))
+    allp = [x for v in res.values() for x in v if x["private"]]
+    tot = summarize(allp, "all kinds, private")
+    rows = [r for r in rows if r]
+    if a.json:
+        print(json.dumps(dict(db=DB, groups=([tot] if tot else []) + rows), ensure_ascii=False, indent=1))
+        return
+    if not rows:
+        print("No backtest window: wh needs two complete crawls of a category at least two days apart (`wh crawl`).")
+        return
+    print("What happened to ads online at a category's first complete crawl by its last one (%s)\n" % DB)
+    print("%-30s %6s %6s %6s %6s %6s %5s %7s %6s %9s" % ("group", "ads", "days", "gone", "early", "cut", "cuts",
+                                                         "median", "p75", "gone+cut"))
+    for r in ([tot] if tot else []) + rows:
+        print("%-30s %6d %6s %5.0f%% %5.0f%% %5.0f%% %5d %7s %6s %9s" % (
+            cell(r["label"], 30), r["n"], r["days"], r["gone_share"] * 100, r["early_share"] * 100, r["cut_share"] * 100,
+            r["n_cut"],
+            "−%.0f %%" % (r["cut_median"] * 100) if r["cut_median"] else "–",
+            "−%.0f %%" % (r["cut_p75"] * 100) if r["cut_p75"] else "–",
+            "%.0f %%" % (r["gone_cut_share"] * 100) if r["gone_cut_share"] is not None else "–"))
+    print("\ngone: not seen in the last crawl. early: gone before the ad's end date (sold, or taken down; the rest may "
+          "just have expired). cut: the price fell between the crawls (cuts: how many; median and p75 of their size). "
+          "Windows differ by category (days). gone+cut: gone "
+          "ads whose price wh saw fall first; with only full crawls far apart this misses almost every cut before an "
+          "ad vanished, so it is a floor. Asking prices only: no negotiated price is ever seen.")
 
 
 def cmd_deal(a):
@@ -1203,7 +1547,7 @@ def cmd_deal(a):
     data = who_block(a.for_) + "\n\n## The ad\n\n%s\n\n## Comparable ads on willhaben now\n\nSearch \"%s\": %s; %s. Some may not be " \
            "truly comparable: judge from the titles.\n\n%s" % (fmt_details(d, c), words, found, market_line(comps),
                                                               table(comps[:a.limit], a.profile, True))
-    data += market_block(c, d)
+    data += market_block(c, d) + offer_block(c, d)
     task = ("Should I buy this ad? Start with one verdict line: **good deal / fair / overpriced / walk away / likely "
             "scam**. Then: where the price sits against the comparable ads (with numbers), the total cost, anything in "
             "the ad that doesn't match its title, red flags, a suggested offer in €, and the questions to ask the seller "
@@ -2305,6 +2649,17 @@ def main():
     s.add_argument("ad", help="ad ID or link")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_history)
+
+    s = sub.add_parser("offer", help="how far an ad's price can probably drop (no AI): expected final price, opening "
+                                     "offer, walk-away price, a draft message; --backtest: how often prices fell")
+    s.add_argument("ad", nargs="?", help="ad ID or link")
+    s.add_argument("--compare", help="keywords for comparable ads when the ad's kind has no market value")
+    s.add_argument("--pages", type=int, default=1, help="pages of that keyword search (default 1)")
+    s.add_argument("--no-search", action="store_true", help="no keyword search, only the database")
+    s.add_argument("--backtest", nargs="*", metavar="KIND", dest="kinds", default=None,
+                   help="instead of an ad: what happened to the ads between two full crawls (all kinds or these)")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_offer)
 
     s = sub.add_parser("photos", help="download an ad's photos as JPEG (WebP gets converted)")
     s.add_argument("ad")
