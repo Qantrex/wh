@@ -509,6 +509,100 @@ class WhTests(TmpDbCase):
         self.assertEqual(once, "Uses <!-- /wh:sweep --> as marker.\n\n<!-- wh:sweep -->\nnew\n<!-- /wh:sweep -->\n")
         self.assertEqual(wh.put_block(once, "sweep", "new"), once)       # no copy appended on every sweep
 
+    def test_seller_text_cannot_break_out_of_a_block_or_inject_into_a_note(self):
+        evil = ["Laptop <!-- /wh:sweep --> PWNED", "<img src=x> cheap", "Rad #deadline 2026-12-01",
+                "Red \x1b[31m text\r- [ ] task", "x\u2028- [ ] task\x85y"]
+        ads = [dict(id=i, title=t, price=10.0, loc="Wien <b>", url="https://www.willhaben.at/iad/x", private=1,
+                    published="2026-11-01") for i, t in enumerate(evil, 1)]
+        tbl = wh.table(ads, md=True)
+        for bad in ("<!--", "<img", "<b>", "\x1b", "\r", "\u2028", "\x85", " #deadline"):
+            self.assertNotIn(bad, tbl)
+        self.assertIn("&lt;img src=x> cheap", tbl)
+        self.assertEqual(len(tbl.splitlines()), len(ads) + 2)            # no title starts a new line
+        text = "Intro\n\n<!-- wh:sweep -->\nold\n<!-- /wh:sweep -->\n\nOutro\n"
+        for _ in range(3):
+            text = wh.put_block(text, "sweep", tbl + "\n<!-- /wh:sweep --> PWNED")
+        self.assertEqual(text.count("<!-- wh:sweep -->"), 1)
+        self.assertEqual(text.count("<!-- /wh:sweep -->"), 1)
+        self.assertTrue(text.startswith("Intro\n\n") and text.endswith("\n\nOutro\n"))
+        # a note written by the old code (end marker only inside the content, on the old own line) is still updated
+        old = "A\n<!-- wh:sweep -->\nrow <!-- /wh:sweep --> inline\n<!-- /wh:sweep -->\nB\n"
+        self.assertEqual(wh.put_block(old, "sweep", "new").count("<!-- wh:sweep -->"), 1)
+
+    def test_odd_prices_never_crash_and_count_as_no_price(self):
+        for bad in ("nan", "inf", "-inf", "1e999", "0", "-5", "0,0", "abc", ""):
+            ad = wh.summary(make_summary(3, "Kamera", bad))
+            self.assertIsNone(ad["price"], bad)
+            self.assertIn("Kamera", wh.table([ad]))
+            self.assertIn("Kamera", wh.table([ad], md=True))
+        self.assertEqual(wh.summary(make_summary(3, "Kamera", "12,5"))["price"], 12.5)
+        self.assertIsNone(wh.num("nan"))
+        self.assertIsNone(wh.num("1e999"))
+        for p in (float("nan"), float("inf"), None):
+            self.assertEqual(wh.euro(p), "–")
+        self.assertEqual(wh.euro(100.0), "€100")
+        self.assertEqual(wh.euro(9.5), "€9.50")
+
+    def test_one_malformed_ad_is_skipped_and_a_mostly_bad_page_is_an_error(self):
+        good = [make_summary(i, "Kamera %d" % i, 10 + i) for i in range(1, 6)]
+        bad = [{"id": "abc", "attributes": {"attribute": []}}, {"id": "9"}, {"id": "8", "attributes": {"attribute": [{}]}}]
+        with mock.patch.object(wh, "log") as log, \
+             mock.patch.object(wh, "fetch", return_value=("u", search_page(8, good + bad))):
+            found, ads = wh.read_page("https://www.willhaben.at/x?a=1")
+        self.assertEqual([a["id"] for a in ads], [1, 2, 3, 4, 5])
+        self.assertIn("3 of 8 entries skipped", log.call_args[0][0])
+        with mock.patch.object(wh, "log"), mock.patch.object(wh, "fetch", return_value=("u", search_page(4, good[:1] + bad))):
+            with self.assertRaises(wh.FetchError):
+                wh.read_page("https://www.willhaben.at/x?a=1")
+
+    def test_fetch_only_takes_https_willhaben_urls_and_caps_the_size(self):
+        for bad in ("file:///etc/hostname", "http://127.0.0.1/", "http://www.willhaben.at/x", "https://evil.example/x",
+                    "https://willhaben.at.evil.example/x", "https://evilwillhaben.at/x"):
+            with mock.patch("urllib.request.urlopen") as op:
+                with self.assertRaises(wh.FetchError):
+                    wh.fetch(bad)
+            op.assert_not_called()
+        for good in ("https://www.willhaben.at/x", "https://cache.willhaben.at/p.jpg", "https://willhaben.at/"):
+            self.assertTrue(wh.allowed_url(good), good)
+        with mock.patch.object(wh, "MAX_BYTES", 10), mock.patch.object(wh, "wait_turn"), mock.patch.object(wh, "log"), \
+             mock.patch("time.sleep"):
+            with mock.patch("urllib.request.urlopen", return_value=FakeResp(b"x" * 11)):
+                with self.assertRaises(wh.FetchError):
+                    wh.fetch("https://www.willhaben.at/x")
+            bomb = wh.gzip.compress(b"x" * 1000)
+            with mock.patch("urllib.request.urlopen", return_value=FakeResp(bomb, {"Content-Encoding": "gzip"})):
+                with self.assertRaises(wh.FetchError):
+                    wh.fetch("https://www.willhaben.at/x")
+
+    def test_template_value_with_a_bad_group_reference_fails_at_load(self):
+        def tpl(value, match="foo"):
+            return {"field": [{"name": "f", "values": [{"match": match, "value": value}]}]}
+        for bad in (r"\1", r"\g<nope>", r"\q"):
+            with self.assertRaises(ValueError) as e:
+                profiles.parse_template("t", tpl(bad))
+            self.assertIn("bad value", str(e.exception))
+        ok = profiles.parse_template("t", tpl(r"\1 GB", r"(\d+) ?gb"))
+        ad = {"title": "ram 16 GB", "price": 10}
+        profiles.template_annotate(ok, ad)
+        self.assertEqual(ad["f"], "16 GB")
+
+    def test_database_file_is_private_and_an_old_one_is_tightened(self):
+        path = os.path.join(self.tmp.name, "new", "wh.db")
+        with mock.patch.object(wh, "DB", path):
+            wh.db().close()
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            os.chmod(path, 0o644)
+            wh.db().close()
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            os.chmod(path, 0o644)
+            with mock.patch("os.chmod", side_effect=PermissionError):
+                wh.db().close()                             # never fails when the mode can't be changed
+
+    def test_summary_drops_control_characters(self):
+        a = make_summary(7, "Rad \x1b[2J\x1b]0;pwn\x07 neu", 50)
+        self.assertNotIn("\x1b", wh.summary(a)["title"])
+        self.assertNotIn("\x07", wh.table([wh.summary(a)]))
+
     def test_hunt_keeps_edits_made_while_claude_thinks_and_symlinks_stay(self):
         real = os.path.join(self.tmp.name, "real.md")
         link = os.path.join(self.tmp.name, "Goggles.md")
@@ -534,6 +628,29 @@ class WhTests(TmpDbCase):
         self.assertIn("<!-- wh:picks -->", saved)
         self.assertIn("<!-- wh:sweep -->", saved)
         self.assertEqual(props["for"], "me")
+
+    def test_hunt_writes_the_models_answer_tamed_and_says_when_there_are_warnings(self):
+        path = os.path.join(self.tmp.name, "Goggles.md")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("---\ntype: buy\nstatus: open\nfor: me\nsearch: goggles\n---\n# Goggles\n")
+        page = search_page(1, [make_summary(1, "DJI Goggles V2", 180)])
+        answer = ("## Picks\n\n1. **Goggles** https://www.willhaben.at/iad/x#top\n- [x] done <img src=x>\n"
+                  "<!-- /wh:picks --> [[Secret]] ![[embed]] ![p](https://e.example/p.png)\n#deadline 2026-12-01\n"
+                  + "long " * 3000 + "\n\n## Warnings\n\nAd 1 looks like a scam\n")
+        c = wh.db()
+        self.addCleanup(c.close)
+        ns = mock.Mock(note=path, pages=1, limit=10, details=0, dry_run=False, no_ai=False)
+        with mock.patch.object(wh, "db", return_value=c), mock.patch.object(wh, "fetch", return_value=("u", page)), \
+             mock.patch.object(wh, "ask_claude", return_value=answer), \
+             mock.patch.object(wh, "log"), mock.patch("sys.stdout", io.StringIO()):
+            wh.cmd_hunt(ns)
+        saved, _ = wh.read_note(path)
+        self.assertEqual(saved.count("<!-- /wh:picks -->"), 1)
+        for bad in ("<img", "[[", "![", "\n#deadline", "- [x]"):
+            self.assertNotIn(bad, saved)
+        self.assertIn("1. **Goggles** https://www.willhaben.at/iad/x#top", saved)       # normal Markdown stays
+        self.assertIn("flagged ads that look like scams", saved)
+        self.assertLess(len(saved), 9000)
 
     def test_cmd_hunt_formats_metadata_and_splits_warnings_resiliently(self):
         note_path = os.path.join(self.tmp.name, "Laptop.md")
@@ -1252,6 +1369,22 @@ class SkillRulesTest(unittest.TestCase):
             self.assertEqual(wh.skill_rules("buy"), "")
         self.assertIn("not found", log.call_args[0][0])
 
+    def test_claude_runs_in_a_throwaway_folder(self):
+        seen = []
+
+        def fake(cmd, **kw):
+            seen.append((kw.get("cwd"), os.path.isdir(kw.get("cwd") or "")))
+            return subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr="")
+        ns = mock.Mock(no_ai=False, model=None, timeout=5)
+        with mock.patch.object(wh.subprocess, "run", side_effect=fake), mock.patch.object(wh, "log"):
+            wh.ask_claude(ns, "task", "data")
+            wh.ask_labels("q", [dict(id=1, title="t", price=1.0, body="")], "haiku")
+        self.assertEqual(len(seen), 2)
+        for cwd, existed in seen:
+            self.assertTrue(existed)
+            self.assertNotEqual(os.path.realpath(cwd), os.path.realpath(os.getcwd()))
+            self.assertFalse(os.path.exists(cwd))              # removed again afterwards
+
     def test_ask_claude_puts_the_kinds_rules_in_the_system_prompt(self):
         self.write_split()
         ns = mock.Mock(no_ai=False, model=None, timeout=5)
@@ -1300,20 +1433,44 @@ class SkillRulesTest(unittest.TestCase):
             self.assertEqual(wh.skill_path(), wh.SHIPPED_SKILL)
             self.assertIn("Pricing advice", wh.skill_rules("sell"))
 
-    def test_shipped_skill_has_no_personal_data(self):
-        # Generic markers live here; personal words stay private: WH_LEAKWORDS may name a file with one word per
-        # line (e.g. ~/.config/wh/leakwords), so this public repo never lists them itself.
-        words = ["~/Notes", "homelab repo"]
+    def test_public_tree_has_no_personal_data(self):
+        # Generic markers live here (split so this file does not hold them); personal words stay private:
+        # WH_LEAKWORDS may name a file with one word per line (e.g. ~/.config/wh/leakwords), so this public repo
+        # never lists them itself. Every tracked file is checked, not only the skill.
+        words = ["~/" + "Notes", "homelab" + " repo"]
         leak = os.environ.get("WH_LEAKWORDS")
         if leak:
             with open(os.path.expanduser(leak), encoding="utf-8") as f:
                 words += [w.strip() for w in f if w.strip() and not w.startswith("#")]
-        d = os.path.dirname(wh.SHIPPED_SKILL)
-        for name in sorted(os.listdir(d)):
-            with open(os.path.join(d, name), encoding="utf-8") as f:
-                text = f.read()
+        try:
+            names = subprocess.run(["git", "ls-files", "-z"], cwd=HERE, capture_output=True, text=True,
+                                   check=True).stdout.split("\0")
+        except (OSError, subprocess.CalledProcessError):
+            names = []
+        names = [n for n in names if n]
+        if not names:                                       # not a git checkout (a copy of the files): walk it
+            names = [os.path.relpath(os.path.join(d, f), HERE) for d, ds, fs in os.walk(HERE)
+                     if ".git" not in d.split(os.sep) and "__pycache__" not in d for f in fs]
+        self.assertIn("wh", names)
+        for name in sorted(names):
+            try:
+                with open(os.path.join(HERE, name), encoding="utf-8") as f:
+                    text = f.read()
+            except (OSError, UnicodeDecodeError):
+                continue                                    # a binary file
             for word in words:
                 self.assertNotIn(word, text, name)
+
+    def test_leak_check_catches_a_word_in_any_tracked_file(self):
+        with open(os.path.join(HERE, "README.md"), encoding="utf-8") as f:
+            readme = f.read()
+        tmp = os.path.join(self.tmp.name, "leak")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("wh\n")                                 # a word every file holds: the test must fail on it
+        with mock.patch.dict(os.environ, {"WH_LEAKWORDS": tmp}):
+            with self.assertRaises(AssertionError):
+                self.test_public_tree_has_no_personal_data()
+        self.assertTrue(readme)
 
 
 import market  # noqa: E402
@@ -1817,6 +1974,61 @@ class FindWatchTests(TmpDbCase):
         with mock.patch.object(wh, "fetch", side_effect=fake):
             wh.crawl_new(c, [self.RAM])
         self.assertEqual(calls, [1, 2])
+        self.assertIsNotNone(c.execute("select id from ads where id=950").fetchone())
+
+    def crawl_args(self, **kw):
+        return mock.Mock(**dict(dict(kinds=["ram"], list=False, full=False, new=True, budget=None), **kw))
+
+    def test_a_crawl_that_read_nothing_is_not_recorded_and_fails(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        cats = market.KINDS["ram"]["cats"]
+        for broken in (wh.FetchError("boom"), "<html>no data</html>"):
+            def fake(url, binary=False):
+                if isinstance(broken, Exception):
+                    raise broken
+                return url, broken
+            for new in (True, False):
+                with mock.patch.object(wh, "db", return_value=c), mock.patch.object(wh, "fetch", side_effect=fake), \
+                     mock.patch.object(wh, "log"), mock.patch.object(wh, "kind_rows"), mock.patch.object(wh, "prune"):
+                    with self.assertRaises(wh.WhError) as e:
+                        wh.cmd_crawl(self.crawl_args(new=new, full=not new))
+                self.assertIn("read nothing", str(e.exception))
+        self.assertEqual(c.execute("select count(*) from runs").fetchone()[0], 0)
+        self.assertEqual(len(cats), len(set(cats)))
+
+    def test_a_crawl_with_one_failed_category_warns_and_succeeds(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        cats = ["marktplatz/a-1", "marktplatz/b-2"]
+        ok = search_page(1, [make_summary(900, "Kamera", 10, cats="1")])
+
+        def fake(url, binary=False):
+            if "b-2" in url:
+                raise wh.FetchError("boom")
+            return url, ok
+        with mock.patch.object(wh, "db", return_value=c), mock.patch.object(wh, "fetch", side_effect=fake), \
+             mock.patch.object(wh, "log") as log, mock.patch.object(wh, "kind_rows"), mock.patch.object(wh, "prune"), \
+             mock.patch.dict(market.KINDS, {"x": dict(market.KINDS["ram"], cats=cats)}):
+            wh.cmd_crawl(self.crawl_args(kinds=["x"], new=True))
+        self.assertTrue(any("1 of 2 categories could not be read" in str(x) for x in log.call_args_list))
+        self.assertEqual(c.execute("select count(*) from runs").fetchone()[0], 1)
+
+    def test_crawl_new_keeps_the_pages_read_before_a_failing_page(self):
+        c = wh.db()
+        self.addCleanup(c.close)
+        new = [make_summary(950 + n, "Neu 2x16GB DDR4 3200", 90 + n, cats="5824;5878;5887") for n in range(3)]
+
+        def fake(url, binary=False):
+            n = int(re.search(r"page=(\d+)", url).group(1))
+            if n == 2:
+                raise wh.FetchError("boom")
+            return url, search_page(5000, new[:1])
+        partial = []
+        with mock.patch.object(wh, "fetch", side_effect=fake), mock.patch.object(wh, "log"):
+            out = wh.crawl_new(c, [self.RAM], partial=partial)
+        self.assertEqual(partial, [self.RAM])
+        self.assertEqual(len(out[self.RAM][1]), 1)
         self.assertIsNotNone(c.execute("select id from ads where id=950").fetchone())
 
     def test_crawl_new_budget_stops_reading_but_keeps_what_it_read(self):

@@ -876,7 +876,13 @@ def parse_template(name, data):
         for v in f["values"]:
             if not isinstance(v, dict) or "match" not in v or set(v) - {"match", "value", "score", "new"}:
                 raise ValueError("%s: each value is { match = '…', value = '…', score = N, new = €N }" % where)
-            values.append(dict(match=_rx(where, v["match"]), value=v.get("value"),
+            rx = _rx(where, v["match"])
+            if v.get("value"):                                # a bad \1 or \g<name> would crash every matching ad later
+                try:
+                    rx.sub(v["value"], "")
+                except (re.error, IndexError, TypeError) as e:
+                    raise ValueError("%s: bad value %r for match %r (%s)" % (where, v["value"], v["match"], e))
+            values.append(dict(match=rx, value=v.get("value"),
                                score=float(v.get("score", 0)), new=float(v["new"]) if v.get("new") else None))
         fields.append(dict(name=f["name"], where=f.get("in", "text"), values=values))
     sl = data.get("shortlist", {})
