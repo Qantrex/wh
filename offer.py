@@ -183,8 +183,8 @@ def estimate(f, today=None):
         elif k == "stale_fix":
             reasons.append(("", note + (" (counted with the cut above)" if down else ""), "ad"))
         elif k == "fix":
-            reasons.append(("-", "\"%s\": %s; a small discount, a bundle or a quick pickup is still worth asking"
-                            % (words, note), "rule"))
+            reasons.append(("-", "\"%s\": %s; such ads still cut their price as often as others (median about "
+                            "−9 %%), so a modest offer is worth trying" % (words, note), "db"))
 
     # the seller
     n_ads = f.get("seller_ads") or 0
@@ -249,8 +249,8 @@ def estimate(f, today=None):
             reasons.append(("", txt, "db"))
 
     # limits
-    if "fix" in keys:
-        lo, hi = min(lo, 2), min(hi, 8 if online and online >= 30 else 5)
+    if "fix" in keys:       # a backtest over 14 nightly crawls: Fixpreis ads cut as often as others (median −8 to −10 %)
+        lo, hi = min(lo, 3), min(hi, 12 if online and online >= 30 else 10)
     lo = max(0.0, min(lo, 30))
     hi = max(lo + 3, min(hi, MAX_ROOM))
     low, high = p * (1 - hi / 100), p * (1 - lo / 100)
@@ -275,8 +275,8 @@ def estimate(f, today=None):
     while floor > nice(low, down=False) and odds(nice(floor - 0.01)) >= 0.5:
         floor = nice(floor - 0.01)
     over = trusted and floor > walk                        # the seller's likely floor is more than it's worth
-    opening = nice(low * (0.97 if "fix" in keys else 0.9))
-    opening = max(opening, nice(p * (0.85 if "fix" in keys else 0.55), down=False))
+    opening = nice(low * (0.95 if "fix" in keys else 0.9))
+    opening = max(opening, nice(p * (0.8 if "fix" in keys else 0.55), down=False))
     opening = min(opening, floor, walk)
     ladder = sorted({opening, nice(low, down=False), floor, nice(high) if high < p else p})
     conf = "low"

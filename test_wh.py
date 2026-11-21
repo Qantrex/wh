@@ -1982,8 +1982,11 @@ class OfferLogicTests(unittest.TestCase):
 
     def test_fixed_price_keeps_the_range_tight(self):
         e = offer.estimate(facts(descr="Festpreis. Muss weg."), TODAY)
-        self.assertGreaterEqual(e["low"], 95)
-        self.assertGreaterEqual(e["open"], 85)
+        loose = offer.estimate(facts(descr="Muss weg."), TODAY)
+        self.assertGreaterEqual(e["low"], 90)                  # Fixpreis ads still cut, but by less than the rest
+        self.assertLess(loose["low"], e["low"])
+        self.assertGreaterEqual(e["open"], 80)
+        self.assertLess(e["floor"], 100)
 
     def test_cheap_against_a_trusted_value_walks_at_the_ask(self):
         v = dict(value=150, conf="high", n=20, close=True)
