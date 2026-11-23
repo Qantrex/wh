@@ -48,6 +48,7 @@ Setup: the Install section of the `wh` README (github.com/Qantrex/wh); `wh docto
 - **Sending needs Claude in Chrome.** `wh` only reads public pages; messages go through the user's logged-in willhaben chat in Chrome. Check that the extension is connected before offering to send; if not, give copy-ready drafts.
 - Write messages in German, in the user's own tone, with their name. Lowball offers are fine.
 - For every ad on a buy note's shortlist, draft an opening message right away and show it to the owner for a yes. The opener asks one or two questions and makes no offer. The offer from wh offer goes in the reply after the seller answers.
+- **Buying: PayLivery or pickup only** (owner, 2026-11-23). The user buys through willhaben's PayLivery or picks the item up themselves, never plain shipping with a bank transfer. Openers and replies never ask about shipping costs; for a pickup-only ad far away, show the trip (time, fuel estimate) next to the offer.
 - "Anzeige nicht mehr verfügbar" usually means the ad just **expired** (not renewed), not sold. Never treat it as sold or mention it to the seller.
 - Listing tables in notes hold only ads you would consider; mention rejects in chat if they matter.
 - Check specs and prices online, not from memory, and cite sources in the note.
