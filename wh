@@ -1498,11 +1498,15 @@ def offer_facts(c, d, words=None, pages=1, search=True):
                 seller_record=seller_record(c, row.get("seller"), d["id"]))
 
 
-def offer_result(c, d, words=None, pages=1, search=True):
+def offer_result(c, d, words=None, pages=1, search=True, offered=None, counter=None):
     f = offer_facts(c, d, words, pages, search)
     est = offer.estimate(f)
-    if not est.get("error") and not est.get("over"):
-        est["message"] = offer.message(est, f, CONFIG.get("name"), CONFIG.get("location"), CONFIG.get("message"))
+    if est.get("error"):
+        return f, est
+    est["next"], price, kind = offer.next_step(est, offered, counter)
+    if price is not None and not (est.get("over") and kind == "first"):
+        est["message"] = offer.message(est, f, CONFIG.get("name"), CONFIG.get("location"), CONFIG.get("message"),
+                                       price, kind)
     return f, est
 
 
@@ -1518,14 +1522,26 @@ def fmt_offer(f, e, md=False):
         return "wh offer: %s" % e["error"]
     if e.get("over"):
         head = ("Walk away: the lowest price the seller will probably still accept is about %s (asking %s, %s "
-                "confidence), more than it's worth" % (euro(e["floor"]), euro(e["ask"]), e["conf"]))
+                "confidence), more than it's worth; if you try anyway, stop at %s" % (
+                    euro(e["floor"]), euro(e["ask"]), e["conf"], euro(e["walk"])))
     else:
-        head = ("Offer %s: the lowest price the seller will probably still accept (asking %s; about %d %% odds, %s "
-                "confidence)" % (euro(e["floor"]), euro(e["ask"]), odds_pct(e["floor_odds"]), e["conf"]))
-    lines = [head,
-             "Rough odds the seller says yes: %s" % " · ".join(
-                 "%s ~%d %%" % (euro(x), odds_pct(o)) for x, o in e["ladder"]),
-             "Walk away above %s" % euro(e["walk"]), "", "Why:"]
+        head = ("Open with %s, go no higher than %s (asking %s; about %d %% odds of a deal at all, %s confidence)" % (
+            euro(e["open"]), euro(e["walk"]), euro(e["ask"]), odds_pct(e["deal_odds"]), e["conf"]))
+    plan = e["plan"]
+    lines = [head, "Plan, one step at a time (rough odds the seller says yes to each price):"]
+    for k, (x, o) in enumerate(plan, 1):
+        what = ("first offer" if k == 1 else
+                "the ask: still a good buy below the market, don't lose it over a step"
+                if e.get("cheap") and x == e["walk"] else "last offer: walk away above it" if x == e["walk"] else
+                "after a no, or a counter above it")
+        if k == len(plan) and len(plan) == 1:
+            what = "the only offer: walk away above it"
+        lines.append("  %d. %7s  ~%2d %%  %s" % (k, euro(x), odds_pct(o), what))
+    lines += ["Next: %s." % e["next"]] if e.get("next") else []
+    paid = min((offer.nice(e["expected"]), offer.nice(e["expected"], False)), key=lambda x: abs(x - e["expected"]))
+    lines += ["If the seller counters at or below your next step, take it. A deal costs about %s on average; about %d "
+              "in 10 sellers say no to every step." % (euro(paid), round((1 - e["deal_odds"]) * 10)),
+              "", "Why:"]
     for sign, text, src in e["reasons"]:
         lines.append("  %s %s (%s)" % (sign or "·", text, SOURCE[src]))
     for w in e["warnings"]:
@@ -1547,8 +1563,9 @@ def fmt_offer(f, e, md=False):
         lines += ["", "No market value: %s. The range rests on the rule of thumb and the ad's own signals." % why]
     lines += ["", "Evidence: no negotiated price is ever seen, so the odds are a guess: a %s seller's usual %s "
               "off, shifted by the signals above, read as four in five sellers taking the high end and one in five "
-              "going down to the low end. Measured: %s." % (
-                  "private" if f.get("private", True) else "dealer", "5–15 %" if f.get("private", True) else "0–5 %",
+              "going down to the low end. Prices are round (whole euros under €20, then €5, above €200 €10) and the odds "
+              "are for those prices. Measured: %s." % (
+                  "private" if f.get("private", True) else "dealer", offer.band_text(f.get("private", True)),
                   ", ".join(x for x in (
                   "the market value" if v and v.get("unit") == "sellers" else "a rough value from similar ads" if v else "",
                   "what comparable ads did between two full crawls" if f.get("base") else "",
@@ -1556,8 +1573,10 @@ def fmt_offer(f, e, md=False):
                   "the seller's other ads" if (f.get("seller_record") or {}).get("n", 0) >= 3 else "") if x) or "nothing"),
               ""]
     if e.get("message"):
-        lines += ["Reply with the offer, after the seller answered your opening questions (draft, not sent):", e["message"]]
-    else:
+        first = e["next"].startswith("open with")
+        lines += [("Reply with the first offer, after the seller answered your opening questions" if first else "Reply")
+                  + " (draft, not sent):", e["message"]]
+    elif e.get("over"):
         lines += ["No reply draft: at the walk-away price the seller will probably say no."]
     return "\n".join(lines)
 
@@ -1570,8 +1589,9 @@ def offer_block(c, d):
         return "\n\n## Price room (wh offer)\n\nwh offer failed: %s" % ex
     if e.get("error"):
         return ""
-    return ("\n\n## Price room (wh offer, no AI)\n\n%s\n\nUse this floor for the suggested offer unless the data above "
-            "clearly says otherwise, and say where you differ." % fmt_offer(f, e).split("\n\nReply with the offer")[0])
+    return ("\n\n## Price room (wh offer, no AI)\n\n%s\n\nUse this plan for the suggested offer (open with its first "
+            "price, one step at a time, walk away above its last offer) unless the data above clearly says otherwise, and "
+            "say where you differ." % re.split(r"\n\n(?:Reply|No reply draft)", fmt_offer(f, e))[0])
 
 
 def cmd_offer(a):
@@ -1583,7 +1603,10 @@ def cmd_offer(a):
     d = details(c, ad_id(a.ad), refresh=True)
     if d["status"] == "offline":
         sys.exit(fmt_details(d))
-    f, e = offer_result(c, d, a.compare, a.pages, not a.no_search)
+    offered, counter = getattr(a, "offered", None), getattr(a, "counter", None)
+    if counter is not None and offered is None:
+        raise WhError("--counter needs --offered (your last offer)")
+    f, e = offer_result(c, d, a.compare, a.pages, not a.no_search, offered, counter)
     if a.json:
         print(json.dumps(dict(facts={k: v for k, v in f.items() if k != "descr"}, offer=e), ensure_ascii=False,
                          indent=1, default=str))
@@ -2783,12 +2806,16 @@ def main():
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_history)
 
-    s = sub.add_parser("offer", help="how far an ad's price can probably drop (no AI): expected final price, opening "
-                                     "offer, walk-away price, a draft message; --backtest: how often prices fell")
+    s = sub.add_parser("offer", help="how far an ad's price can probably drop (no AI): a haggling plan in round prices "
+                                     "(opening offer, counter steps, last offer) with rough odds, a draft message; "
+                                     "--backtest: how often prices fell")
     s.add_argument("ad", nargs="?", help="ad ID or link")
     s.add_argument("--compare", help="keywords for comparable ads when the ad's kind has no market value")
     s.add_argument("--pages", type=int, default=1, help="pages of that keyword search (default 1)")
     s.add_argument("--no-search", action="store_true", help="no keyword search, only the database")
+    s.add_argument("--offered", type=float, metavar="EUR", help="your last offer: say what to do next")
+    s.add_argument("--counter", type=float, metavar="EUR", help="with --offered: the seller's counter (leave out for a "
+                                                                "plain no)")
     s.add_argument("--backtest", nargs="*", metavar="KIND", dest="kinds", default=None,
                    help="instead of an ad: what happened to the ads between two full crawls (all kinds or these)")
     s.add_argument("--json", action="store_true")

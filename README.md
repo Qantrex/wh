@@ -22,7 +22,8 @@ wh value dell u2723qe                   # a bare model gets its kind from the ad
 wh crawl --list                         # the categories behind the market values, and when they were last read
 wh watch add gpu --kind gpu --below 0.35   # a saved find; `wh watch run --json` reports new deals once (for a timer)
 
-wh offer <link>                         # the lowest price the seller will probably still accept, rough odds, a reply draft
+wh offer <link>                         # a haggling plan in round prices: first offer, counter steps, last offer, odds
+wh offer <link> --offered 80 --counter 110   # after the seller answered: the next step and its reply draft
 wh offer --backtest tv speakers         # what happened to ads between two full crawls: gone, early, cut
 
 wh deal <link> --for "a friend"         # AI: worth buying (for whom)? verdict, comparables, offer, questions
@@ -47,7 +48,7 @@ The AI commands gather the data and ask `claude -p` (no tools, so it only reason
 
 ## Price room (wh offer)
 
-`wh offer <ad>` estimates the lowest price the seller will probably still accept, without AI. It starts from a rule of thumb (private sellers usually come down 5–15 %, dealers 0–5 %) and shifts it by the ad's signals, each labelled as coming from the ad, from measurements in the database, or from a rule of thumb:
+`wh offer <ad>` makes a plan to haggle, without AI. It starts from a rule of thumb (private sellers usually come down 10–25 %, dealers 0–5 %) and shifts it by the ad's signals, each labelled as coming from the ad, from measurements in the database, or from a rule of thumb:
 
 - **Time online:** the earliest of willhaben's online-since date and wh's first sighting (bumps reset willhaben's date), and the days until a private ad expires (45 days after publishing).
 - **Price cuts:** the ad's own history plus willhaben's record of the last cut (old price and date), which wh stores from the search pages.
@@ -55,7 +56,11 @@ The AI commands gather the data and ask `claude -p` (no tools, so it only reason
 - **The seller:** private or dealer, how many ads they have online (15–40 is a clear-out; more is a trader in practice), a brand-new account, and how often they cut the price on their other ads wh has seen.
 - **The market:** the ask against the market value when wh knows the kind (a loose match, such as a TV valued by brand and size only, counts as rough), otherwise a keyword search for similar ads; and what comparable ads did between the first and the last full crawl of their category.
 
-The result is the floor with its odds, a short ladder of prices with rough odds, a walk-away price, the reasons, and a short German reply with the offer for after the seller answered your first questions (`name`, `location` and an optional `message` template in the config). `wh deal` gets the same numbers.
+The result is a plan: a first offer that about one seller in four takes, one or two counter steps, and the last offer at the lowest price the seller will probably still accept (about even odds), which is also the walk-away price. Concede one step at a time, only after a no; take a counter at or below your next step. Ads already below a trusted market value get a gentler plan that ends at the ask; ads whose likely floor is above the value get "walk away". wh also shows the odds of a deal at all and what one costs on average, the reasons, and a short German reply with the first offer for after the seller answered your first questions (`name`, `location` and an optional `message` template in the config). After the seller answered, `--offered EUR` (your last offer) and `--counter EUR` (their price, if they named one) give the next step and its reply. `wh deal` gets the same plan.
+
+Every price is a round amount, because odd amounts are awkward to pay in cash at a pickup: whole euros under €20, multiples of €5 up to €200 and of €10 above. The odds are computed for the rounded prices. On small ads the €5 steps leave little room: a €35 ad gets €25 and €30.
+
+Harder haggling costs deals. Over the backtest's 99k private ads (each estimated as of the first crawl), the old offer sat at a median 90 % of the ask and the old walk-away at 92 %; the new plan opens at 73 % and stops at 83 %. Under the old 5–15 % band that cuts the odds of a deal at all from about two in three to one in three; under the new 10–25 % band it stays near three in five. The band was widened after a handful of real negotiations ended lower than the old one said, often on the first offer, so the truth is probably in between. Of the ads that cut their price between two crawls, 43 % went down to the new last offer (66 % to the old walk-away): a lower bound, since nobody sees what sellers take in a chat.
 
 **How strong the evidence is:** nobody ever sees the price a used item finally sells for, so the odds are a guess. The band is read as "four in five sellers take the high end, one in five go down to the low end". What is measured is what asking prices did: `wh offer --backtest [kinds]` takes every ad online at a category's first complete crawl and checks it at the last one (at least two days later). Over 14 days of nightly crawls (November 2026, 93k private ads in 10 kinds), 36 % were gone, 13 % went before their end date (sold or taken down), and 11 % had cut their price (median −11 %, a quarter by 20 % or more). Ads at or below the market value went early about twice as often as ads above 130 % of it; ads 90–130 % of value were cut most often. Ads saying VB cut a bit more often (about 15 %); ads saying Fixpreis went early more often and still cut as often as the rest, by a median of about 9 %. Dealers cut rarely and by 3–6 %. Treat the numbers as direction, not precision.
 
@@ -86,7 +91,7 @@ If willhaben pushes back (HTTP 403/429/503 or a Cloudflare challenge page), ever
 ## Files
 
 - `wh`: the command (Python 3.11+, standard library only). Linked as `~/.local/bin/wh`.
-- `offer.py`: `wh offer`'s estimate (signals, floor, odds, reply draft), pure Python without network or database.
+- `offer.py`: `wh offer`'s estimate (signals, round prices, the haggling plan with odds, next step, reply drafts), pure Python without network or database.
 - `market.py`: the kinds of items (categories, spec extractors, keys) and the market value maths, pure Python without network or database.
 - `profiles.py`: per-category knowledge that turns ads into comparable specs and filters junk: the built-in profiles (`laptop`, `pc`, `server`, `hue`) and the template engine. A buy note picks one with `wh-profile: laptop`.
 - `templates/example.toml`: a sample template. Your own live in `~/.config/wh/templates/` (see [Templates](#templates)).

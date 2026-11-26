@@ -1,9 +1,10 @@
-"""How far an ad's price can probably drop: the signals, the expected final price, an opening offer, a walk-away
-price and a short German message. Pure Python: wh gathers the facts (ad page, database, market value, backtest) and
-passes them in as one dict, so everything here is testable offline.
+"""How far an ad's price can probably drop: the signals, a plan to haggle (an opening offer, one or two counter
+steps and the last offer, all round prices with rough odds) and short German messages. Pure Python: wh gathers the
+facts (ad page, database, market value, backtest) and passes them in as one dict, so everything here is testable
+offline.
 
 Nobody ever sees the price a used item is finally sold for. The range is a rule of thumb (private sellers usually come
-down 5–15 %) shifted by the ad's signals, and wh says which of them are measured and which are rules of thumb.
+down 10–25 %) shifted by the ad's signals, and wh says which of them are measured and which are rules of thumb.
 """
 import re
 from datetime import date
@@ -12,6 +13,15 @@ import market
 
 RUN_DAYS = 45                 # a private willhaben ad runs this long from its last publishing, then expires
 MAX_ROOM = 45                 # never expect more than this (in % off the asking price)
+PRIVATE = (10.0, 25.0)        # how far a usual private seller comes down, in % off the ask (a rule of thumb)
+DEALER = (0.0, 5.0)
+OPEN_ODDS = 0.25              # the first offer: about one seller in four says yes right away
+STEP_SHARE = 0.6              # a counter step gives up this share of the way from the first to the last offer
+LOWBALL = 0.65                # never open below this share of the ask (0.8 with a fixed price): it ends the chat
+
+
+def band_text(private=True):
+    return "%g–%g %%" % (PRIVATE if private else DEALER)
 
 VB = re.compile(r"\b(?:vb|vhb|verhandlungsbasis|(?<!nicht\s)verhandelbar|preisvorschl\w*\s+(?:willkommen|erwünscht)|"
                 r"mach\w*\s+(?:mir\s+)?(?:ein\s+)?angebot|(?:für\s+)?angebote\s+offen|offen\s+für\s+angebote)\b", re.I)
@@ -27,10 +37,16 @@ STATED = re.compile(r"(?:preis\s*:?\s*|vb\s*|fix\s*preis\s*:?\s*)(?:€\s*)?(\d[
 
 
 def nice(p, down=True):
-    """A price people type: whole euros under 50, then steps of 5, 10, 20, 50 and 100."""
-    step = 1 if p < 50 else 5 if p < 200 else 10 if p < 500 else 20 if p < 1000 else 50 if p < 3000 else 100
+    """A round price, easy to pay in cash at a pickup: whole euros under €20, multiples of €5 up to €200 and of €10
+    above. Rounds down unless down=False."""
+    step = 1 if p < 20 else 5 if p < 200 else 10
     n = int(p // step) if down else -int(-p // step)
     return max(step, n * step)
+
+
+def is_round(x):
+    """True for a price nice() can give: what every price wh offer suggests must be."""
+    return x == int(x) and (x < 20 or x % 5 == 0 and (x <= 200 or x % 10 == 0))
 
 
 def text_flags(text, price=None):
@@ -108,10 +124,11 @@ def estimate(f, today=None):
     if not p:
         return dict(ask=p, error="the ad has no price (0 or 'zu verschenken'): nothing to estimate")
     reasons, warnings = [], []
-    lo, hi = (5.0, 15.0) if f.get("private", True) else (0.0, 5.0)
+    lo, hi = (PRIVATE if f.get("private", True) else DEALER)
     reasons.append(("", "%s seller: a usual private seller comes down %s" % (
         "private" if f.get("private", True) else "dealer",
-        "5–15 %" if f.get("private", True) else "0–5 % (a dealer prices to sell, warranty counts)"), "rule"))
+        band_text(f.get("private", True)) + ("" if f.get("private", True) else
+                                              " (a dealer prices to sell, warranty counts)")), "rule"))
 
     def add(dlo, dhi, text, source="ad"):
         nonlocal lo, hi
@@ -255,61 +272,111 @@ def estimate(f, today=None):
     hi = max(lo + 3, min(hi, MAX_ROOM))
     low, high = p * (1 - hi / 100), p * (1 - lo / 100)
     trusted = bool(ratio and v.get("conf") in ("high", "medium") and v.get("close", True))
-    if trusted and ratio > 1.0 and low > v["value"]:
-        walk = nice(v["value"])
-        warnings.append("even the low end (%s) is above the market value %s: walk away unless it's something special"
-                        % (fmt(nice(low, down=False)), fmt(v["value"])))
-    elif trusted and ratio > 1.0:
-        walk = max(nice(min(high, v["value"])), nice(low, down=False))
-    elif trusted and ratio <= 0.9:
-        walk = p                                           # below the market: paying the ask is still a good buy
-    else:
-        walk = max(nice(high), nice(low, down=False))
-    def odds(x):
-        """Rough odds the seller accepts x: the band lo..hi (in % off the ask) is read as 'four in five sellers take
-        the price at lo, one in five go down to hi', straight in between. A guess: no negotiated price is ever seen."""
-        r = (1 - x / p) * 100
-        return max(0.05, min(0.95, 0.8 - 0.6 * (r - lo) / (hi - lo)))
 
-    floor = nice(p * (1 - (lo + hi) / 200), down=False)    # the lowest price with about even odds
-    while floor > nice(low, down=False) and odds(nice(floor - 0.01)) >= 0.5:
-        floor = nice(floor - 0.01)
-    over = trusted and floor > walk                        # the seller's likely floor is more than it's worth
-    opening = nice(low * (0.95 if "fix" in keys else 0.9))
-    opening = max(opening, nice(p * (0.8 if "fix" in keys else 0.55), down=False))
-    opening = min(opening, floor, walk)
-    ladder = sorted({opening, nice(low, down=False), floor, nice(high) if high < p else p})
+    def odds(x):
+        return odds_at(x, p, lo, hi)
+
+    top = nice(p)                                          # the ask, as a round price
+
+    def at(t, near=False):
+        """The lowest round price with odds of at least t, never above the ask; near=True: the round price whose odds
+        are closest to t (the lower one on a tie), so a small ad with €5 steps still leaves room for a counter step."""
+        x = p * (1 - (lo + (0.8 - t) * (hi - lo) / 0.6) / 100)
+        up = min(nice(x, down=False), top)
+        if not near:
+            return up
+        return min((nice(x), up), key=lambda y: (abs(odds(y) - t), y))
+
+    floor = at(0.5)                                        # the lowest price the seller will probably still accept
+    low_r = min(nice(low, down=False), top)
+    cheap = trusted and ratio <= 0.9
+    over = bool(trusted and ratio > 1.0 and floor > nice(v["value"]))
+    if trusted and ratio > 1.0 and low > v["value"]:
+        warnings.append("even the low end (%s) is above the market value %s: walk away unless it's something special"
+                        % (fmt(low_r), fmt(v["value"])))
+    if over:
+        walk = nice(v["value"])                            # the seller's likely floor is more than it's worth
+    elif cheap:
+        walk = top                                         # below the market: paying the ask is still a good buy
+    else:
+        walk = floor                                       # the last step, not a margin above the likely deal
+    no_lower = min(nice(p * (0.8 if "fix" in keys else LOWBALL), down=False), floor)
+    opening = min(max(at(0.4 if cheap else OPEN_ODDS, near=True), no_lower), walk)
+    mid = floor if cheap else nice(opening + STEP_SHARE * (walk - opening))
+    plan = sorted({opening, walk} | ({mid} if opening < mid < walk else set()))
+    deal = odds(walk)
+    paid = sum(x * (odds(x) - (odds(y) if y else 0)) for x, y in zip(plan, [None] + plan[:-1])) / deal
     conf = "low"
     if trusted and b and b.get("n", 0) >= 30 and online is not None and not at_least:
         conf = "medium"
-    return dict(ask=p, floor=floor, floor_odds=round(odds(floor), 2), over=over, ladder=[(x, round(odds(x), 2)) for x in ladder],
-                low=nice(low, down=False), high=nice(high, down=True) if high < p else p, conf=conf,
+    return dict(ask=p, floor=floor, floor_odds=round(odds(floor), 2), over=over,
+                plan=[(x, round(odds(x), 2)) for x in plan], ladder=[(x, round(odds(x), 2)) for x in plan],
+                deal_odds=round(deal, 2), expected=round(paid, 2), cheap=cheap, band=(lo, hi),
+                low=low_r, high=nice(high) if high < p else top, conf=conf,
                 open=opening, walk=walk, reasons=reasons, cuts=cuts, flags=flags, days_online=online, at_least=at_least,
                 days_left=left, warnings=warnings, relisted=relisted)
 
 
-def message(est, f, name=None, home=None, template=None):
-    """The short German reply with the offer (the floor), sent after the seller answered the opening questions: the
-    offer and how I'd pick it up. `home`: the user's place (the `location` in the config) to say whether it's a trip;
-    `template`: the user's own wording with {offer} {pickup} {name}."""
-    state = (f.get("state") or "").lower()
-    near = bool(home and state and state.split()[0] in home.lower())
-    town = (f.get("town") or "").strip()
-    if near or not home:
-        pickup = "Ich könnte diese Woche abholen."
-    elif f.get("pickup_only") or not f.get("p2p"):
-        pickup = "Ich würde zum Abholen nach %s kommen." % town if town else "Ich würde zum Abholen vorbeikommen."
+def odds_at(x, ask, lo, hi):
+    """Rough odds the seller accepts x: the band lo..hi (in % off the ask) is read as 'four in five sellers take the
+    price at lo, one in five go down to hi', straight in between. A guess: no negotiated price is ever seen."""
+    r = (1 - x / ask) * 100
+    return max(0.05, min(0.95, 0.8 - 0.6 * (r - lo) / (hi - lo)))
+
+
+def next_step(est, offered=None, counter=None):
+    """Where the haggling stands after the seller answered: (what to do, the price to offer or None, which message).
+    offered: your last offer; counter: the seller's price, or None for a plain no."""
+    plan = [x for x, _ in est["plan"]]
+    last = est["walk"]
+    if offered is None:
+        return "open with %s (step 1 of %d)" % (euro(plan[0]), len(plan)), plan[0], "first"
+    if counter is not None and counter <= offered:
+        return "the seller asks %s, no more than you offered: take it" % euro(counter), None, None
+    later = [x for x in plan if x > offered]
+    if counter is not None and later and counter <= later[0]:
+        return ("take the seller's %s: it's no more than your next step (%s)" % (euro(counter), euro(later[0])),
+                counter, "counter")
+    if not later or offered >= last:
+        return ("you're at your last offer (%s): say once that it's your limit, then walk away%s"
+                % (euro(last), " (the seller wants %s)" % euro(counter) if counter else "")), last, "last"
+    k = plan.index(later[0]) + 1
+    return ("concede to %s (step %d of %d)%s%s" % (
+        euro(later[0]), k, len(plan), ", not to the seller's %s" % euro(counter) if counter else "",
+        ": your last offer, walk away above it" if later[0] == last else ""),
+        later[0], "last" if later[0] == last else "counter")
+
+
+def euro(x):
+    return "€%s" % fmt(x)
+
+
+def message(est, f, name=None, home=None, template=None, price=None, kind="first"):
+    """The short German reply with an offer. kind "first": the opening offer, sent after the seller answered the
+    opening questions, with how I'd pick it up; "counter": a step up after a no; "last": the last offer. `home`: the
+    user's place (the `location` in the config) to say whether it's a trip; `template`: the user's own wording for the
+    first offer with {offer} {pickup} {name}."""
+    offer = "%s €" % fmt(est["open"] if price is None else price)
+    if kind == "counter":
+        text = "Danke dir! Treffen wir uns bei %s?" % offer
+    elif kind == "last":
+        text = "Danke dir! %s wäre mein letztes Angebot, mehr geht für mich leider nicht." % offer
     else:
-        pickup = "Versand mit PayLivery wäre für mich ok, Abholung auch."
-    offer = "%s €" % fmt(est["floor"])
-    text = None
-    if template:
-        try:
-            text = template.replace("\\n", "\n").format(offer=offer, pickup=pickup, name=name or "")
-        except (KeyError, IndexError, ValueError):
-            text = None                                    # a brace the template didn't mean: use the default
-    if not text:
+        state = (f.get("state") or "").lower()
+        near = bool(home and state and state.split()[0] in home.lower())
+        town = (f.get("town") or "").strip()
+        if near or not home:
+            pickup = "Ich könnte diese Woche abholen."
+        elif f.get("pickup_only") or not f.get("p2p"):
+            pickup = "Ich würde zum Abholen nach %s kommen." % town if town else "Ich würde zum Abholen vorbeikommen."
+        else:
+            pickup = "Versand mit PayLivery wäre für mich ok, Abholung auch."
+        if template:
+            try:
+                return template.replace("\\n", "\n").format(offer=offer, pickup=pickup, name=name or "")
+            except (KeyError, IndexError, ValueError):
+                pass                                       # a brace the template didn't mean: use the default
         text = "Danke für die Antwort! %s Wären %s ok?" % (pickup, offer)
-        if name:
-            text += "\nLg %s" % name
+    if name:
+        text += "\nLg %s" % name
     return text

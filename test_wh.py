@@ -2128,13 +2128,81 @@ def facts(**kw):
 
 
 class OfferLogicTests(unittest.TestCase):
-    def test_nice_rounds_to_prices_people_type(self):
-        self.assertEqual(offer.nice(33.7), 33)                 # whole euros under 50 (not €30–€30 for a €35 ad)
-        self.assertEqual(offer.nice(33.2, down=False), 34)
-        self.assertEqual(offer.nice(173), 170)
-        self.assertEqual(offer.nice(447), 440)
-        self.assertEqual(offer.nice(689, down=False), 700)
-        self.assertEqual(offer.nice(1234), 1200)
+    def test_nice_rounds_to_amounts_easy_to_pay_in_cash(self):
+        for p, down, want in ((17.6, True, 17), (17.2, False, 18), (19.6, False, 20), (33.7, True, 30),
+                              (33.2, False, 35), (173, True, 170), (199, False, 200), (203, True, 200),
+                              (201, False, 210), (447, True, 440), (689, False, 690), (1234, True, 1230), (0.4, True, 1)):
+            self.assertEqual(offer.nice(p, down), want, (p, down))
+        self.assertTrue(all(offer.is_round(x) for x in (1, 19, 20, 25, 195, 200, 210, 1230)))
+        self.assertFalse(any(offer.is_round(x) for x in (19.5, 21, 33, 57, 205, 1234)))
+
+    GRID = (1, 3, 11, 15, 19, 21, 22, 24, 25, 35, 57, 99, 120, 195, 199, 201, 205, 250, 489, 980, 1500, 3333)
+
+    def mixes(self, p):
+        """Made-up ads at ask p with different signals."""
+        old = "2026-09-01"
+        yield facts(price=float(p))
+        yield facts(price=float(p), descr="VB, muss weg wegen Umzug", old_price=p * 1.2, cut_on="2026-11-18",
+                    first_published=old, published=old, first_seen=old, ends="2026-11-24")
+        yield facts(price=float(p), descr="Festpreis.")
+        yield facts(price=float(p), private=False)
+        yield facts(price=float(p), value=dict(value=p * 1.4, conf="high", n=20, close=True))       # cheap
+        yield facts(price=float(p), value=dict(value=p * 0.7, conf="high", n=20, close=True))       # over
+        yield facts(price=float(p), seller_record=dict(n=6, n_cut=0, median=None))
+
+    def test_every_suggested_price_is_round_ordered_and_at_most_the_ask(self):
+        for p in self.GRID:
+            for f in self.mixes(p):
+                e = offer.estimate(f, TODAY)
+                plan = [x for x, _ in e["plan"]]
+                shown = plan + [e["open"], e["walk"], e["floor"], e["low"], e["high"]]
+                self.assertTrue(all(offer.is_round(x) for x in shown), (p, shown))
+                self.assertEqual(plan, sorted(set(plan)), (p, plan))
+                self.assertEqual((plan[0], plan[-1]), (e["open"], e["walk"]), p)
+                self.assertTrue(all(x <= p for x in shown), (p, shown))
+                self.assertIn("%s €" % offer.fmt(e["open"]), offer.message(e, f))
+
+    def test_odds_are_for_the_rounded_prices(self):
+        for p in self.GRID:
+            for f in self.mixes(p):
+                e = offer.estimate(f, TODAY)
+                for x, o in e["plan"] + [(e["floor"], e["floor_odds"])]:
+                    self.assertEqual(o, round(offer.odds_at(x, p, *e["band"]), 2), (p, x))
+                self.assertEqual(e["deal_odds"], round(offer.odds_at(e["walk"], p, *e["band"]), 2))
+        e = offer.estimate(facts(price=35.0), TODAY)          # €5 steps: the even-odds price is no round amount
+        self.assertEqual(e["floor"], 30)
+        self.assertGreater(e["floor_odds"], 0.55)              # €30 has better odds than the unrounded €31-ish
+
+    def test_plan_opens_low_with_counter_steps(self):
+        e = offer.estimate(facts(), TODAY)
+        (o1, p1), (o2, p2), (o3, p3) = e["plan"]
+        self.assertLess(p1, 0.35)                              # the first offer: about one seller in four says yes
+        self.assertTrue(p1 < p2 < p3)
+        self.assertGreaterEqual(o1, 65)                         # not a lowball that ends the chat
+        self.assertGreaterEqual(o2 - o1, o3 - o2)               # the concessions don't grow
+        self.assertTrue(o1 <= e["expected"] <= o3)
+
+    def test_walk_away_is_the_last_step_not_a_margin_above_the_deal(self):
+        for f in (facts(), facts(price=300.0, descr="VB"), facts(price=57.0)):
+            e = offer.estimate(f, TODAY)
+            self.assertEqual(e["walk"], e["floor"])             # the old walk-away took four in five sellers' price
+            self.assertLess(e["deal_odds"], 0.75)
+            if f["price"] >= 100:                                # €5 steps on a €57 ad leave no price between
+                self.assertLess(e["walk"], e["high"])
+
+    def test_next_step(self):
+        e = dict(plan=[(85, 0.25), (90, 0.35), (95, 0.5)], walk=95)
+        self.assertEqual(offer.next_step(e)[1:], (85, "first"))
+        self.assertEqual(offer.next_step(e, 85)[1:], (90, "counter"))               # a plain no: one step up
+        said, price, kind = offer.next_step(e, 85, 120)
+        self.assertEqual((price, kind), (90, "counter"))                            # not to the seller's number
+        self.assertIn("not to the seller's €120", said)
+        self.assertEqual(offer.next_step(e, 85, 88)[1:], (88, "counter"))           # at or below the next step: take it
+        self.assertEqual(offer.next_step(e, 85, 80)[1:], (None, None))              # less than offered: take it
+        self.assertEqual(offer.next_step(e, 90, 110)[1:], (95, "last"))
+        said, price, kind = offer.next_step(e, 95, 110)
+        self.assertEqual((price, kind), (95, "last"))
+        self.assertIn("walk away", said)
 
     def test_text_flags(self):
         keys = lambda t, p=100: {k for k, _, _ in offer.text_flags(t, p)}
@@ -2203,8 +2271,10 @@ class OfferLogicTests(unittest.TestCase):
     def test_cheap_against_a_trusted_value_walks_at_the_ask(self):
         v = dict(value=150, conf="high", n=20, close=True)
         e = offer.estimate(facts(value=v), TODAY)
-        self.assertEqual(e["walk"], 100)
-        self.assertGreaterEqual(e["low"], 90)
+        self.assertEqual(e["walk"], 100)                        # it goes fast: don't lose it over a step
+        self.assertGreaterEqual(e["plan"][0][1], 0.3)           # and the first offer is a gentler one
+        odd = offer.estimate(facts(price=57.0, value=dict(v, value=90)), TODAY)
+        self.assertEqual(odd["walk"], 55)                       # the ask as a round amount
 
     def test_walk_away_never_above_a_trusted_value(self):
         v = dict(value=600, conf="high", n=36, close=True)
@@ -2214,7 +2284,8 @@ class OfferLogicTests(unittest.TestCase):
             self.assertLessEqual(e["walk"], 600)
             self.assertLessEqual(e["open"], e["walk"])
             self.assertTrue(e["over"])                                     # no offer above what it's worth
-            self.assertTrue(any(("(%s)" % e["low"]) in w for w in e["warnings"]))   # the same low as in the range
+            if e["low"] > 600:
+                self.assertTrue(any(("(%s)" % e["low"]) in w for w in e["warnings"]))   # the same low as in the range
         fair = offer.estimate(facts(price=650.0, value=v), TODAY)
         self.assertFalse(fair["over"])
         self.assertLessEqual(fair["floor"], fair["walk"])
@@ -2242,7 +2313,7 @@ class OfferLogicTests(unittest.TestCase):
         e = dict(open=20, floor=26)
         near = offer.message(e, facts(), "Alex", "1010 Wien")
         self.assertTrue(near.startswith("Danke für die Antwort!"))        # the reply after the seller answered
-        self.assertIn("Wären 26 € ok?", near)
+        self.assertIn("Wären 20 € ok?", near)                              # the first offer, not the last step
         self.assertIn("diese Woche abholen", near)
         self.assertTrue(near.endswith("Lg Alex"))
         far = offer.message(e, facts(state="Kärnten", town="Villach", p2p=0), None, "1010 Wien")
@@ -2251,9 +2322,12 @@ class OfferLogicTests(unittest.TestCase):
         ship = offer.message(e, facts(state="Tirol", town="Imst", p2p=1), None, "1010 Wien")
         self.assertIn("PayLivery", ship)
         own = offer.message(e, facts(), "Alex", "1010 Wien", "Servus! {pickup} {offer}?\nLG {name}")
-        self.assertEqual(own, "Servus! Ich könnte diese Woche abholen. 26 €?\nLG Alex")
+        self.assertEqual(own, "Servus! Ich könnte diese Woche abholen. 20 €?\nLG Alex")
         broken = offer.message(e, facts(), None, None, "Hi {preis}")
-        self.assertIn("Wären 26 € ok?", broken)
+        self.assertIn("Wären 20 € ok?", broken)
+        self.assertEqual(offer.message(e, facts(), "Alex", price=25, kind="counter"),
+                         "Danke dir! Treffen wir uns bei 25 €?\nLg Alex")
+        self.assertIn("26 € wäre mein letztes Angebot", offer.message(e, facts(), price=26, kind="last"))
 
 
 class OfferDbTests(TmpDbCase):
@@ -2350,11 +2424,24 @@ class OfferDbTests(TmpDbCase):
              mock.patch.object(wh, "CONFIG", {"name": "Alex", "location": "1010 Wien"}), \
              mock.patch("sys.stdout", out):
             wh.cmd_offer(argparse_ns(ad="942424242", kinds=None, compare=None, pages=1, no_search=False, json=False))
+            text = out.getvalue()
+            self.assertIn("Open with €", text)
+            self.assertIn("150 → 120", text)
+            self.assertIn("1. ", text)
+            self.assertIn("last offer: walk away above it", text)
+            self.assertIn("Next: open with", text)
+            self.assertIn("Reply with the first offer", text)
+            self.assertIn("Lg Alex", text)
+            out.seek(0)
+            out.truncate(0)
+            first = int(re.search(r"Open with €(\d+)", text).group(1))
+            wh.cmd_offer(argparse_ns(ad="942424242", kinds=None, compare=None, pages=1, no_search=False, json=False,
+                                     offered=first, counter=119))
         text = out.getvalue()
-        self.assertIn("the lowest price the seller will probably still accept", text)
-        self.assertIn("150 → 120", text)
-        self.assertIn("Reply with the offer", text)
-        self.assertIn("Lg Alex", text)
+        self.assertIn("Next: concede to", text)
+        self.assertIn("not to the seller's €119", text)
+        self.assertIn("Reply (draft, not sent)", text)
+        self.assertNotIn("119 €", text)
 
     def test_seller_record_counts_cuts_on_other_ads(self):
         c = wh.db()
@@ -2376,7 +2463,8 @@ class OfferDbTests(TmpDbCase):
         block = wh.offer_block(c, d)
         self.assertIn("## Price room (wh offer, no AI)", block)
         self.assertNotIn("Reply with the offer", block)
-        self.assertIn("Offer €", block)
+        self.assertIn("Open with €", block)
+        self.assertIn("last offer", block)
         self.assertEqual(wh.offer_block(c, dict(d, price=0)), "")
 
 
