@@ -2134,9 +2134,9 @@ class OfferLogicTests(unittest.TestCase):
                               (201, False, 210), (447, True, 440), (689, False, 690), (1234, True, 1230), (0.4, True, 1)):
             self.assertEqual(offer.nice(p, down), want, (p, down))
         self.assertTrue(all(offer.is_round(x) for x in (1, 19, 20, 25, 195, 200, 210, 1230)))
-        self.assertFalse(any(offer.is_round(x) for x in (19.5, 21, 33, 57, 205, 1234)))
+        self.assertFalse(any(offer.is_round(x) for x in (19.5, 21, 33, 47, 205, 1234)))
 
-    GRID = (1, 3, 11, 15, 19, 21, 22, 24, 25, 35, 57, 99, 120, 195, 199, 201, 205, 250, 489, 980, 1500, 3333)
+    GRID = (1, 3, 11, 15, 19, 21, 22, 24, 25, 45, 47, 62, 99, 120, 195, 199, 201, 205, 250, 489, 980, 1500, 3333)
 
     def mixes(self, p):
         """Made-up ads at ask p with different signals."""
@@ -2169,9 +2169,9 @@ class OfferLogicTests(unittest.TestCase):
                 for x, o in e["plan"] + [(e["floor"], e["floor_odds"])]:
                     self.assertEqual(o, round(offer.odds_at(x, p, *e["band"]), 2), (p, x))
                 self.assertEqual(e["deal_odds"], round(offer.odds_at(e["walk"], p, *e["band"]), 2))
-        e = offer.estimate(facts(price=35.0), TODAY)          # €5 steps: the even-odds price is no round amount
-        self.assertEqual(e["floor"], 30)
-        self.assertGreater(e["floor_odds"], 0.55)              # €30 has better odds than the unrounded €31-ish
+        e = offer.estimate(facts(price=45.0), TODAY)          # €5 steps: the even-odds price is no round amount
+        self.assertEqual(e["floor"], 40)
+        self.assertGreater(e["floor_odds"], 0.55)              # €40 has better odds than the unrounded €39-ish
 
     def test_plan_opens_low_with_counter_steps(self):
         e = offer.estimate(facts(), TODAY)
@@ -2183,11 +2183,11 @@ class OfferLogicTests(unittest.TestCase):
         self.assertTrue(o1 <= e["expected"] <= o3)
 
     def test_walk_away_is_the_last_step_not_a_margin_above_the_deal(self):
-        for f in (facts(), facts(price=300.0, descr="VB"), facts(price=57.0)):
+        for f in (facts(), facts(price=300.0, descr="VB"), facts(price=47.0)):
             e = offer.estimate(f, TODAY)
             self.assertEqual(e["walk"], e["floor"])             # the old walk-away took four in five sellers' price
             self.assertLess(e["deal_odds"], 0.75)
-            if f["price"] >= 100:                                # €5 steps on a €57 ad leave no price between
+            if f["price"] >= 100:                                # €5 steps on a €47 ad leave no price between
                 self.assertLess(e["walk"], e["high"])
 
     def test_next_step(self):
@@ -2273,8 +2273,8 @@ class OfferLogicTests(unittest.TestCase):
         e = offer.estimate(facts(value=v), TODAY)
         self.assertEqual(e["walk"], 100)                        # it goes fast: don't lose it over a step
         self.assertGreaterEqual(e["plan"][0][1], 0.3)           # and the first offer is a gentler one
-        odd = offer.estimate(facts(price=57.0, value=dict(v, value=90)), TODAY)
-        self.assertEqual(odd["walk"], 55)                       # the ask as a round amount
+        odd = offer.estimate(facts(price=62.0, value=dict(v, value=90)), TODAY)
+        self.assertEqual(odd["walk"], 60)                       # the ask as a round amount
 
     def test_walk_away_never_above_a_trusted_value(self):
         v = dict(value=600, conf="high", n=36, close=True)
